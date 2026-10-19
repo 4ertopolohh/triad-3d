@@ -3,6 +3,7 @@ import { applyProjectPatch } from "../../src/domain";
 import type { ProjectCommand } from "../../src/domain";
 import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
 import { createNestedMeshProject } from "../fixtures/projects";
+import { AssetBytes } from "../../src/assets/asset-bytes";
 
 const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
   commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
@@ -101,5 +102,41 @@ describe("editor store", () => {
     expect(store.getSnapshot().document.project.model.revision).toBe(8);
     expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
     expect(store.getSnapshot().document.revision).toBe(1);
+  });
+
+  it("atomically replaces project, command bus, assets, selection and history", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("Changed"), 0);
+    store.setSelection(["mesh-node"]);
+    const oldIdentity = store.captureDocument().identity;
+    const next = createNestedMeshProject();
+    next.model.revision = 17;
+    const bytes = new AssetBytes([["asset", new Uint8Array([1, 2])]]);
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(store.getSnapshot().document.project.model.revision).toBe(17);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().selection.ids).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    bytes.clear();
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(false);
+    expect(store.executeCommand(rename("After load"), 0)).toMatchObject({ ok: true, revision: 1 });
+  });
+
+  it("does not acknowledge a stale save or replace after an edit", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const captured = store.captureDocument();
+    store.executeCommand(rename("Later"), 0);
+    expect(store.confirmSaved(captured.revision, captured.identity)).toBe(false);
+    expect(store.replaceProject({ project: createNestedMeshProject(), assets: new AssetBytes() }, captured.identity)).toBe(false);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    const current = store.captureDocument();
+    expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
   });
 });

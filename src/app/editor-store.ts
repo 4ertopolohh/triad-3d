@@ -1,6 +1,8 @@
 import { createCommandBus } from "../domain/command-bus";
 import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
 import type { EntityId, Project } from "../domain/types";
+import { AssetBytes } from "../assets/asset-bytes";
+import type { LoadedProject } from "../assets/native-project-archive";
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
   : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
@@ -30,6 +32,10 @@ export interface EditorStore {
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   setTool(next: Partial<EditorState["tool"]>): void;
   setView(next: Partial<EditorState["view"]>): void;
+  getAssetBytes(): AssetBytes;
+  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  confirmSaved(revision: number, identity: object): boolean;
+  replaceProject(loaded: LoadedProject, identity: object): boolean;
 }
 
 function deepFreeze<T>(value: T): DeepReadonly<T> {
@@ -41,7 +47,9 @@ function deepFreeze<T>(value: T): DeepReadonly<T> {
 }
 
 export function createEditorStore(initialProject: Project): EditorStore {
-  const bus = createCommandBus(initialProject);
+  let bus = createCommandBus(initialProject);
+  let assetBytes = new AssetBytes();
+  let identity: object = {};
   const listeners = new Set<() => void>();
   let state: EditorState = Object.freeze({
     document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
@@ -62,6 +70,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
 
   function commit(result: CommandResult): CommandResult {
     if (!result.ok || !result.changed) return result;
+    identity = {};
     const entry: HistoryEntry = Object.freeze({
       id: result.id,
       revision: result.revision,
@@ -86,6 +95,30 @@ export function createEditorStore(initialProject: Project): EditorStore {
     executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
     executeTransaction: (commands, expectedRevision, transactionId) =>
       commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
+    getAssetBytes: () => assetBytes.clone(),
+    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    confirmSaved(revision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
+      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
+      return true;
+    },
+    replaceProject(loaded, expectedIdentity) {
+      if (identity !== expectedIdentity) return false;
+      const nextBus = createCommandBus(loaded.project);
+      const nextAssets = loaded.assets.clone();
+      bus = nextBus;
+      assetBytes.clear();
+      assetBytes = nextAssets;
+      identity = {};
+      publish({
+        ...state,
+        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+        history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
+      });
+      return true;
+    },
     setSelection(ids, activeId) {
       const valid = new Set(state.document.project.nodes.map((node) => node.id));
       const selected = [...new Set(ids.filter((id) => valid.has(id)))];

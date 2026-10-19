@@ -77,9 +77,13 @@ src/
     editor-store.ts
     use-editor-store.ts
   domain/
+    schemas/
+      document-v1.schema.json
+      manifest-v1.schema.json
     command-bus.ts
     create-project.ts
     index.ts
+    project-serialization.ts
     types.ts
     validate-project.ts
   spikes/
@@ -114,6 +118,7 @@ tests/
   domain/
     commands.test.ts
     project.test.ts
+    serialization.test.ts
   export/
     generate-tsx.test.ts
     prepare.test.ts
@@ -271,62 +276,6 @@ Alternatives: Единый quality toggle для всего.
 ## Решение по ADR-003
 
 Manifold 3.5.4 пригоден как основа будущего CSG Worker для закрытых тел: реальные операции и базовая геометрическая валидация прошли, Vite dev-маршрут запущен. **ADR-003 остаётся PROPOSED** до проверки UV/материалов, отмены во время тяжёлого вычисления, устойчивости на сложных импортированных сетках и памяти. Блокирующей ошибки в проверенных простых телах нет; для production-интеграции эти риски существенны.
-</file>
-
-<file path="docs/data-contracts.md">
-# Data and contracts
-
-## Project invariants
-
-- Exactly one Model and one Scene.
-- Node has unique stable ID and parent cannot form cycle.
-- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
-- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
-- Session history in RAM only, no autosave on tab close.
-
-## Entities
-
-- `Project`: schemaVersion/modelId/sceneId/assets/animations
-- `Model`: rootNodeId/revision/child hierarchy
-- `Scene`: camera/background/HDRI/light/instances
-- `Node`: id/type/transform/parent/material/modifiers
-- `Modifier`: id/type/order/args/enabled
-- `Material`: PBR fields + slots
-- `Asset`: hash/mediaType/path/colorspace
-- `AnimationClip`: duration/loop/trackRefs
-- `Track`: nodeId/propertyPath/keyframes
-- `InteractionRule NEXT`: typed event/condition/action
-
-## Messages
-
-- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
-- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
-- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
-- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
-- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
-- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
-
-## Data sample
-
-```json
-{
-  "formatVersion": "1.0.0",
-  "projectId": "project-unique-id",
-  "model": {"id": "model-1", "rootNodeId": "root-1", "revision": 4},
-  "scene": {"id": "scene-1", "modelInstances": []},
-  "nodes": [
-    {"id": "root-1", "parentId": null, "kind": "group",
-     "name": "Модель", "children": ["torus-1"],
-     "transform": {"position": [0,0,0], "rotationQuat": [0,0,0,1], "scale": [1,1,1]},
-     "visible": true, "locked": false, "materialSlots": [], "modifierIds": []}
-  ],
-  "modifiers": [], "materials": [], "animations": [], "assets": []
-}
-```
-
-## Error codes
-
-FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
 </file>
 
 <file path="docs/implementation-plan.md">
@@ -3548,6 +3497,82 @@ export function useEditorStore(store: EditorStore): EditorState {
 }
 </file>
 
+<file path="src/domain/schemas/document-v1.schema.json">
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triad-3d.local/schemas/document-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "model", "scene", "nodes", "modifiers", "materials", "assets", "animations", "tracks", "keyframes"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "id": { "$ref": "#/$defs/id" },
+    "name": { "type": "string" },
+    "model": { "$ref": "#/$defs/model" },
+    "scene": { "$ref": "#/$defs/scene" },
+    "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+    "modifiers": { "type": "array", "items": { "$ref": "#/$defs/modifier" } },
+    "materials": { "type": "array", "items": { "$ref": "#/$defs/material" } },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
+    "animations": { "type": "array", "items": { "$ref": "#/$defs/animation" } },
+    "tracks": { "type": "array", "items": { "$ref": "#/$defs/track" } },
+    "keyframes": { "type": "array", "items": { "$ref": "#/$defs/keyframe" } }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "number": { "type": "number" },
+    "vec3": { "type": "array", "prefixItems": [{ "$ref": "#/$defs/number" }, { "$ref": "#/$defs/number" }, { "$ref": "#/$defs/number" }], "minItems": 3, "maxItems": 3 },
+    "quat": { "type": "array", "prefixItems": [{ "$ref": "#/$defs/number" }, { "$ref": "#/$defs/number" }, { "$ref": "#/$defs/number" }, { "$ref": "#/$defs/number" }], "minItems": 4, "maxItems": 4 },
+    "transform": { "type": "object", "additionalProperties": false, "required": ["position", "rotationQuat", "scale"], "properties": { "position": { "$ref": "#/$defs/vec3" }, "rotationQuat": { "$ref": "#/$defs/quat" }, "scale": { "$ref": "#/$defs/vec3" } } },
+    "model": { "type": "object", "additionalProperties": false, "required": ["id", "rootNodeId", "revision"], "properties": { "id": { "$ref": "#/$defs/id" }, "rootNodeId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 0 } } },
+    "camera": { "type": "object", "additionalProperties": false, "required": ["projection", "position", "target", "fovDegrees", "near", "far"], "properties": { "projection": { "const": "perspective" }, "position": { "$ref": "#/$defs/vec3" }, "target": { "$ref": "#/$defs/vec3" }, "fovDegrees": { "$ref": "#/$defs/number" }, "near": { "$ref": "#/$defs/number" }, "far": { "$ref": "#/$defs/number" } } },
+    "background": { "type": "object", "additionalProperties": false, "required": ["color", "intensity"], "properties": { "color": { "$ref": "#/$defs/vec3" }, "environmentAssetId": { "$ref": "#/$defs/id" }, "intensity": { "$ref": "#/$defs/number" } } },
+    "light": { "type": "object", "additionalProperties": false, "required": ["id", "kind", "color", "intensity", "position", "target"], "properties": { "id": { "$ref": "#/$defs/id" }, "kind": { "enum": ["ambient", "directional", "point", "spot"] }, "color": { "$ref": "#/$defs/vec3" }, "intensity": { "$ref": "#/$defs/number" }, "position": { "$ref": "#/$defs/vec3" }, "target": { "$ref": "#/$defs/vec3" } } },
+    "instance": { "type": "object", "additionalProperties": false, "required": ["id", "modelId", "transform", "visible"], "properties": { "id": { "$ref": "#/$defs/id" }, "modelId": { "$ref": "#/$defs/id" }, "transform": { "$ref": "#/$defs/transform" }, "visible": { "type": "boolean" } } },
+    "scene": { "type": "object", "additionalProperties": false, "required": ["id", "camera", "background", "lights", "instances"], "properties": { "id": { "$ref": "#/$defs/id" }, "camera": { "$ref": "#/$defs/camera" }, "background": { "$ref": "#/$defs/background" }, "lights": { "type": "array", "items": { "$ref": "#/$defs/light" } }, "instances": { "type": "array", "items": { "$ref": "#/$defs/instance" } } } },
+    "slot": { "type": "object", "additionalProperties": false, "required": ["name", "materialId"], "properties": { "name": { "type": "string" }, "materialId": { "$ref": "#/$defs/id" } } },
+    "nodeBase": { "type": "object", "required": ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"], "properties": { "id": { "$ref": "#/$defs/id" }, "kind": { "enum": ["group", "mesh"] }, "name": { "type": "string" }, "parentId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "children": { "type": "array", "items": { "$ref": "#/$defs/id" } }, "transform": { "$ref": "#/$defs/transform" }, "visible": { "type": "boolean" }, "locked": { "type": "boolean" }, "materialSlots": { "type": "array", "items": { "$ref": "#/$defs/slot" } }, "modifierIds": { "type": "array", "items": { "$ref": "#/$defs/id" } } } },
+    "meshSource": { "oneOf": [
+      { "type": "object", "additionalProperties": false, "required": ["kind", "primitive", "parameters"], "properties": { "kind": { "const": "primitive" }, "primitive": { "enum": ["cube", "sphere", "torus", "cylinder", "cone", "plane"] }, "parameters": { "type": "object", "additionalProperties": { "$ref": "#/$defs/number" } } } },
+      { "type": "object", "additionalProperties": false, "required": ["kind", "assetId"], "properties": { "kind": { "const": "asset" }, "assetId": { "$ref": "#/$defs/id" } } }
+    ] },
+    "node": { "oneOf": [
+      { "type": "object", "allOf": [{ "$ref": "#/$defs/nodeBase" }, { "properties": { "kind": { "const": "group" } }, "required": ["kind"] }], "unevaluatedProperties": false },
+      { "type": "object", "allOf": [{ "$ref": "#/$defs/nodeBase" }, { "properties": { "kind": { "const": "mesh" }, "meshSource": { "$ref": "#/$defs/meshSource" } }, "required": ["kind", "meshSource"] }], "unevaluatedProperties": false }
+    ] },
+    "modifierParameter": { "anyOf": [{ "$ref": "#/$defs/number" }, { "type": "string" }, { "type": "boolean" }, { "type": "array", "items": { "$ref": "#/$defs/number" } }] },
+    "modifier": { "type": "object", "additionalProperties": false, "required": ["id", "nodeId", "kind", "order", "enabled", "version", "parameters"], "properties": { "id": { "$ref": "#/$defs/id" }, "nodeId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["boolean", "mirror", "array", "bend", "twist", "taper", "bevel"] }, "order": { "type": "integer", "minimum": 0 }, "enabled": { "type": "boolean" }, "version": { "type": "integer", "minimum": 0 }, "parameters": { "type": "object", "additionalProperties": { "$ref": "#/$defs/modifierParameter" } } } },
+    "material": { "type": "object", "additionalProperties": false, "required": ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string" }, "baseColor": { "$ref": "#/$defs/vec3" }, "metalness": { "$ref": "#/$defs/number" }, "roughness": { "$ref": "#/$defs/number" }, "emissive": { "$ref": "#/$defs/vec3" }, "opacity": { "$ref": "#/$defs/number" }, "transmission": { "$ref": "#/$defs/number" }, "ior": { "$ref": "#/$defs/number" }, "clearcoat": { "$ref": "#/$defs/number" }, "envIntensity": { "$ref": "#/$defs/number" }, "textureAssetIds": { "type": "array", "items": { "$ref": "#/$defs/id" } } } },
+    "asset": { "type": "object", "additionalProperties": false, "required": ["id", "hash", "mediaType", "path", "colorSpace"], "properties": { "id": { "$ref": "#/$defs/id" }, "hash": { "type": "string" }, "mediaType": { "type": "string" }, "path": { "type": "string" }, "colorSpace": { "enum": ["srgb", "linear", "none"] } } },
+    "animation": { "type": "object", "additionalProperties": false, "required": ["id", "name", "durationSeconds", "loop", "trackIds"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string" }, "durationSeconds": { "$ref": "#/$defs/number" }, "loop": { "type": "boolean" }, "trackIds": { "type": "array", "items": { "$ref": "#/$defs/id" } } } },
+    "track": { "type": "object", "additionalProperties": false, "required": ["id", "nodeId", "property", "keyframeIds"], "properties": { "id": { "$ref": "#/$defs/id" }, "nodeId": { "$ref": "#/$defs/id" }, "property": { "enum": ["transform.position", "transform.rotationQuat", "transform.scale"] }, "keyframeIds": { "type": "array", "items": { "$ref": "#/$defs/id" } } } },
+    "keyframe": { "type": "object", "additionalProperties": false, "required": ["id", "timeSeconds", "value", "interpolation"], "properties": { "id": { "$ref": "#/$defs/id" }, "timeSeconds": { "$ref": "#/$defs/number" }, "value": { "anyOf": [{ "$ref": "#/$defs/number" }, { "$ref": "#/$defs/vec3" }, { "$ref": "#/$defs/quat" }] }, "interpolation": { "enum": ["step", "linear", "bezier"] } } }
+  }
+}
+</file>
+
+<file path="src/domain/schemas/manifest-v1.schema.json">
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triad-3d.local/schemas/manifest-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["formatVersion", "appVersion", "document", "assets"],
+  "properties": {
+    "formatVersion": { "const": "1.0.0" },
+    "appVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "document": { "$ref": "#/$defs/document" },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "document": { "type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": { "path": { "const": "document.json" }, "sha256": { "$ref": "#/$defs/sha256" } } },
+    "asset": { "type": "object", "additionalProperties": false, "required": ["id", "path", "sha256"], "properties": { "id": { "type": "string", "minLength": 1, "pattern": "\\S" }, "path": { "$ref": "#/$defs/path" }, "sha256": { "$ref": "#/$defs/sha256" } } }
+  }
+}
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { EntityId, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -3848,6 +3873,199 @@ export function createProject(idFactory: IdFactory = () => crypto.randomUUID()):
     tracks: [],
     keyframes: [],
   };
+}
+</file>
+
+<file path="src/domain/project-serialization.ts">
+import Ajv2020 from "ajv/dist/2020.js";
+import documentSchema from "./schemas/document-v1.schema.json";
+import manifestSchema from "./schemas/manifest-v1.schema.json";
+import type { Project } from "./types";
+import { validateProject } from "./validate-project";
+
+export const DOCUMENT_SCHEMA_VERSION = "1.0.0";
+export const NATIVE_FORMAT_VERSION = "1.0.0";
+export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
+
+export type SerializationErrorCode = "FILE_INVALID" | "SCHEMA_UNSUPPORTED";
+export interface SerializationError {
+  code: SerializationErrorCode;
+  message: string;
+  path?: string;
+  details?: string;
+}
+export type Result<T> = { ok: true; value: T } | { ok: false; error: SerializationError };
+
+export interface NativeManifest {
+  formatVersion: string;
+  appVersion: string;
+  document: { path: "document.json"; sha256: string };
+  assets: { id: string; path: string; sha256: string }[];
+}
+
+export interface DocumentMigration {
+  readonly from: string;
+  readonly to: string;
+  migrate(input: unknown): unknown;
+}
+
+const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
+const documentValidator = ajv.compile(documentSchema);
+const manifestValidator = ajv.compile(manifestSchema);
+const fail = (code: SerializationErrorCode, message: string, path?: string, details?: string): Result<never> => ({
+  ok: false, error: { code, message, ...(path === undefined ? {} : { path }), ...(details === undefined ? {} : { details }) },
+});
+
+function schemaError(errors: typeof documentValidator.errors): Result<never> {
+  const first = errors?.[0];
+  const path = first?.keyword === "required" && typeof first.params.missingProperty === "string"
+    ? `${first.instancePath}/${first.params.missingProperty}`
+    : first?.keyword === "additionalProperties" && typeof first.params.additionalProperty === "string"
+      ? `${first.instancePath}/${first.params.additionalProperty}` : first?.instancePath;
+  return fail("FILE_INVALID", "Структура документа не соответствует схеме.", path || "/", first?.message);
+}
+
+function inspect(value: unknown): Result<true> {
+  const active = new WeakSet<object>();
+  const stack: { value: unknown; depth: number; path: string; exit?: boolean }[] = [{ value, depth: 0, path: "/" }];
+  let count = 0;
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item) break;
+    if (item.exit) {
+      active.delete(item.value as object);
+      continue;
+    }
+    if (++count > SERIALIZATION_LIMITS.maxValues) return fail("FILE_INVALID", "Превышен лимит элементов документа.", item.path);
+    if (item.depth > SERIALIZATION_LIMITS.maxDepth) return fail("FILE_INVALID", "Превышена глубина документа.", item.path);
+    if (typeof item.value === "number" && !Number.isFinite(item.value)) return fail("FILE_INVALID", "Число должно быть конечным.", item.path);
+    if (item.value && typeof item.value === "object") {
+      if (active.has(item.value)) return fail("FILE_INVALID", "Цикл в документе.", item.path);
+      active.add(item.value);
+      stack.push({ ...item, exit: true });
+      for (const key of Object.keys(item.value)) {
+        stack.push({ value: (item.value as Record<string, unknown>)[key], depth: item.depth + 1, path: `${item.path === "/" ? "" : item.path}/${key}` });
+      }
+    }
+  }
+  return { ok: true, value: true };
+}
+
+function isProject(value: unknown): value is Project {
+  return documentValidator(value);
+}
+
+function isNativeManifest(value: unknown): value is NativeManifest {
+  return manifestValidator(value);
+}
+
+function validateDocument(value: unknown): Result<Project> {
+  const safety = inspect(value);
+  if (!safety.ok) return safety;
+  if (!isProject(value)) return schemaError(documentValidator.errors);
+  const issues = validateProject(value);
+  if (issues.length) {
+    const issue = issues[0];
+    return fail("FILE_INVALID", "Нарушена целостность проекта.", issue?.path, issue?.code);
+  }
+  return { ok: true, value };
+}
+
+function versionOf(value: unknown): Result<string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект проекта.", "/");
+  const version = (value as Record<string, unknown>).schemaVersion;
+  if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия документа.", "/schemaVersion");
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) return fail("SCHEMA_UNSUPPORTED", "Неверный формат версии документа.", "/schemaVersion");
+  return { ok: true, value: version };
+}
+
+export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {
+  const initial = versionOf(value);
+  if (!initial.ok) return initial;
+  let version = initial.value;
+  let current = value;
+  const visited = new Set<string>();
+  while (version !== DOCUMENT_SCHEMA_VERSION) {
+    if (visited.has(version) || visited.size >= 32) return fail("SCHEMA_UNSUPPORTED", "Цикл или слишком длинная цепочка миграций.", "/schemaVersion");
+    visited.add(version);
+    const migration = migrations.find((entry) => entry.from === version);
+    if (!migration) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version} не поддерживается.`, "/schemaVersion");
+    try {
+      // Migration code is trusted application code; each step receives an isolated copy.
+      current = migration.migrate(JSON.parse(JSON.stringify(current)));
+    } catch {
+      return fail("FILE_INVALID", "Миграция документа завершилась ошибкой.", "/schemaVersion");
+    }
+    const next = versionOf(current);
+    if (!next.ok) return next;
+    if (next.value !== migration.to) return fail("FILE_INVALID", "Миграция вернула неожиданную версию.", "/schemaVersion");
+    version = next.value;
+  }
+  return { ok: true, value: current };
+}
+
+export function serializeProjectDocument(project: Project): Result<string> {
+  try {
+    const version = versionOf(project);
+    if (!version.ok) return version;
+    if (version.value !== DOCUMENT_SCHEMA_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version.value} не поддерживается.`, "/schemaVersion");
+    const checked = validateDocument(project);
+    if (!checked.ok) return checked;
+    const json = JSON.stringify(project);
+    if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
+    return { ok: true, value: json };
+  } catch {
+    return fail("FILE_INVALID", "Не удалось сериализовать документ.");
+  }
+}
+
+export function deserializeProjectDocument(json: string, migrations: readonly DocumentMigration[] = []): Result<Project> {
+  if (typeof json !== "string") return fail("FILE_INVALID", "Ожидается JSON-строка.");
+  if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
+  let parsed: unknown;
+  try { parsed = JSON.parse(json); } catch { return fail("FILE_INVALID", "Некорректный JSON."); }
+  const safety = inspect(parsed);
+  if (!safety.ok) return safety;
+  const migrated = migrateProjectDocument(parsed, migrations);
+  if (!migrated.ok) return migrated;
+  const checked = validateDocument(migrated.value);
+  if (!checked.ok) return checked;
+  // A parsed JSON tree is already independent; migrations are checked again above.
+  return checked;
+}
+
+function safeArchivePath(path: string): boolean {
+  return path.length > 0 && path.length <= 1024 && !/[\\:%]/.test(path) &&
+    !Array.from(path).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) &&
+    !path.startsWith("/") && !path.endsWith("/") &&
+    path.split("/").every((part) => part !== "" && part !== "." && part !== ".." && !/[. ]$/.test(part) &&
+      !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part));
+}
+
+export function validateNativeManifest(value: unknown): Result<NativeManifest> {
+  try {
+    const safety = inspect(value);
+    if (!safety.ok) return safety;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект manifest.");
+    const version = (value as Record<string, unknown>).formatVersion;
+    if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия manifest.", "/formatVersion");
+    if (version !== NATIVE_FORMAT_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия контейнера ${version} не поддерживается.`, "/formatVersion");
+    if (!isNativeManifest(value)) return schemaError(manifestValidator.errors);
+    const manifest = value;
+    const paths = new Set<string>([manifest.document.path.toLowerCase()]);
+    const ids = new Set<string>();
+    for (const [index, asset] of manifest.assets.entries()) {
+      if (!safeArchivePath(asset.path)) return fail("FILE_INVALID", "Недопустимый путь ресурса.", `/assets/${index}/path`);
+      const folded = asset.path.toLowerCase();
+      if (paths.has(folded)) return fail("FILE_INVALID", "Пути в manifest конфликтуют.", `/assets/${index}/path`);
+      if (ids.has(asset.id)) return fail("FILE_INVALID", "ID ресурса повторяется.", `/assets/${index}/id`);
+      paths.add(folded);
+      ids.add(asset.id);
+    }
+    return { ok: true, value: manifest };
+  } catch {
+    return fail("FILE_INVALID", "Не удалось проверить manifest.");
+  }
 }
 </file>
 
@@ -5366,6 +5584,119 @@ describe("project document graph", () => {
 });
 </file>
 
+<file path="tests/domain/serialization.test.ts">
+import { describe, expect, it } from "vitest";
+import {
+  deserializeProjectDocument, migrateProjectDocument, serializeProjectDocument,
+  validateNativeManifest, type NativeManifest,
+} from "../../src/domain";
+import {
+  emptyProject, createNestedMeshProject, createMaterialAnimationProject,
+  createDuplicateIdProject, createInvalidHierarchyProject, createMissingReferenceProject,
+} from "../fixtures/projects";
+
+const clone = <T>(value: T): T => structuredClone(value);
+const jsonOf = (value: unknown) => JSON.stringify(value);
+
+describe("project document schema v1", () => {
+  it.each([emptyProject, createNestedMeshProject(), createMaterialAnimationProject()])("round-trips complete projects", (project) => {
+    const before = clone(project);
+    const serialized = serializeProjectDocument(project);
+    expect(serialized.ok, JSON.stringify(serialized)).toBe(true);
+    if (!serialized.ok) return;
+    expect(serializeProjectDocument(project)).toEqual(serialized);
+    const restored = deserializeProjectDocument(serialized.value);
+    expect(restored).toEqual({ ok: true, value: project });
+    expect(project).toEqual(before);
+    if (restored.ok) expect(restored.value).not.toBe(project);
+  });
+
+  it("keeps modifier ordering, assets, zero, false and optional fields", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh");
+    if (!mesh) throw new Error("Missing mesh");
+    project.assets.push({ id: "asset-1", hash: "hash", mediaType: "image/png", path: "assets/x.png", colorSpace: "srgb" });
+    project.scene.background.environmentAssetId = "asset-1";
+    project.modifiers.push(
+      { id: "modifier-1", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 1, parameters: { axis: [1, 0, 0] } },
+      { id: "modifier-2", nodeId: mesh.id, kind: "bevel", order: 1, enabled: true, version: 1, parameters: { width: 0 } },
+    );
+    mesh.modifierIds.push("modifier-1", "modifier-2");
+    const result = serializeProjectDocument(project);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    if (result.ok) expect(deserializeProjectDocument(result.value)).toEqual({ ok: true, value: project });
+  });
+
+  it.each([
+    ["bad JSON", "{"],
+    ["missing version", jsonOf({ ...emptyProject, schemaVersion: undefined })],
+    ["extra property", jsonOf({ ...emptyProject, unexpected: true })],
+    ["bad enum", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, projection: "orthographic" } } })],
+    ["bad vector", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, position: [1, 2] } } })],
+    ["bad quaternion", jsonOf({ ...emptyProject, nodes: [{ ...emptyProject.nodes[0], transform: { ...emptyProject.nodes[0]?.transform, rotationQuat: [0, 0, 1] } }] })],
+    ["bad number", jsonOf({ ...emptyProject, model: { ...emptyProject.model, revision: -1 } })],
+  ])("rejects %s", (_name, input) => {
+    const result = deserializeProjectDocument(input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
+  });
+
+  it.each(["2.0.0", "1.1.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+    const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
+  });
+
+  it.each([createDuplicateIdProject(), createInvalidHierarchyProject(), createMissingReferenceProject()])("rejects broken domain links", (project) => {
+    const result = deserializeProjectDocument(jsonOf(project));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
+  });
+
+  it("rejects nonfinite numbers without mutating input", () => {
+    const project = clone(emptyProject);
+    project.scene.camera.fovDegrees = Number.POSITIVE_INFINITY;
+    const result = serializeProjectDocument(project);
+    expect(result.ok).toBe(false);
+    expect(project.scene.camera.fovDegrees).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("enforces input size and nesting limits", () => {
+    expect(deserializeProjectDocument(" ".repeat(17 * 1024 * 1024)).ok).toBe(false);
+    const deep = `${"[".repeat(70)}0${"]".repeat(70)}`;
+    expect(deserializeProjectDocument(deep).ok).toBe(false);
+  });
+
+  it("provides pure migration chaining without an invented built-in migration", () => {
+    const old = { ...emptyProject, schemaVersion: "0.9.0" };
+    const before = clone(old);
+    const migration = { from: "0.9.0", to: "1.0.0", migrate: (input: unknown) => ({ ...(input as object), schemaVersion: "1.0.0" }) };
+    expect(migrateProjectDocument(old, [migration])).toEqual({ ok: true, value: emptyProject });
+    expect(old).toEqual(before);
+    expect(deserializeProjectDocument(jsonOf(old), [migration])).toEqual({ ok: true, value: emptyProject });
+  });
+});
+
+describe("native manifest v1", () => {
+  const sha256 = "a".repeat(64);
+  const manifest: NativeManifest = {
+    formatVersion: "1.0.0", appVersion: "0.1.0", document: { path: "document.json", sha256 },
+    assets: [{ id: "asset-1", path: "assets/image.png", sha256 }],
+  };
+
+  it("accepts the contract", () => expect(validateNativeManifest(manifest)).toEqual({ ok: true, value: manifest }));
+  it.each(["../image.png", "/assets/image.png", "assets\\image.png", "assets/%2e%2e/x", "C:/x", "assets//x", "assets/./x"])('rejects unsafe path %s', (path) => {
+    const candidate = clone(manifest);
+    candidate.assets[0]!.path = path;
+    expect(validateNativeManifest(candidate).ok).toBe(false);
+  });
+  it("rejects duplicate paths and invalid digests", () => {
+    expect(validateNativeManifest({ ...manifest, assets: [...manifest.assets, { id: "other", path: "ASSETS/IMAGE.PNG", sha256 }] }).ok).toBe(false);
+    expect(validateNativeManifest({ ...manifest, document: { ...manifest.document, sha256: "bad" } }).ok).toBe(false);
+  });
+});
+</file>
+
 <file path="tests/export/generate-tsx.test.ts">
 import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
@@ -5771,14 +6102,51 @@ export default defineConfig({
 });
 </file>
 
-<file path="src/domain/index.ts">
-export { createProject } from "./create-project";
-export type { IdFactory } from "./create-project";
-export { validateProject } from "./validate-project";
-export type { ValidationCode, ValidationIssue } from "./validate-project";
-export type * from "./types";
-export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
-export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+<file path="docs/data-contracts.md">
+# Data and contracts
+
+## Project invariants
+
+- Exactly one Model and one Scene.
+- Node has unique stable ID and parent cannot form cycle.
+- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
+- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
+- Session history in RAM only, no autosave on tab close.
+
+## Entities
+
+- `Project`: schemaVersion/modelId/sceneId/assets/animations
+- `Model`: rootNodeId/revision/child hierarchy
+- `Scene`: camera/background/HDRI/light/instances
+- `Node`: id/type/transform/parent/material/modifiers
+- `Modifier`: id/type/order/args/enabled
+- `Material`: PBR fields + slots
+- `Asset`: hash/mediaType/path/colorspace
+- `AnimationClip`: duration/loop/trackRefs
+- `Track`: nodeId/propertyPath/keyframes
+- `InteractionRule NEXT`: typed event/condition/action
+
+## Messages
+
+- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
+- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
+- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
+- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
+- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
+- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
+
+## JSON document and native manifest v1
+
+- `document.json` uses the current `Project` shape and `schemaVersion: "1.0.0"`. Its authoritative machine-readable contract is [`document-v1.schema.json`](../src/domain/schemas/document-v1.schema.json). `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
+- `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
+- Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. No migration is registered until a real earlier schema exists.
+- Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
+
+The earlier illustrative example used `formatVersion`, `projectId`, and `scene.modelInstances` inside the document. The implemented domain type instead uses `schemaVersion`, `id`, and `scene.instances`; TASK-009 fixes the JSON contract to those existing types without inventing fields.
+
+## Error codes
+
+FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
 </file>
 
 <file path="src/domain/validate-project.ts">
@@ -6106,12 +6474,25 @@ export default tseslint.config(
 );
 </file>
 
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
+export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
+export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
+export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
 <file path="tsconfig.json">
 {
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
     "jsx": "react-jsx",
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -6192,6 +6573,12 @@ function EditorShell() {
 <file path="docs/implementation-status.md">
 # Implementation status
 
+## TASK-009 — Versioned project JSON serialization
+
+- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
+- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
+- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
+
 ## TASK-007 — Domain commands and transactions
 
 - Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
@@ -6254,6 +6641,7 @@ function EditorShell() {
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "manifold-3d": "^3.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
