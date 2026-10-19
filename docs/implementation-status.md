@@ -1,5 +1,10 @@
 # Implementation status
 
+## TASK-003 — CSG/Manifold WASM spike
+
+- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
+- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
+
 ## TASK-002 — Renderer/PBR spike
 
 - Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.

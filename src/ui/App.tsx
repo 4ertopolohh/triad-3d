@@ -4,11 +4,17 @@ import { lazy, Suspense } from "react";
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
   : null;
+const CsgSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/csg/CsgSpike"))
+  : null;
 
 const project = createProject();
 const issues = validateProject(project);
 
 export function App() {
+  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
+    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
+  }
   if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
     return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
   }

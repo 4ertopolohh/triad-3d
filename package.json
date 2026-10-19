@@ -25,6 +25,7 @@
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "manifold-3d": "^3.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "three": "0.186.1"

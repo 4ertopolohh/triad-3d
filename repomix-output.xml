@@ -41,10 +41,14 @@ The content is organized as follows:
 
 <directory_structure>
 docs/
+  renderer-snapshots/
+    webgl2.jpg
+    webgpu.jpg
   architecture.md
   data-contracts.md
   implementation-plan.md
   implementation-status.md
+  renderer-decision.md
   requirements.json
   requirements.md
   risks.md
@@ -61,12 +65,20 @@ src/
     index.ts
     types.ts
     validate-project.ts
+  spikes/
+    renderer/
+      assets/
+        studio_small_03_1k.hdr
+      reference-scene.ts
+      renderer-spike.css
+      RendererSpike.tsx
   ui/
     styles/
       app.css
       tokens.css
     App.tsx
   main.tsx
+  vite-env.d.ts
 tests/
   domain/
     project.test.ts
@@ -712,17 +724,68 @@ Complete dependencies in order. Estimates are planning targets, not commitments.
 - Estimate: 2–4 ч
 </file>
 
-<file path="docs/implementation-status.md">
-# Implementation status
+<file path="docs/renderer-decision.md">
+# TASK-002 — WebGPU/WebGL2 и PBR
 
-## TASK-006 — React/Vite foundation
+Дата проверки: 19 октября 2026. Статус spike: **COMPLETED** для двух доступных backend в одном браузерном окружении. **ADR-004 остаётся PROPOSED** до межбраузерной и аппаратной проверки.
 
-- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
-- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
-- The document remains in memory only. No browser storage or backend is used.
-- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
-- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
-- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+## Воспроизведение
+
+```text
+npm ci
+npm run dev
+http://127.0.0.1:5173/?spike=renderer
+```
+
+Если порт занят, используйте адрес, напечатанный Vite. Режим доступен только в dev-сборке; обычный экран редактора открывается без query-параметра. Выберите оба режима по очереди, дождитесь статуса «Готово» и «HDRI: Загружен», затем нажмите «Сбросить вид». Сравнивайте при одинаковом размере окна. Контрольные снимки 1280×800: [WebGPU](renderer-snapshots/webgpu.jpg) и [WebGL2](renderer-snapshots/webgl2.jpg). На каждом снимке виден фактический backend.
+
+## Среда и версии
+
+| Параметр | Наблюдение |
+| --- | --- |
+| Three.js / `@types/three` | 0.186.1 / 0.186.0, зафиксированы в lockfile |
+| TypeScript | 5.9.3 |
+| ОС | Windows 11 Home, build 26300 |
+| Установленные GPU | NVIDIA GeForce GTX 1050 with Max-Q Design, Intel UHD Graphics 620; какой адаптер выбрал браузер, не определено |
+| Браузер испытания | Встроенный Chromium браузер Codex; точная версия не предоставлена инструментом |
+| Chrome / Edge | В этом испытании не использовались; версии и результаты `UNVERIFIED` |
+| Размер | viewport 1280×800 CSS px, canvas 1215×534 CSS px; устройство с DPR браузера |
+
+## Матрица совместимости
+
+`PASS` означает наблюдаемый результат в указанной среде; `UNVERIFIED` — отсутствие испытания, а не положительный результат.
+
+| Проверка | Auto / WebGPU preferred | Forced WebGL2 |
+| --- | --- | --- |
+| `renderer.init()` и кадр | PASS — фактически WebGPU | PASS — фактически WebGL2 |
+| Хром, отражения | PASS — яркие отражения HDRI видны на сфере | PASS — отражения видны |
+| Стекло, transmission / IOR | PASS — полосы позади сферы видны сквозь неё, отражения сохранены | PASS — тот же эффект виден |
+| Normal map | PASS — периодический рельеф заметен при направленном свете | PASS — рельеф заметен |
+| Локальный HDRI | PASS — загружен и виден в фоне и отражениях | PASS — загружен и виден |
+| Повторное переключение, один canvas | PASS | PASS |
+| Reset View | PASS — после вращения восстановлена фиксированная камера | NOT_APPLICABLE — отдельно не повторялось в этой ветке, код общий |
+| Автоматический fallback при отсутствии WebGPU | UNVERIFIED — WebGPU здесь доступен | NOT_APPLICABLE |
+| Отсутствие WebGL2 / ошибка GPU-инициализации | UNVERIFIED | UNVERIFIED |
+| Ошибка загрузки HDRI | UNVERIFIED — обработчик реализован, ресурс не повреждался для испытания | UNVERIFIED |
+| Другие браузеры и GPU | UNVERIFIED | UNVERIFIED |
+
+После перехода по ссылке «Вернуться в редактор» обычная страница показана без canvas. В консоли при первичной проверке обнаружено предупреждение об устаревшем `RGBELoader`; прототип переведён на `HDRLoader` и повторно проверен. Других ошибок и явных различий между снимками не выявлено. Снимки демонстрируют базовую работоспособность, но не являются пиксельным или колориметрическим сравнением. Для Studio Small 03 характерен большой перепад яркости: фон, подставка и стекло местами очень светлые; для будущих пресетов следует отдельно калибровать экспозицию.
+
+## Эталонная сцена и pipeline
+
+Оба режима создают сцену одной фабрикой. Сферы имеют одинаковую геометрию с UV и нормалями. Хром: `MeshPhysicalMaterial`, metalness 1, roughness 0.08. Стекло: transmission 1, IOR 1.5, thickness 1.4, opacity 1. Normal map детерминированно генерируется в canvas, помечена `NoColorSpace` и накладывается на UV-сферу. Общие камера, свет, HDRI, ACES Filmic tone mapping, exposure 1.25 и выходной `SRGBColorSpace` заданы независимо от backend. HDRI загружается как radiance data через `HDRLoader` и используется с `EquirectangularReflectionMapping`; Three.js выполняет необходимую обработку environment для PBR. При ошибке HDRI сцена остаётся с нейтральным освещением, а статус становится `FAILED`.
+
+HDRI: [Poly Haven — Studio Small 03](https://polyhaven.com/a/studio_small_03), автор Greg Zaal, 1K `.hdr`, 1 686 299 байт, SHA-256 `30933D55E45F0795DAF49F3CBEFBE0E5EBCB821EE04FB0A2818C02FFC3938817`. [Лицензия CC0](https://polyhaven.com/license). Файл хранится локально в `src/spikes/renderer/assets/` и включается только в dev-режим; сетевое соединение при запуске сцены не требуется.
+
+## Решение и ограничения
+
+Для TASK-014 рекомендован единый `WebGPURenderer` с предпочтением WebGPU и его WebGL2 fallback, а также явный `forceWebGL` для диагностики и тестов. Показывать backend следует по `renderer.backend` **после** `await renderer.init()`, не по `navigator.gpu` и не по `isWebGPURenderer`, который обозначает класс renderer. При невозможности инициализации — ошибка и ручной повторный запуск, без бесконечных попыток. Владение canvas, loop, controls, textures, materials и geometries должно быть ограничено жизненным циклом adapter; TASK-014 отдельно реализует context-loss recovery и синхронизацию из утверждённого доменного состояния.
+
+Для TASK-029 следует зафиксировать поддерживаемую PBR-схему и цветовые пространства: normal map — данные, цветовые текстуры — sRGB, HDR environment — линейный радианс. Перед production нужны visual golden для металла и стекла на разных устройствах. Для TASK-036 профили качества должны иметь измеренную матрицу возможностей каждого backend и явные предупреждения о деградации. FPS и бюджет памяти в этом spike не измерялись.
+
+По [руководству Three.js](https://threejs.org/manual/pages/webgpurenderer) `WebGPURenderer` остаётся экспериментальным; классические `ShaderMaterial`, `RawShaderMaterial`, `onBeforeCompile()` и старый `EffectComposer` не поддерживаются этим renderer. Пользовательские эффекты для него потребуют node materials / TSL и отдельной проверки обеих веток. Это ограничение документации, **не результат запуска таких эффектов в данном spike**. [API `WebGPURenderer`](https://threejs.org/docs/pages/WebGPURenderer.html) подтверждает `forceWebGL`; [API `MeshPhysicalMaterial`](https://threejs.org/docs/pages/MeshPhysicalMaterial.html) подтверждает требование `opacity: 1` при ненулевом transmission.
+
+Двух успешных запусков в одном браузере недостаточно для окончательного выбора production backend. До принятия ADR-004 нужны Chrome и Edge с зафиксированными версиями и фактически выбранным GPU, испытание отсутствия WebGPU/WebGL2, HDRI decode failure, context loss, серия переключений под профилировщиком, сравнение качества/производительности и тест будущих материалов и postprocessing. Пока стратегия — предпочтение WebGPU с наблюдаемым WebGL2 fallback, без заявления о полной эквивалентности.
 </file>
 
 <file path="docs/requirements.json">
@@ -3406,6 +3469,271 @@ export interface Keyframe {
 }
 </file>
 
+<file path="src/spikes/renderer/reference-scene.ts">
+import * as THREE from "three/webgpu";
+
+export const CAMERA_POSITION = new THREE.Vector3(0, 2.7, 9.2);
+export const CAMERA_TARGET = new THREE.Vector3(0, 0.65, 0);
+
+function normalTexture(): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 256;
+  const context = canvas.getContext("2d")!;
+  const image = context.createImageData(256, 256);
+  for (let y = 0; y < 256; y++) for (let x = 0; x < 256; x++) {
+    const u = x / 256 * Math.PI * 16;
+    const v = y / 256 * Math.PI * 16;
+    const dx = Math.cos(u) * Math.sin(v) * 0.65;
+    const dy = Math.sin(u) * Math.cos(v) * 0.65;
+    const length = Math.hypot(dx, dy, 1);
+    const offset = (y * 256 + x) * 4;
+    image.data[offset] = Math.round((dx / length * 0.5 + 0.5) * 255);
+    image.data[offset + 1] = Math.round((dy / length * 0.5 + 0.5) * 255);
+    image.data[offset + 2] = Math.round((1 / length * 0.5 + 0.5) * 255);
+    image.data[offset + 3] = 255;
+  }
+  context.putImageData(image, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.NoColorSpace;
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(2, 2);
+  return texture;
+}
+
+export function createReferenceScene() {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x252b34);
+  const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+  camera.position.copy(CAMERA_POSITION);
+  camera.lookAt(CAMERA_TARGET);
+  const ownedGeometry: THREE.BufferGeometry[] = [];
+  const ownedMaterials: THREE.Material[] = [];
+  const normalMap = normalTexture();
+
+  function add(geometry: THREE.BufferGeometry, material: THREE.Material, x: number, y: number, z: number) {
+    ownedGeometry.push(geometry);
+    ownedMaterials.push(material);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, y, z);
+    scene.add(mesh);
+    return mesh;
+  }
+
+  add(new THREE.SphereGeometry(0.95, 64, 48), new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 1, roughness: 0.08,
+  }), -2.25, 0.85, 0);
+
+  add(new THREE.SphereGeometry(0.95, 64, 48), new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 0, roughness: 0.04,
+    transmission: 1, ior: 1.5, thickness: 1.4, opacity: 1,
+  }), 0, 0.85, 0);
+
+  const normalMesh = add(new THREE.SphereGeometry(0.95, 64, 48), new THREE.MeshPhysicalMaterial({
+    color: 0x8eabd3, metalness: 0.12, roughness: 0.42,
+    normalMap, normalScale: new THREE.Vector2(0.75, 0.75),
+  }), 2.25, 0.85, 0);
+  normalMesh.rotation.y = 0.35;
+
+  add(new THREE.BoxGeometry(7.5, 0.12, 3), new THREE.MeshStandardMaterial({
+    color: 0x343b46, metalness: 0.05, roughness: 0.72,
+  }), 0, -0.18, 0);
+  // The striped target behind glass makes transmission visible independently of its opacity.
+  for (let i = 0; i < 7; i++) {
+    add(new THREE.BoxGeometry(0.08, 1.6, 0.025), new THREE.MeshBasicMaterial({
+      color: i % 2 ? 0xd8a66a : 0xe1e9f4,
+    }), (i - 3) * 0.2, 0.8, -1.15);
+  }
+
+  const ambient = new THREE.AmbientLight(0xffffff, 0.65);
+  const key = new THREE.DirectionalLight(0xffffff, 3);
+  key.position.set(-2, 5, 4);
+  scene.add(ambient, key);
+
+  return {
+    scene, camera,
+    dispose() {
+      normalMap.dispose();
+      for (const geometry of ownedGeometry) geometry.dispose();
+      for (const material of ownedMaterials) material.dispose();
+    },
+  };
+}
+</file>
+
+<file path="src/spikes/renderer/renderer-spike.css">
+.renderer-spike { min-height: 100vh; padding: 24px; background: var(--color-surface-base); color: var(--color-text-primary); font-family: var(--font-family-ui); }
+.renderer-spike__header { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.renderer-spike__header h1 { margin: 0 0 18px; font-size: 22px; }
+.renderer-spike__eyebrow { margin: 0 0 6px; color: var(--color-text-muted); font-size: 12px; }
+.renderer-spike__header a { color: var(--color-state-info); }
+.renderer-spike__toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.renderer-spike__toolbar label { display: flex; gap: 8px; align-items: center; }
+.renderer-spike__toolbar select, .renderer-spike__toolbar button { min-height: 32px; padding: 4px 10px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: inherit; font: inherit; }
+.renderer-spike__toolbar button { cursor: pointer; }
+.renderer-spike__viewport { width: 100%; height: min(67vh, 700px); min-height: 340px; overflow: hidden; background: #252b34; border: var(--border-default); border-radius: var(--radius-md); }
+.renderer-spike__viewport canvas { display: block; }
+.renderer-spike__diagnostics { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; padding: 12px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); font-size: 13px; }
+.renderer-spike__diagnostics p { flex-basis: 100%; margin: 0; color: var(--color-state-danger); }
+.renderer-spike__legend { color: var(--color-text-secondary); font-size: 13px; }
+</file>
+
+<file path="src/spikes/renderer/RendererSpike.tsx">
+import { useEffect, useRef, useState } from "react";
+import * as THREE from "three/webgpu";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { HDRLoader } from "three/addons/loaders/HDRLoader.js";
+import { CAMERA_POSITION, CAMERA_TARGET, createReferenceScene } from "./reference-scene";
+import hdriUrl from "./assets/studio_small_03_1k.hdr?url";
+import "./renderer-spike.css";
+
+type Mode = "auto" | "webgl2";
+type Backend = "WebGPU" | "WebGL2" | "не определён";
+
+function actualBackend(renderer: THREE.WebGPURenderer): Backend {
+  // Renderer.backend changes to the fallback instance during await renderer.init().
+  if ("isWebGPUBackend" in renderer.backend && renderer.backend.isWebGPUBackend === true) return "WebGPU";
+  if ("isWebGLBackend" in renderer.backend && renderer.backend.isWebGLBackend === true) return "WebGL2";
+  return "не определён";
+}
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export default function RendererSpike() {
+  const host = useRef<HTMLDivElement>(null);
+  const resetView = useRef<() => void>(() => {});
+  const [mode, setMode] = useState<Mode>("auto");
+  const [attempt, setAttempt] = useState(0);
+  const [backend, setBackend] = useState<Backend>("не определён");
+  const [initialization, setInitialization] = useState("Инициализация…");
+  const [hdri, setHdri] = useState("Ожидание загрузки…");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const element = host.current;
+    if (!element) return;
+    const mount = element;
+    let cancelled = false;
+    let renderer: THREE.WebGPURenderer | undefined;
+    let controls: OrbitControls | undefined;
+    let environment: THREE.DataTexture | undefined;
+    const reference = createReferenceScene();
+    const resize = () => {
+      if (!renderer || cancelled) return;
+      const width = Math.max(1, element.clientWidth);
+      const height = Math.max(1, element.clientHeight);
+      reference.camera.aspect = width / height;
+      reference.camera.updateProjectionMatrix();
+      renderer.setSize(width, height, false);
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(element);
+    setBackend("не определён");
+    setInitialization("Инициализация…");
+    setHdri("Ожидание загрузки…");
+    setError("");
+
+    async function initialize() {
+      try {
+        renderer = new THREE.WebGPURenderer({ antialias: true, forceWebGL: mode === "webgl2" });
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.25;
+        await renderer.init();
+        if (cancelled) return;
+        const actual = actualBackend(renderer);
+        if (actual === "не определён") throw new Error("Three.js не сообщил выбранный backend.");
+        setBackend(actual);
+        controls = new OrbitControls(reference.camera, renderer.domElement);
+        controls.target.copy(CAMERA_TARGET);
+        controls.enableDamping = false;
+        controls.update();
+        resetView.current = () => {
+          reference.camera.position.copy(CAMERA_POSITION);
+          controls?.target.copy(CAMERA_TARGET);
+          controls?.update();
+        };
+        mount.appendChild(renderer.domElement);
+        resize();
+        setInitialization("Готово");
+        const activeRenderer = renderer;
+        // One animation loop per renderer; cleanup stops it before disposal.
+        await activeRenderer.setAnimationLoop(() => {
+          if (cancelled) return;
+          try { activeRenderer.render(reference.scene, reference.camera); }
+          catch (cause) {
+            setError(`Ошибка кадра: ${errorText(cause)}`);
+            setInitialization("Ошибка");
+            void activeRenderer.setAnimationLoop(null);
+          }
+        });
+        setHdri("Загрузка…");
+        try {
+          const texture = await new HDRLoader().loadAsync(hdriUrl);
+          if (cancelled) { texture.dispose(); return; }
+          environment = texture;
+          texture.mapping = THREE.EquirectangularReflectionMapping;
+          reference.scene.environment = texture;
+          reference.scene.background = texture;
+          setHdri("Загружен — Poly Haven studio_small_03, 1K HDR");
+        } catch (cause) {
+          if (!cancelled) {
+            setHdri("FAILED — нейтральное освещение");
+            setError(`HDRI: ${errorText(cause)}`);
+          }
+        }
+      } catch (cause) {
+        if (!cancelled) {
+          setInitialization("Ошибка");
+          setError(`Не удалось запустить рендерер: ${errorText(cause)}`);
+        }
+      }
+    }
+    const initializationJob = initialize();
+    return () => {
+      cancelled = true;
+      resetView.current = () => {};
+      observer.disconnect();
+      controls?.dispose();
+      if (renderer) {
+        void renderer.setAnimationLoop(null);
+        renderer.domElement.remove();
+      }
+      void initializationJob.finally(async () => {
+        if (renderer) await renderer.dispose();
+        environment?.dispose();
+        reference.dispose();
+      });
+    };
+  }, [mode, attempt]);
+
+  return <main className="renderer-spike">
+    <header className="renderer-spike__header">
+      <div><p className="renderer-spike__eyebrow">TRIAD-3D · TASK-002</p><h1>Проверка PBR-рендеринга</h1></div>
+      <a href="/">Вернуться в редактор</a>
+    </header>
+    <div className="renderer-spike__toolbar">
+      <label>Режим <select aria-label="Режим рендеринга" value={mode} onChange={event => setMode(event.target.value as Mode)}>
+        <option value="auto">Auto / приоритет WebGPU</option>
+        <option value="webgl2">Принудительно WebGL2</option>
+      </select></label>
+      <button onClick={() => resetView.current()}>Сбросить вид</button>
+      <button onClick={() => setAttempt(value => value + 1)}>Повторить запуск</button>
+    </div>
+    <div className="renderer-spike__viewport" ref={host} aria-label="Эталонная 3D-сцена" />
+    <section className="renderer-spike__diagnostics" aria-live="polite">
+      <span>Запрошено: {mode === "auto" ? "Auto / WebGPU preferred" : "Forced WebGL2"}</span>
+      <span>Фактически: <strong>{backend}</strong></span>
+      <span>Инициализация: {initialization}</span>
+      <span>HDRI: {hdri}</span>
+      {error && <p role="alert">{error}</p>}
+    </section>
+    <p className="renderer-spike__legend">Слева — хром · В центре — оптическое стекло · Справа — normal map. Перетащите для вращения камеры; колесо меняет масштаб.</p>
+  </main>;
+}
+</file>
+
 <file path="src/ui/styles/app.css">
 body { margin: 0; min-width: 960px; }
 #root { min-height: 100vh; }
@@ -3588,46 +3916,6 @@ textarea {
 }
 </file>
 
-<file path="src/ui/App.tsx">
-import { createProject, validateProject } from "../domain";
-
-const project = createProject();
-const issues = validateProject(project);
-
-export function App() {
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
-        <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
-      </header>
-      <div className="workspace-grid">
-        <aside className="dock left-dock" aria-label="Структура проекта">
-          <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
-          <div className="panel-content">
-            <p className="eyebrow">Текущий проект</p>
-            <div className="project-name">{project.name}</div>
-            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
-            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
-          </div>
-        </aside>
-        <main className="stage" aria-label="Рабочая область">
-          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-006</span></div>
-          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{issues.length === 0 ? "Структура проекта проверена" : "Ошибка структуры проекта"}</span></div>
-          <div className="stage-footer">3D-просмотр пока недоступен</div>
-        </main>
-        <aside className="dock right-dock" aria-label="Инспектор">
-          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><p className="eyebrow">Свойства</p><p className="panel-hint">Выберите объект после появления инструментов моделирования.</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
-        </aside>
-      </div>
-      <section className="timeline" aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><span>Подготовлено для TASK-039</span></div><div className="timeline-body">Дорожки анимации пока недоступны</div></section>
-    </div>
-  );
-}
-</file>
-
 <file path="src/main.tsx">
 import React from "react";
 import { createRoot } from "react-dom/client";
@@ -3638,6 +3926,10 @@ import "./ui/styles/app.css";
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode><App /></React.StrictMode>,
 );
+</file>
+
+<file path="src/vite-env.d.ts">
+/// <reference types="vite/client" />
 </file>
 
 <file path="tests/domain/project.test.ts">
@@ -4133,6 +4425,25 @@ export default defineConfig({
 });
 </file>
 
+<file path="docs/implementation-status.md">
+# Implementation status
+
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
+## TASK-006 — React/Vite foundation
+
+- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
+- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
+- The document remains in memory only. No browser storage or backend is used.
+- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
+- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
+- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+</file>
+
 <file path="src/domain/validate-project.ts">
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 
@@ -4335,36 +4646,51 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
-<file path="package.json">
-{
-  "name": "triad-3d",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "test": "vitest run"
-  },
-  "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "eslint": "^10.13.0",
-    "globals": "^17.13.0",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.72.0",
-    "vite": "^8.3.4",
-    "vitest": "^5.0.5"
-  },
-  "dependencies": {
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1"
+<file path="src/ui/App.tsx">
+import { createProject, validateProject } from "../domain";
+import { lazy, Suspense } from "react";
+
+const RendererSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/renderer/RendererSpike"))
+  : null;
+
+const project = createProject();
+const issues = validateProject(project);
+
+export function App() {
+  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
+    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
   }
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
+        <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
+      </header>
+      <div className="workspace-grid">
+        <aside className="dock left-dock" aria-label="Структура проекта">
+          <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
+          <div className="panel-content">
+            <p className="eyebrow">Текущий проект</p>
+            <div className="project-name">{project.name}</div>
+            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
+            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
+            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
+          </div>
+        </aside>
+        <main className="stage" aria-label="Рабочая область">
+          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-006</span></div>
+          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{issues.length === 0 ? "Структура проекта проверена" : "Ошибка структуры проекта"}</span></div>
+          <div className="stage-footer">3D-просмотр пока недоступен</div>
+        </main>
+        <aside className="dock right-dock" aria-label="Инспектор">
+          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
+          <div className="panel-content"><p className="eyebrow">Свойства</p><p className="panel-hint">Выберите объект после появления инструментов моделирования.</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
+        </aside>
+      </div>
+      <section className="timeline" aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><span>Подготовлено для TASK-039</span></div><div className="timeline-body">Дорожки анимации пока недоступны</div></section>
+    </div>
+  );
 }
 </file>
 
@@ -4385,6 +4711,41 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
     "lib": ["ES2022", "DOM"]
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
+<file path="package.json">
+{
+  "name": "triad-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "three": "0.186.1"
+  }
 }
 </file>
 
