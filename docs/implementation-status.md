@@ -1,5 +1,12 @@
 # Implementation status
 
+## TASK-007 — Domain commands and transactions
+
+- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
+- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
+- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
+- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
+
 ## TASK-004 — TSX export harness spike
 
 - Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.

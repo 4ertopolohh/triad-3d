@@ -56,10 +56,22 @@ docs/
   sources.md
   tasks.json
   testing.md
+  tsx-export-feasibility.md
+  tsx-export-smoke.png
   ui-spec.md
   use-cases.md
 docs-people/
   TRIAD-3D_Master_Project_Specification_v1.0.docx
+harness/
+  tsx-export/
+    src/
+      main.tsx
+    index.html
+    package.json
+    tsconfig.json
+    vite.config.ts
+scripts/
+  check-export-harness.mjs
 src/
   domain/
     create-project.ts
@@ -73,6 +85,8 @@ src/
       csg.worker.ts
       CsgSpike.tsx
       protocol.ts
+    export/
+      generate-tsx.ts
     renderer/
       assets/
         studio_small_03_1k.hdr
@@ -93,6 +107,9 @@ tests/
     csg.test.ts
   domain/
     project.test.ts
+  export/
+    generate-tsx.test.ts
+    prepare.test.ts
   fixtures/
     projects.ts
   visual/
@@ -3095,6 +3112,36 @@ Covers: NFR-013..NFR-014
 Owner task: TASK-049
 </file>
 
+<file path="docs/tsx-export-feasibility.md">
+# TASK-004 — TSX export feasibility
+
+Status: **COMPLETED** for the spike only. This does not implement FR-068–071 or TASK-044.
+
+## Verified setup and pipeline
+
+- Windows, Node 24.21.0, npm 11.19.0; React/React DOM 19.3.1, Three.js 0.186.1, TypeScript 5.9.3, Vite 8.3.4.
+- Input: `createNestedMeshProject()` (root → nested group → cube) and `createMaterialAnimationProject()` (same graph, chrome PBR material, animation track).
+- `generateSpikeTsx(Project)` validates the domain graph, converts supported fields to JSON literals, and returns TSX, package dependencies and diagnostics. It does not mutate the project.
+- `npm run export:check` creates a temporary directory outside the repository, copies only `harness/tsx-export`, writes automatically generated TSX through Vitest, runs `npm ci`, `tsc --noEmit`, and `vite build`, then checks `dist/index.html`. The harness has its own package and lockfile. No editor source is present in its build directory.
+
+## Results
+
+- `npm exec vitest run tests/export/generate-tsx.test.ts`: 7 tests passed, including the isolated TypeScript/Vite build.
+- `npm exec vitest run tests/domain/project.test.ts`: 9 tests passed.
+- `npm run typecheck`, `npm run lint`, `npm run build`: passed.
+- Browser smoke: **PASS** in the Codex in-app browser with WebGL. A cube silhouette was visible, the browser reported no errors, and exactly one canvas existed after React StrictMode mount. Changing the `width` prop from 640 to 400 in the temporary harness updated the canvas width; it remained one canvas. A [control screenshot](tsx-export-smoke.png) was captured during the check.
+
+## Supported fields and policy
+
+The spike supports cube `size` or `width`/`height`/`depth`, node hierarchy and local position/quaternion/scale, visibility, names/IDs, one assigned PBR material per mesh, scene camera, background color, and ambient/directional/point/spot lights. Generated TSX uses React lifecycle cleanup for Three resources and canvas. User strings are serialized and escaped; no source fields are executed as code.
+
+Invalid domain structures and unsupported geometry, modifiers, extra material slots or scene instances fail with typed `SpikeExportError`. Animation, textures/assets, HDRI and nondefault environment/background intensity receive explicit omission diagnostics while the static model is exported. No animation runtime, CSG, imported mesh, ZIP, GLB, procedural texture, interaction, quality profile or video is implemented.
+
+## TASK-044 implications
+
+The isolated build establishes that the basic generated component has no editor runtime dependency. It does not prove all future export cases. A fully metallic material renders nearly black without an environment map; TASK-044 needs environment packaging or a documented material preview policy. The current generator is intentionally a narrow spike, with static render and no resize observer or context loss handling. Production export also needs coverage for assets, modifiers and animation plus a broader compatibility report.
+</file>
+
 <file path="docs/ui-spec.md">
 # UI screens and modules
 
@@ -3290,6 +3337,78 @@ Preconditions: Есть сложная модель
 Steps: Применить boolean/array → busy overlay → Cancel → проверка исходного состояния → продолжить редактирование.
 Alternatives: Worker crash: rollback, clean temp geometry.
 Refs: FR-065, NFR-003..NFR-006
+</file>
+
+<file path="harness/tsx-export/src/main.tsx">
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import TriadModel from "./TriadModel";
+
+createRoot(document.getElementById("root")!).render(<StrictMode><TriadModel width={640} height={480} /></StrictMode>);
+</file>
+
+<file path="harness/tsx-export/index.html">
+<!doctype html>
+<html lang="ru"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>TRIAD-3D export spike</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+</file>
+
+<file path="harness/tsx-export/package.json">
+{
+  "name": "triad-tsx-export-harness",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit", "build": "vite build" },
+  "dependencies": { "react": "19.3.1", "react-dom": "19.3.1", "three": "0.186.1" },
+  "devDependencies": {
+    "@types/react": "19.3.0", "@types/react-dom": "19.3.0", "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "6.1.2", "typescript": "5.9.3", "vite": "8.3.4"
+  }
+}
+</file>
+
+<file path="harness/tsx-export/tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler", "jsx": "react-jsx",
+    "strict": true, "noEmit": true, "skipLibCheck": true, "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"]
+}
+</file>
+
+<file path="harness/tsx-export/vite.config.ts">
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({ plugins: [react()] });
+</file>
+
+<file path="scripts/check-export-harness.mjs">
+import { cp, mkdtemp, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const root = resolve(import.meta.dirname, "..");
+const isolated = await mkdtemp(join(tmpdir(), "triad-tsx-harness-"));
+await cp(join(root, "harness", "tsx-export"), isolated, { recursive: true });
+
+function run(command, args, cwd, env = process.env) {
+  const result = spawnSync(command, args, { cwd, env, stdio: "inherit", shell: process.platform === "win32" });
+  if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} failed (${result.status})`);
+}
+
+run("npm", ["exec", "vitest", "run", "tests/export/prepare.test.ts"], root, {
+  ...process.env, TRIAD_HARNESS_OUTPUT: isolated,
+});
+const generated = await readFile(join(isolated, "src", "TriadModel.tsx"), "utf8");
+if (/from\s+["'][^"']*(?:src\/domain|src\/ui|triad-3d)/.test(generated)) throw new Error("Generated component imports editor internals");
+run("npm", ["ci", "--no-audit", "--no-fund"], isolated);
+run("npm", ["run", "typecheck"], isolated);
+run("npm", ["run", "build"], isolated);
+await stat(join(isolated, "dist", "index.html"));
+console.log(`Independent harness PASS: ${isolated}`);
 </file>
 
 <file path="src/domain/create-project.ts">
@@ -3759,6 +3878,196 @@ export type Request = { id: number; operation: Operation; first: MeshData; secon
 export type Response =
   | { id: number; ok: true; result: Awaited<ReturnType<typeof import("./core").compute>> }
   | { id: number; ok: false; code: string; message: string };
+</file>
+
+<file path="src/spikes/export/generate-tsx.ts">
+import type { Material, Node, Project } from "../../domain/types";
+import { validateProject } from "../../domain/validate-project";
+
+export type ExportDiagnostic = { code: string; path: string; message: string };
+export type SpikeExport = {
+  filename: "TriadModel.tsx";
+  source: string;
+  dependencies: Readonly<Record<"react" | "three", string>>;
+  diagnostics: ExportDiagnostic[];
+};
+
+export class SpikeExportError extends Error {
+  constructor(public readonly code: "INVALID_PROJECT" | "EXPORT_UNSUPPORTED", public readonly issues: readonly ExportDiagnostic[]) {
+    super(`${code}: ${issues.map((issue) => `${issue.path}: ${issue.message}`).join("; ")}`);
+  }
+}
+
+type ExportNode = {
+  id: string;
+  name: string;
+  kind: "group" | "mesh";
+  visible: boolean;
+  transform: Node["transform"];
+  dimensions?: readonly [number, number, number];
+  material?: Pick<Material, "baseColor" | "metalness" | "roughness" | "emissive" | "opacity" | "transmission" | "ior" | "clearcoat">;
+  children: ExportNode[];
+};
+
+const DEFAULT_MATERIAL: NonNullable<ExportNode["material"]> = {
+  baseColor: [0.7, 0.7, 0.7], metalness: 0, roughness: 0.6,
+  emissive: [0, 0, 0], opacity: 1, transmission: 0, ior: 1.5, clearcoat: 0,
+};
+
+function literal(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+export function generateSpikeTsx(project: Project): SpikeExport {
+  const validation = validateProject(project);
+  if (validation.length) throw new SpikeExportError("INVALID_PROJECT", validation);
+
+  const errors: ExportDiagnostic[] = [];
+  const diagnostics: ExportDiagnostic[] = [];
+  const nodes = new Map(project.nodes.map((node) => [node.id, node]));
+  const materials = new Map(project.materials.map((material) => [material.id, material]));
+
+  if (project.modifiers.length) errors.push({ code: "MODIFIERS_UNSUPPORTED", path: "modifiers", message: "Модификаторы не поддерживаются в spike." });
+  if (project.scene.instances.length) errors.push({ code: "INSTANCES_UNSUPPORTED", path: "scene.instances", message: "Экземпляры сцены не поддерживаются в spike." });
+  if (project.animations.length || project.tracks.length || project.keyframes.length) diagnostics.push({ code: "ANIMATION_OMITTED", path: "animations", message: "Экспортирована только статическая поза; анимация не включена." });
+  if (project.scene.background.environmentAssetId) diagnostics.push({ code: "ENVIRONMENT_OMITTED", path: "scene.background.environmentAssetId", message: "HDRI окружение не включено." });
+  if (project.scene.background.intensity !== 1) diagnostics.push({ code: "BACKGROUND_INTENSITY_OMITTED", path: "scene.background.intensity", message: "Интенсивность фона не включена." });
+  if (project.assets.length) diagnostics.push({ code: "ASSETS_OMITTED", path: "assets", message: "Файлы ассетов не упакованы." });
+
+  const visit = (node: Node): ExportNode => {
+    if (node.materialSlots.length > (node.kind === "mesh" ? 1 : 0)) errors.push({ code: "MATERIAL_SLOTS_UNSUPPORTED", path: `nodes.${node.id}.materialSlots`, message: "Поддерживается один слот только у mesh." });
+    let dimensions: readonly [number, number, number] | undefined;
+    let material: ExportNode["material"];
+    if (node.kind === "mesh") {
+      const source = node.meshSource;
+      if (source.kind !== "primitive" || source.primitive !== "cube") {
+        errors.push({ code: "MESH_SOURCE_UNSUPPORTED", path: `nodes.${node.id}.meshSource`, message: "Поддерживается только cube primitive." });
+      } else {
+        const parameters = source.parameters;
+        const keys = Object.keys(parameters);
+        const sized = keys.length === 1 && keys[0] === "size";
+        const dimensioned = keys.length === 3 && ["width", "height", "depth"].every((key) => key in parameters);
+        if (!sized && !dimensioned) errors.push({ code: "CUBE_PARAMETERS_UNSUPPORTED", path: `nodes.${node.id}.meshSource.parameters`, message: "Ожидается size либо width, height, depth." });
+        else {
+          const size = parameters.size;
+          dimensions = sized ? [size!, size!, size!] : [parameters.width!, parameters.height!, parameters.depth!];
+          if (dimensions.some((value) => value <= 0)) errors.push({ code: "INVALID_CUBE_SIZE", path: `nodes.${node.id}.meshSource.parameters`, message: "Размеры cube должны быть положительными." });
+        }
+      }
+      const slot = node.materialSlots[0];
+      const assigned = slot ? materials.get(slot.materialId) : undefined;
+      material = assigned ? {
+        baseColor: assigned.baseColor, metalness: assigned.metalness, roughness: assigned.roughness,
+        emissive: assigned.emissive, opacity: assigned.opacity, transmission: assigned.transmission,
+        ior: assigned.ior, clearcoat: assigned.clearcoat,
+      } : DEFAULT_MATERIAL;
+      if (assigned?.textureAssetIds.length) diagnostics.push({ code: "TEXTURES_OMITTED", path: `materials.${assigned.id}.textureAssetIds`, message: "Текстуры не включены." });
+      if (assigned && assigned.envIntensity !== 1) diagnostics.push({ code: "ENV_INTENSITY_OMITTED", path: `materials.${assigned.id}.envIntensity`, message: "Интенсивность окружения не включена." });
+    }
+    return {
+      id: node.id, name: node.name, kind: node.kind, visible: node.visible, transform: node.transform,
+      ...(dimensions ? { dimensions } : {}), ...(material ? { material } : {}),
+      children: node.children.map((id) => visit(nodes.get(id)!)),
+    };
+  };
+  const root = visit(nodes.get(project.model.rootNodeId)!);
+  if (errors.length) throw new SpikeExportError("EXPORT_UNSUPPORTED", errors);
+
+  const data = { root, camera: project.scene.camera, background: project.scene.background.color, lights: project.scene.lights };
+  return {
+    filename: "TriadModel.tsx",
+    dependencies: { react: "19.3.1", three: "0.186.1" },
+    diagnostics,
+    source: `import { useEffect, useRef } from "react";
+import * as THREE from "three";
+
+export interface TriadModelProps { width?: number; height?: number }
+
+interface RuntimeNode {
+  id: string;
+  name: string;
+  kind: "group" | "mesh";
+  visible: boolean;
+  transform: { position: readonly [number, number, number]; rotationQuat: readonly [number, number, number, number]; scale: readonly [number, number, number] };
+  dimensions?: readonly [number, number, number];
+  material?: {
+    baseColor: readonly [number, number, number]; metalness: number; roughness: number;
+    emissive: readonly [number, number, number]; opacity: number; transmission: number;
+    ior: number; clearcoat: number;
+  };
+  children: readonly RuntimeNode[];
+}
+const data = ${literal(data)} as const;
+
+export default function TriadModel({ width = 640, height = 480 }: TriadModelProps) {
+  const mount = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const container = mount.current;
+    if (!container) return;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(...data.background);
+    const camera = new THREE.PerspectiveCamera(data.camera.fovDegrees, width / height, data.camera.near, data.camera.far);
+    camera.position.set(...data.camera.position);
+    camera.lookAt(...data.camera.target);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(width, height);
+    container.appendChild(renderer.domElement);
+    const resources: Array<{ dispose(): void }> = [];
+    const build = (node: RuntimeNode, parent: THREE.Object3D): void => {
+      const object: THREE.Object3D = node.kind === "mesh" && node.dimensions && node.material
+        ? (() => {
+            const geometry = new THREE.BoxGeometry(...node.dimensions);
+            const m = node.material;
+            const material = new THREE.MeshPhysicalMaterial({
+              color: new THREE.Color(...m.baseColor), metalness: m.metalness, roughness: m.roughness,
+              emissive: new THREE.Color(...m.emissive), opacity: m.opacity, transparent: m.opacity < 1,
+              transmission: m.transmission, ior: m.ior, clearcoat: m.clearcoat,
+            });
+            resources.push(geometry, material);
+            return new THREE.Mesh(geometry, material);
+          })()
+        : new THREE.Group();
+      object.name = node.name;
+      object.userData.triadNodeId = node.id;
+      object.visible = node.visible;
+      object.position.set(...node.transform.position);
+      object.quaternion.set(...node.transform.rotationQuat);
+      object.scale.set(...node.transform.scale);
+      parent.add(object);
+      node.children.forEach((child) => build(child, object));
+    };
+    build(data.root, scene);
+    data.lights.forEach((light) => {
+      const color = new THREE.Color(...light.color);
+      let object: THREE.Light;
+      if (light.kind === "ambient") object = new THREE.AmbientLight(color, light.intensity);
+      else if (light.kind === "directional") object = new THREE.DirectionalLight(color, light.intensity);
+      else if (light.kind === "point") object = new THREE.PointLight(color, light.intensity);
+      else object = new THREE.SpotLight(color, light.intensity);
+      object.position.set(...light.position);
+      if (object instanceof THREE.DirectionalLight || object instanceof THREE.SpotLight) {
+        object.target.position.set(...light.target);
+        scene.add(object.target);
+      }
+      scene.add(object);
+    });
+    renderer.render(scene, camera);
+    return () => {
+      resources.forEach((resource) => resource.dispose());
+      renderer.dispose();
+      renderer.domElement.remove();
+    };
+  }, [width, height]);
+  return <div ref={mount} style={{ width, height }} />;
+}
+`,
+  };
+}
 </file>
 
 <file path="src/spikes/renderer/reference-scene.ts">
@@ -4408,112 +4717,112 @@ describe("project document graph", () => {
 });
 </file>
 
-<file path="tests/fixtures/projects.ts">
-import { createProject } from "../../src/domain/create-project";
-import type { Material, MeshNode, Project } from "../../src/domain/types";
+<file path="tests/export/generate-tsx.test.ts">
+import { execFileSync } from "node:child_process";
+import { describe, expect, it } from "vitest";
+import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
+import {
+  createInvalidHierarchyProject, createInvalidNumberProject, createMaterialAnimationProject,
+  createNestedMeshProject,
+} from "../fixtures/projects";
 
-function projectWithIds(): Project {
-  let next = 0;
-  return createProject(() => `id-${++next}`);
-}
+describe("TASK-004 TSX export spike", () => {
+  it("generates code from a nested cube and preserves local hierarchy", () => {
+    const project = createNestedMeshProject();
+    const group = project.nodes.find((node) => node.id === "nested-group")!;
+    group.transform.position = [2, 3, 4];
+    const result = generateSpikeTsx(project);
+    expect(result.source).toContain("new THREE.BoxGeometry(...node.dimensions)");
+    expect(result.source).toContain('"position":[2,3,4]');
+    expect(result.source).toContain("parent.add(object)");
+    expect(result.source).toContain('"dimensions":[1,1,1]');
+    expect(result.dependencies).toEqual({ react: "19.3.1", three: "0.186.1" });
+    expect(result.source).not.toMatch(/from ["'][^"']*src\//);
+  });
 
-export const emptyProject = projectWithIds();
+  it("responds to supported geometry, transform, visibility and material values", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
+    const before = generateSpikeTsx(project).source;
+    if (mesh.meshSource.kind !== "primitive") throw new Error("Invalid fixture");
+    mesh.meshSource.parameters.size = 2;
+    mesh.transform.position = [1, 0, 0];
+    mesh.visible = false;
+    project.materials[0]!.roughness = 0.4;
+    const after = generateSpikeTsx(project).source;
+    expect(after).not.toBe(before);
+    expect(after).toContain('"dimensions":[2,2,2]');
+    expect(after).toContain('"position":[1,0,0]');
+    expect(after).toContain('"visible":false');
+    expect(after).toContain('"roughness":0.4');
+  });
 
-export function createNestedMeshProject(): Project {
-  const project = projectWithIds();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  const groupId = "nested-group";
-  const meshId = "mesh-node";
-  const group = {
-    id: groupId,
-    kind: "group" as const,
-    name: "Вложенная группа",
-    parentId: root.id,
-    children: [meshId],
-    transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
-    visible: true,
-    locked: false,
-    materialSlots: [],
-    modifierIds: [],
-  };
-  const mesh: MeshNode = {
-    ...group,
-    id: meshId,
-    kind: "mesh",
-    name: "Куб",
-    parentId: groupId,
-    children: [],
-    meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
-  };
-  project.nodes.push(group, mesh);
-  root.children.push(groupId);
-  return project;
-}
+  it("is deterministic and does not mutate its input", () => {
+    const project = createMaterialAnimationProject();
+    const original = structuredClone(project);
+    expect(generateSpikeTsx(project)).toEqual(generateSpikeTsx(project));
+    expect(project).toEqual(original);
+  });
 
-export function createMaterialAnimationProject(): Project {
-  const project = createNestedMeshProject();
-  const material: Material = {
-    id: "material-1",
-    name: "Хром",
-    baseColor: [0.8, 0.8, 0.8],
-    metalness: 1,
-    roughness: 0.18,
-    emissive: [0, 0, 0],
-    opacity: 1,
-    transmission: 0,
-    ior: 1.5,
-    clearcoat: 0,
-    envIntensity: 1,
-    textureAssetIds: [],
-  };
-  project.materials.push(material);
-  const mesh = project.nodes.find((node) => node.kind === "mesh");
-  if (!mesh) throw new Error("Fixture mesh missing");
-  mesh.materialSlots.push({ name: "Основной", materialId: material.id });
-  project.animations.push({ id: "clip-1", name: "Подъём", durationSeconds: 2, loop: false, trackIds: ["track-1"] });
-  project.tracks.push({ id: "track-1", nodeId: mesh.id, property: "transform.position", keyframeIds: ["key-1", "key-2"] });
-  project.keyframes.push(
-    { id: "key-1", timeSeconds: 0, value: [0, 0, 0], interpolation: "linear" },
-    { id: "key-2", timeSeconds: 2, value: [0, 1, 0], interpolation: "linear" },
-  );
-  return project;
-}
+  it("rejects invalid numbers and hierarchy without mutation", () => {
+    for (const project of [createInvalidNumberProject(), createInvalidHierarchyProject()]) {
+      const original = structuredClone(project);
+      expect(() => generateSpikeTsx(project)).toThrowError(SpikeExportError);
+      expect(project).toEqual(original);
+    }
+  });
 
-export function createInvalidHierarchyProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  const group = project.nodes.find((node) => node.id === "nested-group");
-  if (!root || !group) throw new Error("Fixture hierarchy missing");
-  root.parentId = group.id;
-  group.children.push(root.id);
-  return project;
-}
+  it("rejects unsupported mesh and modifiers, diagnoses omitted animation", () => {
+    const animated = generateSpikeTsx(createMaterialAnimationProject());
+    expect(animated.diagnostics).toContainEqual(expect.objectContaining({ code: "ANIMATION_OMITTED" }));
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
+    mesh.meshSource = { kind: "primitive", primitive: "sphere", parameters: { radius: 1 } };
+    expect(() => generateSpikeTsx(project)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
+    const modified = createNestedMeshProject();
+    const modifiedMesh = modified.nodes.find((node) => node.kind === "mesh")!;
+    modifiedMesh.modifierIds.push("modifier-1");
+    modified.modifiers.push({ id: "modifier-1", nodeId: modifiedMesh.id, kind: "mirror", order: 0, enabled: true, version: 1, parameters: {} });
+    expect(() => generateSpikeTsx(modified)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
+    const missingMaterial = createMaterialAnimationProject();
+    missingMaterial.materials.length = 0;
+    expect(() => generateSpikeTsx(missingMaterial)).toThrowError(expect.objectContaining({ code: "INVALID_PROJECT" }));
+  });
 
-export function createDuplicateIdProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  const duplicate = project.nodes.find((node) => node.id === "mesh-node");
-  if (!root || !duplicate) throw new Error("Fixture nodes missing");
-  duplicate.id = root.id;
-  return project;
-}
+  it("escapes user strings as data", () => {
+    const project = createNestedMeshProject();
+    project.nodes[1]!.name = '</script><script>alert("x")</script>';
+    const source = generateSpikeTsx(project).source;
+    expect(source).not.toContain("</script>");
+    expect(source).toContain("\\u003c/script\\u003e");
+  });
 
-export function createInvalidNumberProject(): Project {
-  const project = projectWithIds();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  root.transform.position = [Number.NaN, 0, 0];
-  return project;
-}
+  it("typechecks and builds the generated component outside the repository", () => {
+    execFileSync(process.execPath, ["scripts/check-export-harness.mjs"], {
+      cwd: process.cwd(), stdio: "inherit", timeout: 180_000,
+    });
+  }, 200_000);
+});
+</file>
 
-export function createMissingReferenceProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  root.children.push("absent-node");
-  return project;
-}
+<file path="tests/export/prepare.test.ts">
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "vitest";
+import { generateSpikeTsx } from "../../src/spikes/export/generate-tsx";
+import { createMaterialAnimationProject } from "../fixtures/projects";
+
+test("write generated component for isolated harness", async () => {
+  const output = process.env.TRIAD_HARNESS_OUTPUT;
+  const result = generateSpikeTsx(createMaterialAnimationProject());
+  if (!output) {
+    if (!result.source.includes("function TriadModel")) throw new Error("TSX was not generated");
+    return;
+  }
+  const sourceDirectory = join(output, "src");
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(join(sourceDirectory, result.filename), result.source, "utf8");
+});
 </file>
 
 <file path="tests/visual/design-tokens.html">
@@ -4773,19 +5082,6 @@ You may create/edit files, install needed libraries, refactor local task impleme
 Geometry → Materials → Animation → TSX/ZIP export; NEXT only after MVP gate.
 </file>
 
-<file path="eslint.config.js">
-import js from "@eslint/js";
-import globals from "globals";
-import tseslint from "typescript-eslint";
-
-export default tseslint.config(
-  { ignores: ["dist/**", "node_modules/**", "repomix-output.xml"] },
-  js.configs.recommended,
-  ...tseslint.configs.recommended,
-  { files: ["**/*.{js,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
-);
-</file>
-
 <file path="index.html">
 <!doctype html>
 <html lang="ru">
@@ -5028,6 +5324,129 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
+<file path="tests/fixtures/projects.ts">
+import { createProject } from "../../src/domain/create-project";
+import type { Material, MeshNode, Project } from "../../src/domain/types";
+
+function projectWithIds(): Project {
+  let next = 0;
+  return createProject(() => `id-${++next}`);
+}
+
+export const emptyProject = projectWithIds();
+
+export function createNestedMeshProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  const groupId = "nested-group";
+  const meshId = "mesh-node";
+  const group = {
+    id: groupId,
+    kind: "group" as const,
+    name: "Вложенная группа",
+    parentId: root.id,
+    children: [meshId],
+    transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
+    visible: true,
+    locked: false,
+    materialSlots: [],
+    modifierIds: [],
+  };
+  const mesh: MeshNode = {
+    ...group,
+    id: meshId,
+    kind: "mesh",
+    name: "Куб",
+    parentId: groupId,
+    children: [],
+    materialSlots: [],
+    modifierIds: [],
+    meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
+  };
+  project.nodes.push(group, mesh);
+  root.children.push(groupId);
+  return project;
+}
+
+export function createMaterialAnimationProject(): Project {
+  const project = createNestedMeshProject();
+  const material: Material = {
+    id: "material-1",
+    name: "Хром",
+    baseColor: [0.8, 0.8, 0.8],
+    metalness: 1,
+    roughness: 0.18,
+    emissive: [0, 0, 0],
+    opacity: 1,
+    transmission: 0,
+    ior: 1.5,
+    clearcoat: 0,
+    envIntensity: 1,
+    textureAssetIds: [],
+  };
+  project.materials.push(material);
+  const mesh = project.nodes.find((node) => node.kind === "mesh");
+  if (!mesh) throw new Error("Fixture mesh missing");
+  mesh.materialSlots.push({ name: "Основной", materialId: material.id });
+  project.animations.push({ id: "clip-1", name: "Подъём", durationSeconds: 2, loop: false, trackIds: ["track-1"] });
+  project.tracks.push({ id: "track-1", nodeId: mesh.id, property: "transform.position", keyframeIds: ["key-1", "key-2"] });
+  project.keyframes.push(
+    { id: "key-1", timeSeconds: 0, value: [0, 0, 0], interpolation: "linear" },
+    { id: "key-2", timeSeconds: 2, value: [0, 1, 0], interpolation: "linear" },
+  );
+  return project;
+}
+
+export function createInvalidHierarchyProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const group = project.nodes.find((node) => node.id === "nested-group");
+  if (!root || !group) throw new Error("Fixture hierarchy missing");
+  root.parentId = group.id;
+  group.children.push(root.id);
+  return project;
+}
+
+export function createDuplicateIdProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const duplicate = project.nodes.find((node) => node.id === "mesh-node");
+  if (!root || !duplicate) throw new Error("Fixture nodes missing");
+  duplicate.id = root.id;
+  return project;
+}
+
+export function createInvalidNumberProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.transform.position = [Number.NaN, 0, 0];
+  return project;
+}
+
+export function createMissingReferenceProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.children.push("absent-node");
+  return project;
+}
+</file>
+
+<file path="eslint.config.js">
+import js from "@eslint/js";
+import globals from "globals";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist/**", "node_modules/**", "repomix-output.xml"] },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  { files: ["**/*.{js,mjs,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
+);
+</file>
+
 <file path="tsconfig.json">
 {
   "compilerOptions": {
@@ -5046,30 +5465,6 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
 }
-</file>
-
-<file path="docs/implementation-status.md">
-# Implementation status
-
-## TASK-003 — CSG/Manifold WASM spike
-
-- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
-- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
-
-## TASK-002 — Renderer/PBR spike
-
-- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
-- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
-- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
-
-## TASK-006 — React/Vite foundation
-
-- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
-- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
-- The document remains in memory only. No browser storage or backend is used.
-- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
-- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
-- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
 </file>
 
 <file path="src/ui/App.tsx">
@@ -5126,6 +5521,35 @@ export function App() {
 }
 </file>
 
+<file path="docs/implementation-status.md">
+# Implementation status
+
+## TASK-004 — TSX export harness spike
+
+- Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.
+- Targeted export tests, domain regression, root typecheck/lint/build, and WebGL smoke passed. Supported fields and omissions are recorded in [tsx-export-feasibility.md](tsx-export-feasibility.md). Production TASK-044 remains open.
+
+## TASK-003 — CSG/Manifold WASM spike
+
+- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
+- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
+
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
+## TASK-006 — React/Vite foundation
+
+- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
+- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
+- The document remains in memory only. No browser storage or backend is used.
+- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
+- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
+- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+</file>
+
 <file path="package.json">
 {
   "name": "triad-3d",
@@ -5137,7 +5561,8 @@ export function App() {
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "export:check": "node scripts/check-export-harness.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
