@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-011 — Undo/Redo delta history
+
+- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
+- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
+- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
+
 ## TASK-010B — Basic static GLB import
 
 - Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.

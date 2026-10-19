@@ -1,8 +1,8 @@
 import { createProject } from "../domain";
-import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject, selectRevision } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
 import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
@@ -36,6 +36,31 @@ function EditorShell() {
   const project = selectProject(state);
   const revision = selectRevision(state);
   const dirty = selectDirty(state);
+  const canUndo = selectCanUndo(state);
+  const canRedo = selectCanRedo(state);
+  function travel(direction: "undo" | "redo") {
+    if (fileBusy || pendingGlb) return;
+    const current = editorStore.getSnapshot();
+    const result = editorStore[direction](current.document.revision);
+    if (!result.ok) setFileStatus(result.message);
+    else setFileStatus(direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey || fileBusy || pendingGlb || event.isComposing) return;
+      const target = event.target;
+      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
+      const key = event.key.toLowerCase();
+      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
+      if (!direction) return;
+      const current = editorStore.getSnapshot();
+      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
+      event.preventDefault();
+      travel(direction);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   async function saveProject() {
     if (fileBusy) return;
     setFileBusy(true);
@@ -109,6 +134,8 @@ function EditorShell() {
         <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
         <div className="file-actions">
           <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
+          <button type="button" disabled={!canUndo || fileBusy || !!pendingGlb} onClick={() => travel("undo")}>Отменить</button>
+          <button type="button" disabled={!canRedo || fileBusy || !!pendingGlb} onClick={() => travel("redo")}>Повторить</button>
           <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
           <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
           <button type="button" disabled={fileBusy} onClick={() => glbInput.current?.click()}>Импорт GLB</button>

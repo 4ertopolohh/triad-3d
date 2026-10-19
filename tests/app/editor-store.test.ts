@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { applyProjectPatch } from "../../src/domain";
-import type { ProjectCommand } from "../../src/domain";
+import type { GroupNode, ProjectCommand } from "../../src/domain";
 import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
 import { createNestedMeshProject } from "../fixtures/projects";
 import { AssetBytes } from "../../src/assets/asset-bytes";
@@ -10,6 +10,101 @@ const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): Proje
 });
 
 describe("editor store", () => {
+  it("replays 100 changes in both directions with monotonic session revisions", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    for (let index = 1; index <= 100; index += 1) {
+      expect(store.executeCommand(rename(`Name ${index}`), index - 1).ok).toBe(true);
+    }
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 100, canUndo: true, canRedo: false });
+    for (let index = 100; index > 0; index -= 1) expect(store.undo(200 - index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.getSnapshot().document.project.model.revision).toBe(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    for (let index = 0; index < 100; index += 1) expect(store.redo(200 + index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Name 100");
+    expect(store.getSnapshot().document.project.model.revision).toBe(100);
+    expect(store.getSnapshot().document.revision).toBe(300);
+  });
+
+  it("treats a transaction and an explicit gesture as single reversible steps", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    expect(store.executeTransaction([rename("A", "mesh-node", "a"), rename("B", "mesh-node", "b")], 0).ok).toBe(true);
+    expect(store.executeCommand(rename("C"), 1, "drag-1").ok).toBe(true);
+    expect(store.executeCommand(rename("D"), 2, "drag-1").ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("B");
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.redo(5).ok).toBe(true);
+    expect(store.redo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("D");
+  });
+
+  it("preserves checkpoints, branches, and publication atomicity", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    store.executeCommand(rename("A"), 0, "gesture");
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    store.executeCommand(rename("B"), 1, "gesture");
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    const before = store.getSnapshot();
+    expect(store.redo(4)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.executeCommand(rename("missing", "missing"), 5).ok).toBe(false);
+    expect(store.executeCommand(rename("A"), 5)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot()).toBe(before);
+    store.executeCommand(rename("D"), 5);
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 2, canRedo: false });
+    expect(store.redo(6).ok).toBe(false);
+    expect(store.undo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(seen.every((snapshot) => snapshot.document.revision === snapshot.derived.documentRevision)).toBe(true);
+  });
+
+  it("does not mark a new branch clean after discarding its saved position", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("A"), 0);
+    store.executeCommand(rename("B"), 1);
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.executeCommand(rename("D"), 3).ok).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+  });
+
+  it("undoes a locked hidden node and rejects corrupt history patches atomically", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const flags: ProjectCommand = { commandId: "flags", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", locked: true, visible: false } };
+    expect(store.executeCommand(flags, 0).ok).toBe(true);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
+    expect(store.redo(2).ok).toBe(true);
+    const mutable = store.getSnapshot().history.entries[0] as unknown as { patch: { changes: unknown[] } };
+    expect(Object.isFrozen(mutable.patch.changes)).toBe(true);
+  });
+
+  it("removes a selection when undo removes its node", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const node: GroupNode = { id: "new-node", kind: "group", name: "New", parentId: "nested-group", children: [],
+      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+      visible: true, locked: false, materialSlots: [], modifierIds: [] };
+    const command: ProjectCommand = { commandId: "add", type: "ADD_NODE", targetIds: ["nested-group", node.id],
+      payload: { parentId: "nested-group", node } };
+    expect(store.executeCommand(command, 0).ok).toBe(true);
+    store.setSelection(["new-node"], "new-node");
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+  });
   it("initializes a stable, immutable RAM snapshot independently of its input", () => {
     const input = createNestedMeshProject();
     const store = createEditorStore(input);

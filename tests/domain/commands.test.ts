@@ -20,6 +20,21 @@ function add(id: string, parentId = "nested-group"): ProjectCommand {
 }
 
 describe("command bus", () => {
+  it("applies trusted history patches atomically and rejects stale or corrupt bases", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const forward = bus.executeCommand(flags("mesh-node", { locked: true, visible: false }), 0);
+    if (!forward.ok) throw new Error("fixture command failed");
+    const locked = bus.getSnapshot();
+    expect(bus.applyHistoryPatch(forward.undoPatch, 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(bus.applyHistoryPatch({ changes: [{ kind: "modelRevision", before: 999, after: 0 }] }, 1))
+      .toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
+    expect(bus.getSnapshot()).toEqual(locked);
+    expect(bus.getRevision()).toBe(1);
+    expect(bus.applyHistoryPatch(forward.undoPatch, 1)).toMatchObject({ ok: true, revision: 2 });
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
+    expect(bus.applyHistoryPatch(forward.patch, 2)).toMatchObject({ ok: true, revision: 3 });
+    expect(bus.getSnapshot()).toEqual(locked);
+  });
   it("adds a leaf and keeps both hierarchy links and revisions consistent", () => {
     const bus = createCommandBus(createNestedMeshProject());
     const before = bus.getSnapshot();

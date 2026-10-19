@@ -38,6 +38,7 @@ export interface CommandBus {
   getSnapshot(): Project;
   executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
   executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  applyHistoryPatch(patch: ProjectPatch, expectedRevision: number): CommandResult;
 }
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -274,5 +275,25 @@ export function createCommandBus(initialProject: Project): CommandBus {
     getSnapshot: () => structuredClone(committed),
     executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
     executeTransaction,
+    applyHistoryPatch(patch, expectedRevision) {
+      if (expectedRevision !== revision) return failure("history", CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+      try {
+        if (!patch || !Array.isArray(patch.changes) || patch.changes.length === 0)
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Пустой патч истории.");
+        const candidate = applyProjectPatch(committed, patch);
+        if (same(candidate, committed))
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Патч истории не изменяет документ.");
+        const issues = validateProject(candidate);
+        if (issues.length) return failure("history", CommandErrorCode.VALIDATION_FAILED, "Результат истории не прошёл проверку.", issues);
+        const project = structuredClone(candidate);
+        const forward = structuredClone(patch);
+        const undoPatch = inverse(forward);
+        committed = candidate;
+        revision += 1;
+        return { ok: true, id: "history", project, revision, patch: forward, undoPatch, changed: true };
+      } catch {
+        return failure("history", CommandErrorCode.VALIDATION_FAILED, "Патч истории не соответствует документу.");
+      }
+    },
   };
 }

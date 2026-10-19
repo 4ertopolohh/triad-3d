@@ -89,6 +89,9 @@ src/
     project-serialization.ts
     types.ts
     validate-project.ts
+  importers/
+    gltf/
+      import-glb.ts
   spikes/
     csg/
       client.ts
@@ -129,6 +132,8 @@ tests/
     prepare.test.ts
   fixtures/
     projects.ts
+  importers/
+    glb.test.ts
   visual/
     design-tokens.html
 .gitignore
@@ -3638,249 +3643,6 @@ export async function openNativeProjectArchive(input: Blob | ArrayBuffer): Promi
 }
 </file>
 
-<file path="src/domain/command-bus.ts">
-import type { EntityId, Node, Project, Transform } from "./types";
-import { validateProject, type ValidationIssue } from "./validate-project";
-
-export type ProjectCommand =
-  | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
-  | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
-  | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
-  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
-
-export const CommandErrorCode = {
-  REVISION_CONFLICT: "REVISION_CONFLICT",
-  INVALID_COMMAND: "INVALID_COMMAND",
-  INVALID_REFERENCE: "INVALID_REFERENCE",
-  NODE_LOCKED: "NODE_LOCKED",
-  NODE_HIDDEN: "NODE_HIDDEN",
-  VALIDATION_FAILED: "VALIDATION_FAILED",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
-} as const;
-export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
-
-export type PatchChange =
-  | { kind: "addNode"; node: Node }
-  | { kind: "removeNode"; node: Node }
-  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
-  | { kind: "modelRevision"; before: number; after: number };
-export interface ProjectPatch { changes: PatchChange[] }
-
-export type CommandResult =
-  | { ok: true; id: string; project: Project; revision: number; patch: ProjectPatch; undoPatch: ProjectPatch; changed: boolean }
-  | { ok: false; id: string; code: CommandErrorCode; message: string; issues?: ValidationIssue[] };
-
-export interface CommandBus {
-  /** Session revision starts at 0, regardless of the serialized model revision. */
-  getRevision(): number;
-  getSnapshot(): Project;
-  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
-  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
-}
-
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
-const idList = (value: unknown): value is string[] => Array.isArray(value) && value.every(id);
-const numbers = (value: unknown, count: number): value is number[] =>
-  Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
-const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
-const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
-  Object.keys(value).every((key) => keys.includes(key));
-
-function validTransform(value: unknown): value is Transform {
-  return record(value) && ownKeys(value, ["position", "rotationQuat", "scale"])
-    && numbers(value.position, 3) && numbers(value.rotationQuat, 4) && numbers(value.scale, 3);
-}
-
-function validNode(value: unknown): value is Node {
-  if (!record(value) || !id(value.id) || !["group", "mesh"].includes(String(value.kind))) return false;
-  const keys = ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"];
-  if (!ownKeys(value, value.kind === "mesh" ? [...keys, "meshSource"] : keys)) return false;
-  if (typeof value.name !== "string" || !value.name.trim() || !id(value.parentId) || !idList(value.children)
-    || !validTransform(value.transform) || typeof value.visible !== "boolean" || typeof value.locked !== "boolean"
-    || !Array.isArray(value.materialSlots) || !value.materialSlots.every((slot: unknown) =>
-      record(slot) && ownKeys(slot, ["name", "materialId"]) && typeof slot.name === "string" && id(slot.materialId))
-    || !idList(value.modifierIds)) return false;
-  if (value.kind === "group") return true;
-  const source = value.meshSource;
-  if (!record(source)) return false;
-  if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
-  return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
-    && ["cube", "sphere", "torus", "cylinder", "cone", "plane"].includes(String(source.primitive))
-    && record(source.parameters) && Object.values(source.parameters).every((item) => typeof item === "number" && Number.isFinite(item));
-}
-
-function validCommand(value: unknown): value is ProjectCommand {
-  if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
-  const payload = value.payload;
-  if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
-    && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
-    && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
-  if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
-    || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
-  switch (value.type) {
-    case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
-    case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
-    case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
-      && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
-      && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
-      && (!Object.hasOwn(payload, "locked") || typeof payload.locked === "boolean");
-    default: return false;
-  }
-}
-
-function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
-  return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
-}
-
-function blocked(project: Project, node: Node, flags = false): CommandErrorCode | null {
-  let current: Node | undefined = node;
-  while (current) {
-    if (current.locked && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_LOCKED;
-    if (!current.visible && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_HIDDEN;
-    current = current.parentId === null ? undefined : project.nodes.find((entry) => entry.id === current?.parentId);
-  }
-  return null;
-}
-
-function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
-  if (command.type === "ADD_NODE") {
-    const { parentId, node } = command.payload;
-    const parent = project.nodes.find((entry) => entry.id === parentId);
-    if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
-    const block = blocked(project, parent);
-    if (block) return failure(command.commandId, block, "Родительский узел недоступен для редактирования.");
-    if (node.parentId !== parentId || node.children.length !== 0 || node.modifierIds.length !== 0)
-      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Добавляемый узел должен быть согласованным листом без модификаторов.");
-    if (project.nodes.some((entry) => entry.id === node.id) || entityIds(project).has(node.id))
-      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
-    project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
-    project.nodes.push(structuredClone(node));
-    return null;
-  }
-  const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
-  if (!current) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Целевой узел не найден.");
-  const block = blocked(project, current, command.type === "SET_NODE_FLAGS");
-  if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
-  if (command.type === "SET_NODE_FLAGS") {
-    if (current.locked && command.payload.locked !== false)
-      return failure(command.commandId, CommandErrorCode.NODE_LOCKED, "Для изменения узла сначала снимите его блокировку.");
-    if (!current.visible && command.payload.visible !== true)
-      return failure(command.commandId, CommandErrorCode.NODE_HIDDEN, "Для изменения узла сначала восстановите его видимость.");
-  }
-  let next: Node;
-  switch (command.type) {
-    case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
-    case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
-    case "SET_NODE_FLAGS": next = { ...current,
-      visible: command.payload.visible ?? current.visible,
-      locked: command.payload.locked ?? current.locked }; break;
-  }
-  project.nodes = project.nodes.map((entry) => entry.id === current.id ? next : entry);
-  return null;
-}
-
-function entityIds(project: Project): Set<string> {
-  return new Set([project.id, project.model.id, project.scene.id,
-    ...project.nodes.map((item) => item.id), ...project.modifiers.map((item) => item.id),
-    ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
-    ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
-    ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
-    ...project.keyframes.map((item) => item.id)]);
-}
-
-function diff(before: Project, after: Project): ProjectPatch {
-  const changes: PatchChange[] = [];
-  for (const node of after.nodes) {
-    const old = before.nodes.find((entry) => entry.id === node.id);
-    if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
-    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
-      if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
-        before: structuredClone(old[field]), after: structuredClone(node[field]) });
-    }
-  }
-  if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
-  return { changes };
-}
-
-function inverse(patch: ProjectPatch): ProjectPatch {
-  return { changes: [...patch.changes].reverse().map((change): PatchChange => {
-    if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
-    if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
-    if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
-    return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
-  }) };
-}
-
-/** Replays a patch against a matching semantic base; throws on stale or invalid input. */
-export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
-  const result = structuredClone(project);
-  for (const change of patch.changes) {
-    if (change.kind === "addNode") {
-      if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
-      result.nodes.push(structuredClone(change.node));
-    } else if (change.kind === "removeNode") {
-      const index = result.nodes.findIndex((node) => node.id === change.node.id);
-      if (index < 0 || !same(result.nodes[index], change.node)) throw new Error("Patch node conflict");
-      result.nodes.splice(index, 1);
-    } else if (change.kind === "modelRevision") {
-      if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
-      result.model.revision = change.after;
-    } else {
-      const node = result.nodes.find((entry) => entry.id === change.nodeId);
-      if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
-      Object.assign(node, { [change.field]: structuredClone(change.after) });
-    }
-  }
-  if (validateProject(result).length) throw new Error("Patch produces invalid project");
-  return result;
-}
-
-export function createCommandBus(initialProject: Project): CommandBus {
-  const initial = structuredClone(initialProject);
-  const issues = validateProject(initial);
-  if (issues.length) throw new Error(`Invalid initial project: ${issues[0]?.message}`);
-  let committed = initial;
-  let revision = 0;
-  const executeTransaction = (commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult => {
-    const resultId = transactionId ?? (Array.isArray(commands) && commands.length === 1 && id(commands[0]?.commandId)
-      ? commands[0].commandId : "transaction");
-    if (expectedRevision !== revision) return failure(resultId, CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
-    if (!Array.isArray(commands) || commands.length === 0 || !commands.every(validCommand)
-      || new Set(commands.map((command) => command.commandId)).size !== commands.length)
-      return failure(resultId, CommandErrorCode.INVALID_COMMAND, "Некорректная команда или транзакция.");
-    try {
-      const candidate = structuredClone(committed);
-      for (const command of commands) {
-        const error = applyCommand(candidate, command);
-        if (error) return error;
-      }
-      const contentPatch = diff(committed, candidate);
-      if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
-        patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
-      candidate.model.revision += 1;
-      const validationIssues = validateProject(candidate);
-      if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
-      const patch = diff(committed, candidate);
-      const undoPatch = inverse(patch);
-      committed = candidate;
-      revision += 1;
-      return { ok: true, id: resultId, project: structuredClone(committed), revision,
-        patch: structuredClone(patch), undoPatch: structuredClone(undoPatch), changed: true };
-    } catch {
-      return failure(resultId, CommandErrorCode.INTERNAL_ERROR, "Не удалось выполнить транзакцию.");
-    }
-  };
-  return {
-    getRevision: () => revision,
-    getSnapshot: () => structuredClone(committed),
-    executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
-    executeTransaction,
-  };
-}
-</file>
-
 <file path="src/domain/create-project.ts">
 import type { EntityId, Project } from "./types";
 
@@ -4291,6 +4053,170 @@ export interface Keyframe {
   timeSeconds: number;
   value: KeyframeValue;
   interpolation: "step" | "linear" | "bezier";
+}
+</file>
+
+<file path="src/importers/gltf/import-glb.ts">
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import type { BufferGeometry, Material, Mesh, Object3D } from "three";
+import { ARCHIVE_LIMITS } from "../../assets/native-project-archive";
+import type { EditorStore } from "../../app/editor-store";
+import type { CommandResult, ProjectCommand } from "../../domain/command-bus";
+import type { Asset, MeshNode } from "../../domain/types";
+
+export type ImportResult<T> = { ok: true; value: T } | { ok: false; error: { code: "FILE_INVALID" | "IMPORT_UNSUPPORTED" | "ASSET_DECODE_FAILED"; message: string } };
+const fail = (code: "FILE_INVALID" | "IMPORT_UNSUPPORTED" | "ASSET_DECODE_FAILED", message: string): ImportResult<never> => ({ ok: false, error: { code, message } });
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const maxEntities = 10000;
+
+export interface PreparedGlb {
+  name: string;
+  bytes: Uint8Array;
+  hash: string;
+  triangles: number;
+  materialCount: number;
+}
+
+function inspectContainer(bytes: Uint8Array): ImportResult<Record<string, unknown>> {
+  if (bytes.byteLength < 20 || bytes.byteLength > ARCHIVE_LIMITS.asset) return fail("FILE_INVALID", "Размер GLB недопустим (максимум 64 МиБ).");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(0, true) !== 0x46546c67) return fail("FILE_INVALID", "Файл не содержит сигнатуру GLB.");
+  if (view.getUint32(4, true) !== 2) return fail("IMPORT_UNSUPPORTED", "Поддерживается только GLB версии 2.");
+  if (view.getUint32(8, true) !== bytes.byteLength) return fail("FILE_INVALID", "Длина GLB не совпадает с размером файла.");
+  let offset = 12;
+  let json: Record<string, unknown> | null = null;
+  let binLength = 0;
+  let chunkIndex = 0;
+  while (offset < bytes.byteLength) {
+    if (offset + 8 > bytes.byteLength) return fail("FILE_INVALID", "Повреждён заголовок chunk GLB.");
+    const length = view.getUint32(offset, true);
+    const type = view.getUint32(offset + 4, true);
+    offset += 8;
+    if (length % 4 !== 0 || length > bytes.byteLength - offset) return fail("FILE_INVALID", "Повреждены границы chunk GLB.");
+    if (chunkIndex === 0 && type === 0x4e4f534a) {
+      try {
+        const parsed: unknown = JSON.parse(decoder.decode(bytes.subarray(offset, offset + length)).trimEnd());
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return fail("FILE_INVALID", "JSON chunk должен быть объектом.");
+        json = parsed as Record<string, unknown>;
+      } catch { return fail("FILE_INVALID", "Некорректный JSON chunk GLB."); }
+    } else if (chunkIndex === 1 && type === 0x004e4942) binLength = length;
+    else return fail("IMPORT_UNSUPPORTED", "Неподдерживаемый порядок или тип chunk GLB.");
+    offset += length;
+    chunkIndex += 1;
+  }
+  if (!json || offset !== bytes.byteLength || !binLength) return fail("FILE_INVALID", "GLB должен содержать JSON и встроенный BIN chunk.");
+  const obj = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+  if (!obj(json.asset) || json.asset.version !== "2.0") return fail("IMPORT_UNSUPPORTED", "Требуется glTF 2.0.");
+  if (Array.isArray(json.extensionsUsed) && json.extensionsUsed.length || Array.isArray(json.extensionsRequired) && json.extensionsRequired.length)
+    return fail("IMPORT_UNSUPPORTED", "Расширения glTF пока не поддерживаются, включая обязательные декодеры.");
+  const arrays = ["nodes", "meshes", "buffers", "bufferViews", "accessors", "materials", "textures", "images", "animations", "skins", "cameras", "scenes"];
+  for (const key of arrays) if (json[key] !== undefined && (!Array.isArray(json[key]) || json[key].length > maxEntities)) return fail("FILE_INVALID", `Недопустимое количество элементов ${key}.`);
+  // No URI, including a data URI, is handed to GLTFLoader. Embedded BIN and bufferView images are the supported path.
+  const pending: unknown[] = [json];
+  let visited = 0;
+  while (pending.length) {
+    const value = pending.pop();
+    if (++visited > 100_000) return fail("FILE_INVALID", "Слишком сложная структура glTF.");
+    if (Array.isArray(value)) pending.push(...value);
+    else if (obj(value)) {
+      if (Object.hasOwn(value, "uri")) return fail("IMPORT_UNSUPPORTED", "Внешние URI и data URI пока запрещены.");
+      if (Object.hasOwn(value, "extensions")) return fail("IMPORT_UNSUPPORTED", "Расширения glTF пока не поддерживаются.");
+      pending.push(...Object.values(value));
+    }
+  }
+  if ((json.animations as unknown[] | undefined)?.length || (json.skins as unknown[] | undefined)?.length || (json.cameras as unknown[] | undefined)?.length)
+    return fail("IMPORT_UNSUPPORTED", "Анимации, skinning и камеры пока не импортируются.");
+  const meshes = json.meshes as unknown[] | undefined;
+  const nodes = json.nodes as unknown[] | undefined;
+  if (!Array.isArray(json.scenes) || json.scenes.length !== 1 || json.scene !== 0)
+    return fail("IMPORT_UNSUPPORTED", "Поддерживается одна активная сцена glTF.");
+  if (!meshes || meshes.length !== 1 || !nodes || nodes.filter((node) => obj(node) && node.mesh !== undefined).length !== 1)
+    return fail("IMPORT_UNSUPPORTED", "Поддерживается одна статическая mesh-модель без нескольких mesh-узлов.");
+  if (nodes.some((node) => !obj(node) || node.skin !== undefined || node.weights !== undefined || node.extensions !== undefined))
+    return fail("IMPORT_UNSUPPORTED", "Неподдерживаемый узел glTF.");
+  if (meshes.some((mesh) => !obj(mesh) || mesh.weights !== undefined || !Array.isArray(mesh.primitives)
+    || mesh.primitives.length === 0 || mesh.primitives.length > 64 || mesh.primitives.some((primitive: unknown) =>
+      !obj(primitive) || primitive.targets !== undefined || primitive.extensions !== undefined || (primitive.mode !== undefined && primitive.mode !== 4))))
+    return fail("IMPORT_UNSUPPORTED", "Нужна статическая triangle geometry без morph targets.");
+  const buffers = json.buffers as unknown[] | undefined;
+  if (!buffers || buffers.length !== 1 || !obj(buffers[0]) || buffers[0].uri !== undefined
+    || typeof buffers[0].byteLength !== "number" || buffers[0].byteLength > binLength || buffers[0].byteLength < binLength - 3)
+    return fail("IMPORT_UNSUPPORTED", "Внешние buffers запрещены; нужен встроенный BIN chunk.");
+  for (const key of ["images", "textures"] as const) {
+    const entries = json[key] as unknown[] | undefined;
+    if (entries?.some((entry) => !obj(entry) || entry.uri !== undefined || entry.extensions !== undefined))
+      return fail("IMPORT_UNSUPPORTED", "Внешние изображения и текстуры либо их расширения запрещены.");
+  }
+  if (json.extensions !== undefined) return fail("IMPORT_UNSUPPORTED", "Расширения сцены пока не поддерживаются.");
+  return { ok: true, value: json };
+}
+
+function dispose(root: Object3D): void {
+  root.traverse((object) => {
+    if (!("isMesh" in object)) return;
+    const mesh = object as Mesh;
+    mesh.geometry?.dispose();
+    for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      const mat = material as Material & Record<string, unknown>;
+      for (const value of Object.values(mat)) if (value && typeof value === "object" && "isTexture" in value && "dispose" in value && typeof value.dispose === "function") value.dispose();
+      mat.dispose();
+    }
+  });
+}
+
+export async function prepareGlb(file: File): Promise<ImportResult<PreparedGlb>> {
+  if (!/\.glb$/i.test(file.name) || !["", "model/gltf-binary", "application/octet-stream"].includes(file.type))
+    return fail("FILE_INVALID", "Выберите локальный файл .glb с допустимым MIME-типом.");
+  if (file.size > ARCHIVE_LIMITS.asset) return fail("FILE_INVALID", "GLB превышает 64 МиБ.");
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const preflight = inspectContainer(bytes);
+    if (!preflight.ok) return preflight;
+    const loader = new GLTFLoader();
+    const gltf = await loader.parseAsync(bytes.buffer as ArrayBuffer, "");
+    try {
+      if (gltf.animations.length) return fail("IMPORT_UNSUPPORTED", "Анимации glTF пока не переносятся в таймлайн.");
+      let meshCount = 0;
+      let triangles = 0;
+      const materials = new Set<Material>();
+      let invalid = false;
+      gltf.scene.traverse((object) => {
+        if ("isSkinnedMesh" in object || "isPoints" in object || "isLine" in object) invalid = true;
+        if (!("isMesh" in object)) return;
+        meshCount += 1;
+        const mesh = object as Mesh;
+        const geometry = mesh.geometry as BufferGeometry;
+        const position = geometry.getAttribute("position");
+        const count = geometry.index?.count ?? position?.count ?? 0;
+        if (!position || position.itemSize !== 3 || !count || count % 3 !== 0 || !mesh.matrixWorld.elements.every(Number.isFinite)) invalid = true;
+        if (position) for (let index = 0; index < position.count; index += 1) {
+          if (![position.getX(index), position.getY(index), position.getZ(index)].every(Number.isFinite)) { invalid = true; break; }
+        }
+        triangles += count / 3;
+        for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) materials.add(material);
+      });
+      if (invalid || meshCount < 1 || triangles < 1 || triangles > 2_000_000)
+        return fail("IMPORT_UNSUPPORTED", "Геометрия пуста, повреждена или превышает лимит треугольников.");
+      const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((n) => n.toString(16).padStart(2, "0")).join("");
+      return { ok: true, value: { name: file.name.slice(0, -4).slice(0, 100) || "Импорт GLB", bytes, hash, triangles, materialCount: materials.size } };
+    } finally { dispose(gltf.scene); }
+  } catch { return fail("ASSET_DECODE_FAILED", "Не удалось разобрать геометрию GLB."); }
+}
+
+export function commitGlb(store: EditorStore, prepared: PreparedGlb, expectedRevision: number, expectedIdentity: object): CommandResult {
+  const project = store.getSnapshot().document.project;
+  const existing = project.assets.find((asset) => asset.hash === prepared.hash && asset.mediaType === "model/gltf-binary");
+  const assetId = existing?.id ?? crypto.randomUUID();
+  const nodeId = crypto.randomUUID();
+  const asset: Asset | null = existing ? null : { id: assetId, hash: prepared.hash, mediaType: "model/gltf-binary", path: `assets/${prepared.hash}.glb`, colorSpace: "none" };
+  const parentId = project.model.rootNodeId;
+  const node: MeshNode = { id: nodeId, kind: "mesh", name: prepared.name, parentId, children: [],
+    transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+    visible: true, locked: false, materialSlots: [], modifierIds: [], meshSource: { kind: "asset", assetId } };
+  const command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }> = {
+    commandId: crypto.randomUUID(), type: "ADD_MESH_ASSET", targetIds: [parentId, nodeId, assetId], payload: { parentId, node, asset },
+  };
+  return store.addMeshAsset(command, prepared.bytes, expectedRevision, expectedIdentity);
 }
 </file>
 
@@ -5817,6 +5743,139 @@ test("write generated component for isolated harness", async () => {
 });
 </file>
 
+<file path="tests/importers/glb.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { createProject } from "../../src/domain/create-project";
+import { createEditorStore } from "../../src/app/editor-store";
+import { prepareGlb, commitGlb } from "../../src/importers/gltf/import-glb";
+import { applyProjectPatch } from "../../src/domain/command-bus";
+import { createNativeProjectArchive, openNativeProjectArchive, ARCHIVE_LIMITS } from "../../src/assets/native-project-archive";
+
+function fixture(change: (json: Record<string, unknown>) => void = () => {}): Uint8Array {
+  const json: Record<string, unknown> = {
+    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+    buffers: [{ byteLength: 36 }], bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 0] }],
+  };
+  change(json);
+  const encoded = new TextEncoder().encode(JSON.stringify(json));
+  const jsonLength = Math.ceil(encoded.length / 4) * 4;
+  const bytes = new Uint8Array(12 + 8 + jsonLength + 8 + 36);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 0x46546c67, true); view.setUint32(4, 2, true); view.setUint32(8, bytes.length, true);
+  view.setUint32(12, jsonLength, true); view.setUint32(16, 0x4e4f534a, true);
+  bytes.fill(0x20, 20, 20 + jsonLength); bytes.set(encoded, 20);
+  const binAt = 20 + jsonLength;
+  view.setUint32(binAt, 36, true); view.setUint32(binAt + 4, 0x004e4942, true);
+  for (const [index, value] of [0, 0, 0, 1, 0, 0, 0, 1, 0].entries()) view.setFloat32(binAt + 8 + index * 4, value, true);
+  return bytes;
+}
+function file(bytes: Uint8Array, name = "triangle.glb") { return new File([bytes as BlobPart], name, { type: "model/gltf-binary" }); }
+
+describe("GLB import", () => {
+  it("validates geometry, commits atomically, replays patches and preserves bytes through archive", async () => {
+    const bytes = fixture();
+    const prepared = await prepareGlb(file(bytes));
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    if (!prepared.ok) return;
+    expect(prepared.value.triangles).toBe(1);
+    const store = createEditorStore(createProject());
+    const before = store.captureDocument();
+    let publications = 0;
+    store.subscribe(() => { publications += 1; expect(store.getSnapshot().document.project.assets.length).toBe(1); expect(store.getAssetBytes().ids()).toHaveLength(1); });
+    const result = commitGlb(store, prepared.value, before.revision, before.identity);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(publications).toBe(1);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.getSnapshot().document.project.nodes).toHaveLength(2);
+    expect(applyProjectPatch(before.project, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.project);
+    const archived = await createNativeProjectArchive(store.captureDocument().project, store.getAssetBytes(), "0.1.0");
+    if (!archived.ok) throw new Error(JSON.stringify(archived.error));
+    if (!archived.ok) return;
+    const opened = await openNativeProjectArchive(archived.value);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const asset = opened.value.project.assets[0];
+    if (!asset) throw new Error("Missing imported asset");
+    expect(opened.value.assets.get(asset.id)).toEqual(bytes);
+    expect(opened.value.project.nodes[1]).toMatchObject({ parentId: opened.value.project.model.rootNodeId, meshSource: { assetId: asset.id } });
+  });
+
+  it("rejects corrupt or unsupported inputs before parsing and makes no network request", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const cases = [
+      (() => { const value = fixture(); value[0] = 0; return value; })(),
+      (() => { const value = fixture(); new DataView(value.buffer).setUint32(4, 1, true); return value; })(),
+      (() => { const value = fixture(); new DataView(value.buffer).setUint32(8, 1, true); return value; })(),
+      (() => { const value = fixture(); value[20] = 0; return value; })(),
+      fixture((json) => { json.buffers = [{ byteLength: 36, uri: "https://example.com/model.bin" }]; }),
+      fixture((json) => { json.images = [{ uri: "../../secret.png" }]; }),
+      fixture((json) => { json.extensionsRequired = ["KHR_draco_mesh_compression"]; }),
+      fixture((json) => { json.animations = [{}]; }),
+      fixture((json) => { json.meshes = []; }),
+    ];
+    try {
+      for (const bytes of cases) expect((await prepareGlb(file(bytes))).ok).toBe(false);
+      expect((await prepareGlb(file(new Uint8Array(ARCHIVE_LIMITS.asset + 1)))).ok).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  it("rejects a stale preparation without changing project, bytes or history", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const store = createEditorStore(createProject());
+    const captured = store.captureDocument();
+    store.replaceProject({ project: createProject(), assets: store.getAssetBytes() }, captured.identity);
+    const before = store.getSnapshot();
+    expect(commitGlb(store, prepared.value, captured.revision, captured.identity).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+
+  it("reuses identical bytes and rejects revision conflicts", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    const firstCapture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(true);
+    const afterFirst = store.captureDocument();
+    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(commitGlb(store, prepared.value, afterFirst.revision, afterFirst.identity).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(1);
+    expect(store.getAssetBytes().ids()).toHaveLength(1);
+    expect(store.getSnapshot().document.project.nodes).toHaveLength(3);
+  });
+
+  it("rolls back asset bytes and history on an entity ID conflict", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    const captured = store.captureDocument();
+    const rootId = captured.project.model.rootNodeId;
+    const assetId = crypto.randomUUID();
+    const command = {
+      commandId: crypto.randomUUID(), type: "ADD_MESH_ASSET" as const,
+      targetIds: [rootId, rootId, assetId] as [string, string, string],
+      payload: { parentId: rootId, node: {
+        id: rootId, kind: "mesh" as const, name: "bad", parentId: rootId, children: [],
+        transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
+        visible: true, locked: false, materialSlots: [], modifierIds: [], meshSource: { kind: "asset" as const, assetId },
+      }, asset: { id: assetId, hash: prepared.value.hash, path: `assets/${prepared.value.hash}.glb`, mediaType: "model/gltf-binary", colorSpace: "none" as const } },
+    };
+    expect(store.addMeshAsset(command, prepared.value.bytes, captured.revision, captured.identity).ok).toBe(false);
+    expect(store.getSnapshot().document.project).toEqual(captured.project);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+});
+</file>
+
 <file path="tests/visual/design-tokens.html">
 <!doctype html>
 <html lang="ru">
@@ -6114,158 +6173,285 @@ export default defineConfig({
 });
 </file>
 
-<file path="src/app/editor-store.ts">
-import { createCommandBus } from "../domain/command-bus";
-import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
-import type { EntityId, Project } from "../domain/types";
-import { AssetBytes } from "../assets/asset-bytes";
-import type { LoadedProject } from "../assets/native-project-archive";
+<file path="src/domain/command-bus.ts">
+import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
+import { validateProject, type ValidationIssue } from "./validate-project";
 
-export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
-  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+export type ProjectCommand =
+  | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
+  | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
+  | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
+  | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
+  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
 
-export interface EditorState {
-  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
-  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
-  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
-  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
-  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
-  readonly history: { readonly entries: readonly HistoryEntry[] };
-  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
-}
+export const CommandErrorCode = {
+  REVISION_CONFLICT: "REVISION_CONFLICT",
+  INVALID_COMMAND: "INVALID_COMMAND",
+  INVALID_REFERENCE: "INVALID_REFERENCE",
+  NODE_LOCKED: "NODE_LOCKED",
+  NODE_HIDDEN: "NODE_HIDDEN",
+  VALIDATION_FAILED: "VALIDATION_FAILED",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+} as const;
+export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
-export interface HistoryEntry {
-  readonly id: string;
-  readonly revision: number;
-  readonly patch: DeepReadonly<ProjectPatch>;
-  readonly undoPatch: DeepReadonly<ProjectPatch>;
-}
+export type PatchChange =
+  | { kind: "addNode"; node: Node }
+  | { kind: "removeNode"; node: Node }
+  | { kind: "addAsset"; asset: Asset }
+  | { kind: "removeAsset"; asset: Asset }
+  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "modelRevision"; before: number; after: number };
+export interface ProjectPatch { changes: PatchChange[] }
 
-export interface EditorStore {
-  getSnapshot(): EditorState;
-  subscribe(listener: () => void): () => void;
+export type CommandResult =
+  | { ok: true; id: string; project: Project; revision: number; patch: ProjectPatch; undoPatch: ProjectPatch; changed: boolean }
+  | { ok: false; id: string; code: CommandErrorCode; message: string; issues?: ValidationIssue[] };
+
+export interface CommandBus {
+  /** Session revision starts at 0, regardless of the serialized model revision. */
+  getRevision(): number;
+  getSnapshot(): Project;
   executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
   executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
-  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
-  setTool(next: Partial<EditorState["tool"]>): void;
-  setView(next: Partial<EditorState["view"]>): void;
-  getAssetBytes(): AssetBytes;
-  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
-  confirmSaved(revision: number, identity: object): boolean;
-  replaceProject(loaded: LoadedProject, identity: object): boolean;
 }
 
-function deepFreeze<T>(value: T): DeepReadonly<T> {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+const idList = (value: unknown): value is string[] => Array.isArray(value) && value.every(id);
+const numbers = (value: unknown, count: number): value is number[] =>
+  Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
+const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key));
+
+function validTransform(value: unknown): value is Transform {
+  return record(value) && ownKeys(value, ["position", "rotationQuat", "scale"])
+    && numbers(value.position, 3) && numbers(value.rotationQuat, 4) && numbers(value.scale, 3);
+}
+
+function validNode(value: unknown): value is Node {
+  if (!record(value) || !id(value.id) || !["group", "mesh"].includes(String(value.kind))) return false;
+  const keys = ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"];
+  if (!ownKeys(value, value.kind === "mesh" ? [...keys, "meshSource"] : keys)) return false;
+  if (typeof value.name !== "string" || !value.name.trim() || !id(value.parentId) || !idList(value.children)
+    || !validTransform(value.transform) || typeof value.visible !== "boolean" || typeof value.locked !== "boolean"
+    || !Array.isArray(value.materialSlots) || !value.materialSlots.every((slot: unknown) =>
+      record(slot) && ownKeys(slot, ["name", "materialId"]) && typeof slot.name === "string" && id(slot.materialId))
+    || !idList(value.modifierIds)) return false;
+  if (value.kind === "group") return true;
+  const source = value.meshSource;
+  if (!record(source)) return false;
+  if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
+  return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
+    && ["cube", "sphere", "torus", "cylinder", "cone", "plane"].includes(String(source.primitive))
+    && record(source.parameters) && Object.values(source.parameters).every((item) => typeof item === "number" && Number.isFinite(item));
+}
+
+function validCommand(value: unknown): value is ProjectCommand {
+  if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
+  const payload = value.payload;
+  if (value.type === "ADD_MESH_ASSET") {
+    const asset = payload.asset;
+    const node = payload.node;
+    return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+      && ownKeys(payload, ["parentId", "node", "asset"]) && id(payload.parentId)
+      && validNode(node) && node.kind === "mesh" && node.meshSource.kind === "asset"
+      && (asset === null || (record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+        && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
+        && asset.path === `assets/${asset.hash}.glb` && asset.mediaType === "model/gltf-binary" && asset.colorSpace === "none"))
+      && value.targetIds.length === 3 && value.targetIds[0] === payload.parentId
+      && value.targetIds[1] === node.id && value.targetIds[2] === node.meshSource.assetId
+      && (asset === null || asset.id === node.meshSource.assetId);
   }
-  return value as DeepReadonly<T>;
+  if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+    && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
+    && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
+  if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
+    || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  switch (value.type) {
+    case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
+    case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
+    case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
+      && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
+      && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
+      && (!Object.hasOwn(payload, "locked") || typeof payload.locked === "boolean");
+    default: return false;
+  }
 }
 
-export function createEditorStore(initialProject: Project): EditorStore {
-  let bus = createCommandBus(initialProject);
-  let assetBytes = new AssetBytes();
-  let identity: object = {};
-  const listeners = new Set<() => void>();
-  let state: EditorState = Object.freeze({
-    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
-    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
-    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
-    job: Object.freeze({ status: "idle" as const }),
-    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
-    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
-  });
+function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
+  return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
+}
 
-  function publish(next: EditorState): void {
-    state = Object.freeze(next);
-    for (const listener of [...listeners]) {
-      if (listeners.has(listener)) listener();
+function blocked(project: Project, node: Node, flags = false): CommandErrorCode | null {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current.locked && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_LOCKED;
+    if (!current.visible && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_HIDDEN;
+    current = current.parentId === null ? undefined : project.nodes.find((entry) => entry.id === current?.parentId);
+  }
+  return null;
+}
+
+function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
+    const { parentId, node } = command.payload;
+    if (command.type === "ADD_MESH_ASSET") {
+      const { asset } = command.payload;
+      const assetId = command.payload.node.meshSource.kind === "asset" ? command.payload.node.meshSource.assetId : "";
+      if (asset === null) {
+        if (!project.assets.some((entry) => entry.id === assetId && entry.mediaType === "model/gltf-binary"))
+          return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Ресурс GLB не найден.");
+      } else {
+        if (entityIds(project).has(asset.id) || asset.id === node.id || project.assets.some((entry) => entry.path === asset.path))
+          return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
+        project.assets.push(structuredClone(asset));
+      }
+    }
+    const parent = project.nodes.find((entry) => entry.id === parentId);
+    if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
+    const block = blocked(project, parent);
+    if (block) return failure(command.commandId, block, "Родительский узел недоступен для редактирования.");
+    if (node.parentId !== parentId || node.children.length !== 0 || node.modifierIds.length !== 0)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Добавляемый узел должен быть согласованным листом без модификаторов.");
+    if (project.nodes.some((entry) => entry.id === node.id) || entityIds(project).has(node.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
+    project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
+    project.nodes.push(structuredClone(node));
+    return null;
+  }
+  const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
+  if (!current) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Целевой узел не найден.");
+  const block = blocked(project, current, command.type === "SET_NODE_FLAGS");
+  if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
+  if (command.type === "SET_NODE_FLAGS") {
+    if (current.locked && command.payload.locked !== false)
+      return failure(command.commandId, CommandErrorCode.NODE_LOCKED, "Для изменения узла сначала снимите его блокировку.");
+    if (!current.visible && command.payload.visible !== true)
+      return failure(command.commandId, CommandErrorCode.NODE_HIDDEN, "Для изменения узла сначала восстановите его видимость.");
+  }
+  let next: Node;
+  switch (command.type) {
+    case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
+    case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
+    case "SET_NODE_FLAGS": next = { ...current,
+      visible: command.payload.visible ?? current.visible,
+      locked: command.payload.locked ?? current.locked }; break;
+  }
+  project.nodes = project.nodes.map((entry) => entry.id === current.id ? next : entry);
+  return null;
+}
+
+function entityIds(project: Project): Set<string> {
+  return new Set([project.id, project.model.id, project.scene.id,
+    ...project.nodes.map((item) => item.id), ...project.modifiers.map((item) => item.id),
+    ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
+    ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
+    ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
+    ...project.keyframes.map((item) => item.id)]);
+}
+
+function diff(before: Project, after: Project): ProjectPatch {
+  const changes: PatchChange[] = [];
+  for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
+  for (const node of after.nodes) {
+    const old = before.nodes.find((entry) => entry.id === node.id);
+    if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
+    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
+      if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
+        before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
   }
-
-  function commit(result: CommandResult): CommandResult {
-    if (!result.ok || !result.changed) return result;
-    identity = {};
-    const entry: HistoryEntry = Object.freeze({
-      id: result.id,
-      revision: result.revision,
-      patch: deepFreeze(structuredClone(result.patch)),
-      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
-    });
-    publish({
-      ...state,
-      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
-      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
-      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
-    });
-    return result;
-  }
-
-  return {
-    getSnapshot: () => state,
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => { listeners.delete(listener); };
-    },
-    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
-    executeTransaction: (commands, expectedRevision, transactionId) =>
-      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
-    getAssetBytes: () => assetBytes.clone(),
-    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
-    confirmSaved(revision, expectedIdentity) {
-      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
-      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
-      return true;
-    },
-    replaceProject(loaded, expectedIdentity) {
-      if (identity !== expectedIdentity) return false;
-      const nextBus = createCommandBus(loaded.project);
-      const nextAssets = loaded.assets.clone();
-      bus = nextBus;
-      assetBytes.clear();
-      assetBytes = nextAssets;
-      identity = {};
-      publish({
-        ...state,
-        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
-        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-        history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
-        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
-      });
-      return true;
-    },
-    setSelection(ids, activeId) {
-      const valid = new Set(state.document.project.nodes.map((node) => node.id));
-      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
-      const active = activeId === undefined ? (selected[0] ?? null) :
-        activeId !== null && selected.includes(activeId) ? activeId : null;
-      if (active === state.selection.activeId && selected.length === state.selection.ids.length
-        && selected.every((id, index) => id === state.selection.ids[index])) return;
-      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
-    },
-    setTool(next) {
-      const tool = { ...state.tool, ...next };
-      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
-      publish({ ...state, tool: Object.freeze(tool) });
-    },
-    setView(next) {
-      const view = { ...state.view, ...next };
-      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
-      publish({ ...state, view: Object.freeze(view) });
-    },
-  };
+  if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
+  return { changes };
 }
 
-export const selectProject = (state: EditorState) => state.document.project;
-export const selectRevision = (state: EditorState) => state.document.revision;
-export const selectDirty = (state: EditorState) => state.document.dirty;
-export const selectSelectedIds = (state: EditorState) => state.selection.ids;
-export const selectActiveId = (state: EditorState) => state.selection.activeId;
-export const selectTool = (state: EditorState) => state.tool;
-export const selectJob = (state: EditorState) => state.job;
-export const selectDerived = (state: EditorState) => state.derived;
+function inverse(patch: ProjectPatch): ProjectPatch {
+  return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
+    if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
+    if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+  }) };
+}
+
+/** Replays a patch against a matching semantic base; throws on stale or invalid input. */
+export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
+  const result = structuredClone(project);
+  for (const change of patch.changes) {
+    if (change.kind === "addAsset") {
+      if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
+      result.assets.push(structuredClone(change.asset));
+    } else if (change.kind === "removeAsset") {
+      const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
+      if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
+      result.assets.splice(index, 1);
+    } else if (change.kind === "addNode") {
+      if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
+      result.nodes.push(structuredClone(change.node));
+    } else if (change.kind === "removeNode") {
+      const index = result.nodes.findIndex((node) => node.id === change.node.id);
+      if (index < 0 || !same(result.nodes[index], change.node)) throw new Error("Patch node conflict");
+      result.nodes.splice(index, 1);
+    } else if (change.kind === "modelRevision") {
+      if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
+      result.model.revision = change.after;
+    } else {
+      const node = result.nodes.find((entry) => entry.id === change.nodeId);
+      if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
+      Object.assign(node, { [change.field]: structuredClone(change.after) });
+    }
+  }
+  if (validateProject(result).length) throw new Error("Patch produces invalid project");
+  return result;
+}
+
+export function createCommandBus(initialProject: Project): CommandBus {
+  const initial = structuredClone(initialProject);
+  const issues = validateProject(initial);
+  if (issues.length) throw new Error(`Invalid initial project: ${issues[0]?.message}`);
+  let committed = initial;
+  let revision = 0;
+  const executeTransaction = (commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult => {
+    const resultId = transactionId ?? (Array.isArray(commands) && commands.length === 1 && id(commands[0]?.commandId)
+      ? commands[0].commandId : "transaction");
+    if (expectedRevision !== revision) return failure(resultId, CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+    if (!Array.isArray(commands) || commands.length === 0 || !commands.every(validCommand)
+      || new Set(commands.map((command) => command.commandId)).size !== commands.length)
+      return failure(resultId, CommandErrorCode.INVALID_COMMAND, "Некорректная команда или транзакция.");
+    try {
+      const candidate = structuredClone(committed);
+      for (const command of commands) {
+        const error = applyCommand(candidate, command);
+        if (error) return error;
+      }
+      const contentPatch = diff(committed, candidate);
+      if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
+      candidate.model.revision += 1;
+      const validationIssues = validateProject(candidate);
+      if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
+      const patch = diff(committed, candidate);
+      const undoPatch = inverse(patch);
+      committed = candidate;
+      revision += 1;
+      return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: structuredClone(patch), undoPatch: structuredClone(undoPatch), changed: true };
+    } catch {
+      return failure(resultId, CommandErrorCode.INTERNAL_ERROR, "Не удалось выполнить транзакцию.");
+    }
+  };
+  return {
+    getRevision: () => revision,
+    getSnapshot: () => structuredClone(committed),
+    executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
+    executeTransaction,
+  };
+}
 </file>
 
 <file path="src/domain/validate-project.ts">
@@ -6468,48 +6654,6 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
   if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
   else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
 }
-</file>
-
-<file path="src/ui/styles/app.css">
-body { margin: 0; min-width: 960px; }
-#root { min-height: 100vh; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
-.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
-.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
-.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
-.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
-.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
-.file-actions { display: flex; align-items: center; gap: var(--space-2); }
-.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.file-actions button:disabled { opacity: .5; cursor: wait; }
-.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
-.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
-.dock { background: var(--color-surface-base); }
-.left-dock { border-right: var(--border-default); }
-.right-dock { border-left: var(--border-default); }
-.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
-.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
-.panel-content { padding: var(--space-4) var(--space-3); }
-.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
-.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
-.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
-.tree-row:first-of-type { background: var(--color-state-info-surface); }
-.tree-row span { color: var(--color-primary-accent-strong); }
-.tree-row small { margin-left: auto; color: var(--color-text-muted); }
-.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
-.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
-.info-block span { color: var(--color-text-secondary); }
-.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
-.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
-.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
-.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
-.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
-.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
-.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
-.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
-.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
 </file>
 
 <file path="tests/app/editor-store.test.ts">
@@ -6780,6 +6924,258 @@ export default tseslint.config(
 );
 </file>
 
+<file path="src/app/editor-store.ts">
+import { createCommandBus } from "../domain/command-bus";
+import { CommandErrorCode } from "../domain/command-bus";
+import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
+import type { EntityId, Project } from "../domain/types";
+import { AssetBytes } from "../assets/asset-bytes";
+import type { LoadedProject } from "../assets/native-project-archive";
+
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+
+export interface EditorState {
+  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
+  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
+  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
+  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
+  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
+  readonly history: { readonly entries: readonly HistoryEntry[] };
+  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
+}
+
+export interface HistoryEntry {
+  readonly id: string;
+  readonly revision: number;
+  readonly patch: DeepReadonly<ProjectPatch>;
+  readonly undoPatch: DeepReadonly<ProjectPatch>;
+}
+
+export interface EditorStore {
+  getSnapshot(): EditorState;
+  subscribe(listener: () => void): () => void;
+  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
+  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
+  setTool(next: Partial<EditorState["tool"]>): void;
+  setView(next: Partial<EditorState["view"]>): void;
+  getAssetBytes(): AssetBytes;
+  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  confirmSaved(revision: number, identity: object): boolean;
+  replaceProject(loaded: LoadedProject, identity: object): boolean;
+}
+
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
+}
+
+export function createEditorStore(initialProject: Project): EditorStore {
+  let bus = createCommandBus(initialProject);
+  let assetBytes = new AssetBytes();
+  let identity: object = {};
+  const listeners = new Set<() => void>();
+  let state: EditorState = Object.freeze({
+    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
+    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
+    job: Object.freeze({ status: "idle" as const }),
+    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
+  });
+
+  function publish(next: EditorState): void {
+    state = Object.freeze(next);
+    for (const listener of [...listeners]) {
+      if (listeners.has(listener)) listener();
+    }
+  }
+
+  function commit(result: CommandResult): CommandResult {
+    if (!result.ok || !result.changed) return result;
+    identity = {};
+    const entry: HistoryEntry = Object.freeze({
+      id: result.id,
+      revision: result.revision,
+      patch: deepFreeze(structuredClone(result.patch)),
+      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
+    });
+    publish({
+      ...state,
+      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
+      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+    });
+    return result;
+  }
+
+  return {
+    getSnapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
+    executeTransaction: (commands, expectedRevision, transactionId) =>
+      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
+    addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      if (command.payload.asset && (bytes.byteLength === 0 || assetBytes.ids().includes(command.payload.asset.id)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Байты ресурса отсутствуют или ID уже занят." };
+      if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
+      try {
+        const nextAssets = assetBytes.clone();
+        if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
+        const result = bus.executeCommand(command, expectedRevision);
+        if (!result.ok) return result;
+        assetBytes = nextAssets;
+        return commit(result);
+      } catch {
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
+      }
+    },
+    getAssetBytes: () => assetBytes.clone(),
+    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    confirmSaved(revision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
+      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
+      return true;
+    },
+    replaceProject(loaded, expectedIdentity) {
+      if (identity !== expectedIdentity) return false;
+      const nextBus = createCommandBus(loaded.project);
+      const nextAssets = loaded.assets.clone();
+      bus = nextBus;
+      assetBytes.clear();
+      assetBytes = nextAssets;
+      identity = {};
+      publish({
+        ...state,
+        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+        history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
+      });
+      return true;
+    },
+    setSelection(ids, activeId) {
+      const valid = new Set(state.document.project.nodes.map((node) => node.id));
+      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
+      const active = activeId === undefined ? (selected[0] ?? null) :
+        activeId !== null && selected.includes(activeId) ? activeId : null;
+      if (active === state.selection.activeId && selected.length === state.selection.ids.length
+        && selected.every((id, index) => id === state.selection.ids[index])) return;
+      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
+    },
+    setTool(next) {
+      const tool = { ...state.tool, ...next };
+      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
+      publish({ ...state, tool: Object.freeze(tool) });
+    },
+    setView(next) {
+      const view = { ...state.view, ...next };
+      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
+      publish({ ...state, view: Object.freeze(view) });
+    },
+  };
+}
+
+export const selectProject = (state: EditorState) => state.document.project;
+export const selectRevision = (state: EditorState) => state.document.revision;
+export const selectDirty = (state: EditorState) => state.document.dirty;
+export const selectSelectedIds = (state: EditorState) => state.selection.ids;
+export const selectActiveId = (state: EditorState) => state.selection.activeId;
+export const selectTool = (state: EditorState) => state.tool;
+export const selectJob = (state: EditorState) => state.job;
+export const selectDerived = (state: EditorState) => state.derived;
+</file>
+
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
+export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
+export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
+export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
+<file path="src/ui/styles/app.css">
+body { margin: 0; min-width: 960px; }
+#root { min-height: 100vh; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
+.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
+.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
+.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
+.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.file-actions { display: flex; align-items: center; gap: var(--space-2); }
+.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.file-actions button:disabled { opacity: .5; cursor: wait; }
+.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
+.import-confirm span { flex: 1; }
+.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
+.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
+.dock { background: var(--color-surface-base); }
+.left-dock { border-right: var(--border-default); }
+.right-dock { border-left: var(--border-default); }
+.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+.panel-content { padding: var(--space-4) var(--space-3); }
+.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
+.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
+.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
+.tree-row:first-of-type { background: var(--color-state-info-surface); }
+.tree-row span { color: var(--color-primary-accent-strong); }
+.tree-row small { margin-left: auto; color: var(--color-text-muted); }
+.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
+.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
+.info-block span { color: var(--color-text-secondary); }
+.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
+.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
+.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
+.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
+.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
+.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
+.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
+.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
+.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
 <file path="docs/data-contracts.md">
 # Data and contracts
 
@@ -6788,6 +7184,10 @@ export default tseslint.config(
 The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. The document uses schema v1 (`schemaVersion: "1.0.0"`); the manifest uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
 
 The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
+
+## GLB import (TASK-010B)
+
+A confirmed static GLB 2.0 is stored unchanged as `assets/<sha256>.glb` with `mediaType: model/gltf-binary` and `colorSpace: none`. One domain mesh node with identity transform points to the asset under the existing model root; glTF transforms and PBR data remain inside the binary source. No material slots or editable child meshes are synthesized. Import metadata is covered by reversible command patches, while bytes stay in RAM and in the explicit native archive. Duplicate identical GLBs reuse the existing asset ID and bytes. Unsupported animations, skinning, morph targets, multiple mesh nodes or scenes, glTF extensions and any URI are rejected before parsing; this is a partial implementation of FR-064.
 
 ## Project invariants
 
@@ -6833,39 +7233,6 @@ The earlier illustrative example used `formatVersion`, `projectId`, and `scene.m
 FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
 </file>
 
-<file path="src/domain/index.ts">
-export { createProject } from "./create-project";
-export type { IdFactory } from "./create-project";
-export { validateProject } from "./validate-project";
-export type { ValidationCode, ValidationIssue } from "./validate-project";
-export type * from "./types";
-export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
-export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
-export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
-export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
-</file>
-
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "resolveJsonModule": true,
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "lib": ["ES2022", "DOM"]
-  },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
-}
-</file>
-
 <file path="src/ui/App.tsx">
 import { createProject } from "../domain";
 import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
@@ -6873,6 +7240,7 @@ import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
 import { useRef, useState } from "react";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
+import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
 
 const RendererSpike = import.meta.env.DEV
@@ -6897,8 +7265,10 @@ export function App() {
 function EditorShell() {
   const state = useEditorStore(editorStore);
   const fileInput = useRef<HTMLInputElement>(null);
+  const glbInput = useRef<HTMLInputElement>(null);
   const [fileBusy, setFileBusy] = useState(false);
   const [fileStatus, setFileStatus] = useState("");
+  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const project = selectProject(state);
   const revision = selectRevision(state);
   const dirty = selectDirty(state);
@@ -6949,6 +7319,26 @@ function EditorShell() {
     } catch { setFileStatus("Не удалось открыть проект."); }
     finally { setFileBusy(false); }
   }
+  async function importGlb(file: File) {
+    if (fileBusy) return;
+    const captured = editorStore.captureDocument();
+    setPendingGlb(null);
+    setFileBusy(true);
+    setFileStatus("Проверка GLB…");
+    try {
+      const result = await prepareGlb(file);
+      if (!result.ok) { setFileStatus(result.error.message); return; }
+      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
+      setFileStatus("GLB проверен. Подтвердите добавление в текущую модель.");
+    } catch { setFileStatus("Не удалось проверить GLB."); }
+    finally { setFileBusy(false); }
+  }
+  function confirmGlb() {
+    if (!pendingGlb) return;
+    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
+    setPendingGlb(null);
+    setFileStatus(result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -6957,10 +7347,17 @@ function EditorShell() {
           <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
           <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
           <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
+          <button type="button" disabled={fileBusy} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
+          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
         </div>
       </header>
       {fileStatus && <div className="file-status" role="status" aria-live="polite">{fileStatus}</div>}
+      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
+        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются. 3D-просмотр появится позже.</span>
+        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
+        <button type="button" onClick={() => { setPendingGlb(null); setFileStatus("Импорт отменён."); }}>Отмена</button>
+      </div>}
       <div className="workspace-grid">
         <aside className="dock left-dock" aria-label="Структура проекта">
           <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
@@ -6968,6 +7365,7 @@ function EditorShell() {
             <p className="eyebrow">Текущий проект</p>
             <div className="project-name">{project.name}</div>
             <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
+            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
             <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
             <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
           </div>
@@ -6988,8 +7386,53 @@ function EditorShell() {
 }
 </file>
 
+<file path="package.json">
+{
+  "name": "triad-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "export:check": "node scripts/check-export-harness.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@zip.js/zip.js": "^2.24.0",
+    "ajv": "^8.20.0",
+    "manifold-3d": "^3.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "three": "0.186.1"
+  }
+}
+</file>
+
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-010B — Basic static GLB import
+
+- Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.
+- A confirmed import registers SHA-256 asset metadata and an identity transform mesh node in one domain transaction; bytes stay in RAM and round-trip through `.triad3d`. The Russian UI offers a separate import action, confirmation, diagnostics and a visible model entry.
+- TASK-010 / FR-064 remain partial: broader glTF scene and animation import, editable imported materials, and production 3D rendering are not implemented.
 
 ## TASK-010A — Native project archive and manual file actions
 
@@ -7035,45 +7478,6 @@ function EditorShell() {
 - `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
 - TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
 - Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
-</file>
-
-<file path="package.json">
-{
-  "name": "triad-3d",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "test": "vitest run",
-    "export:check": "node scripts/check-export-harness.mjs"
-  },
-  "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@types/three": "0.186.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "eslint": "^10.13.0",
-    "globals": "^17.13.0",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.72.0",
-    "vite": "^8.3.4",
-    "vitest": "^5.0.5"
-  },
-  "dependencies": {
-    "@zip.js/zip.js": "^2.24.0",
-    "ajv": "^8.20.0",
-    "manifold-3d": "^3.5.4",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "three": "0.186.1"
-  }
-}
 </file>
 
 </files>

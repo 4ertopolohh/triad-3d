@@ -28,6 +28,28 @@ function fixture(change: (json: Record<string, unknown>) => void = () => {}): Ui
 function file(bytes: Uint8Array, name = "triangle.glb") { return new File([bytes as BlobPart], name, { type: "model/gltf-binary" }); }
 
 describe("GLB import", () => {
+  it("retains bytes for redo, prunes abandoned imports, and archives restored assets", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    let capture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, capture.revision, capture.identity).ok).toBe(true);
+    const firstId = store.getSnapshot().document.project.assets[0]!.id;
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(0);
+    expect(store.getAssetBytes().get(firstId)).toEqual(prepared.value.bytes);
+    expect(store.redo(2).ok).toBe(true);
+    const archive = await createNativeProjectArchive(store.captureDocument().project, store.getAssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) expect((await openNativeProjectArchive(archive.value)).ok).toBe(true);
+    expect(store.undo(3).ok).toBe(true);
+    capture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, capture.revision, capture.identity).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(1);
+    expect(store.getSnapshot().history.canRedo).toBe(false);
+    const currentId = store.getSnapshot().document.project.assets[0]!.id;
+    if (currentId !== firstId) expect(store.getAssetBytes().get(firstId)).toBeUndefined();
+  });
   it("validates geometry, commits atomically, replays patches and preserves bytes through archive", async () => {
     const bytes = fixture();
     const prepared = await prepareGlb(file(bytes));

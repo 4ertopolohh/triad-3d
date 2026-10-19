@@ -15,6 +15,7 @@ export class AssetBytes {
   }
 
   ids(): string[] { return [...this.values.keys()]; }
+  delete(id: string): void { this.values.delete(id); }
   clear(): void { this.values.clear(); }
   clone(): AssetBytes { return new AssetBytes(this.values); }
 }
