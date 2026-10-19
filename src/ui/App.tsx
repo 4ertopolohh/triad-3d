@@ -63,6 +63,16 @@ function EditorShell() {
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
   useEffect(() => () => { dragCleanup.current?.(); }, []);
   useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!editorStore.getSnapshot().document.dirty) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+  useEffect(() => {
     const element = workspace.current;
     if (!element) return;
     const observer = new ResizeObserver(() => setDockWidths(([left, right]) => clampDocks(element.clientWidth, left, right)));

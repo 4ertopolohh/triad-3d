@@ -1,5 +1,10 @@
 # Implementation status
 
+## TASK-013 — Unsaved changes and RAM-only lifecycle
+
+- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
+- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
+
 ## TASK-012 — Desktop workspace and topbar
 
 - Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.

@@ -6850,291 +6850,6 @@ export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
 </file>
 
-<file path="src/ui/styles/app.css">
-body { margin: 0; min-width: 960px; }
-#root { min-height: 100vh; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
-.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
-.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
-.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
-.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
-.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
-.file-actions { display: flex; align-items: center; gap: var(--space-2); }
-.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.file-actions button:disabled { opacity: .5; cursor: wait; }
-.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
-.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
-.import-confirm span { flex: 1; }
-.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
-.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
-.dock { background: var(--color-surface-base); }
-.left-dock { border-right: var(--border-default); }
-.right-dock { border-left: var(--border-default); }
-.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
-.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
-.panel-content { padding: var(--space-4) var(--space-3); }
-.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
-.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
-.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
-.tree-row:first-of-type { background: var(--color-state-info-surface); }
-.tree-row span { color: var(--color-primary-accent-strong); }
-.tree-row small { margin-left: auto; color: var(--color-text-muted); }
-.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
-.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
-.info-block span { color: var(--color-text-secondary); }
-.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
-.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
-.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
-.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
-.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
-.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
-.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
-.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
-.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
-</file>
-
-<file path="tests/app/editor-store.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import { applyProjectPatch } from "../../src/domain";
-import type { GroupNode, ProjectCommand } from "../../src/domain";
-import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
-import { createNestedMeshProject } from "../fixtures/projects";
-import { AssetBytes } from "../../src/assets/asset-bytes";
-
-const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
-  commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
-});
-
-describe("editor store", () => {
-  it("replays 100 changes in both directions with monotonic session revisions", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    for (let index = 1; index <= 100; index += 1) {
-      expect(store.executeCommand(rename(`Name ${index}`), index - 1).ok).toBe(true);
-    }
-    expect(store.getSnapshot().history).toMatchObject({ cursor: 100, canUndo: true, canRedo: false });
-    for (let index = 100; index > 0; index -= 1) expect(store.undo(200 - index).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
-    expect(store.getSnapshot().document.project.model.revision).toBe(0);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    for (let index = 0; index < 100; index += 1) expect(store.redo(200 + index).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Name 100");
-    expect(store.getSnapshot().document.project.model.revision).toBe(100);
-    expect(store.getSnapshot().document.revision).toBe(300);
-  });
-
-  it("treats a transaction and an explicit gesture as single reversible steps", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    expect(store.executeTransaction([rename("A", "mesh-node", "a"), rename("B", "mesh-node", "b")], 0).ok).toBe(true);
-    expect(store.executeCommand(rename("C"), 1, "drag-1").ok).toBe(true);
-    expect(store.executeCommand(rename("D"), 2, "drag-1").ok).toBe(true);
-    expect(store.getSnapshot().history.entries).toHaveLength(2);
-    expect(store.undo(3).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("B");
-    expect(store.undo(4).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
-    expect(store.redo(5).ok).toBe(true);
-    expect(store.redo(6).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("D");
-  });
-
-  it("preserves checkpoints, branches, and publication atomicity", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const seen: ReturnType<typeof store.getSnapshot>[] = [];
-    store.subscribe(() => seen.push(store.getSnapshot()));
-    store.executeCommand(rename("A"), 0, "gesture");
-    const saved = store.captureDocument();
-    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
-    store.executeCommand(rename("B"), 1, "gesture");
-    expect(store.getSnapshot().history.entries).toHaveLength(2);
-    expect(store.undo(2).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    expect(store.redo(3).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(true);
-    expect(store.undo(4).ok).toBe(true);
-    const before = store.getSnapshot();
-    expect(store.redo(4)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
-    expect(store.executeCommand(rename("missing", "missing"), 5).ok).toBe(false);
-    expect(store.executeCommand(rename("A"), 5)).toMatchObject({ ok: true, changed: false });
-    expect(store.getSnapshot()).toBe(before);
-    store.executeCommand(rename("D"), 5);
-    expect(store.getSnapshot().history).toMatchObject({ cursor: 2, canRedo: false });
-    expect(store.redo(6).ok).toBe(false);
-    expect(store.undo(6).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    expect(seen.every((snapshot) => snapshot.document.revision === snapshot.derived.documentRevision)).toBe(true);
-  });
-
-  it("does not mark a new branch clean after discarding its saved position", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    store.executeCommand(rename("A"), 0);
-    store.executeCommand(rename("B"), 1);
-    const saved = store.captureDocument();
-    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
-    expect(store.undo(2).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(true);
-    expect(store.executeCommand(rename("D"), 3).ok).toBe(true);
-    expect(store.undo(4).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(true);
-  });
-
-  it("undoes a locked hidden node and rejects corrupt history patches atomically", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const flags: ProjectCommand = { commandId: "flags", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
-      payload: { nodeId: "mesh-node", locked: true, visible: false } };
-    expect(store.executeCommand(flags, 0).ok).toBe(true);
-    expect(store.undo(1).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
-    expect(store.redo(2).ok).toBe(true);
-    const mutable = store.getSnapshot().history.entries[0] as unknown as { patch: { changes: unknown[] } };
-    expect(Object.isFrozen(mutable.patch.changes)).toBe(true);
-  });
-
-  it("removes a selection when undo removes its node", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const node: GroupNode = { id: "new-node", kind: "group", name: "New", parentId: "nested-group", children: [],
-      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
-      visible: true, locked: false, materialSlots: [], modifierIds: [] };
-    const command: ProjectCommand = { commandId: "add", type: "ADD_NODE", targetIds: ["nested-group", node.id],
-      payload: { parentId: "nested-group", node } };
-    expect(store.executeCommand(command, 0).ok).toBe(true);
-    store.setSelection(["new-node"], "new-node");
-    expect(store.undo(1).ok).toBe(true);
-    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
-  });
-  it("initializes a stable, immutable RAM snapshot independently of its input", () => {
-    const input = createNestedMeshProject();
-    const store = createEditorStore(input);
-    const snapshot = store.getSnapshot();
-    input.nodes[0]?.children.push("external");
-    expect(store.getSnapshot()).toBe(snapshot);
-    expect(selectProject(snapshot).nodes[0]?.children).not.toContain("external");
-    expect(selectRevision(snapshot)).toBe(0);
-    expect(selectDirty(snapshot)).toBe(false);
-    expect(snapshot.job.status).toBe("idle");
-    expect(Object.isFrozen(snapshot.document.project.nodes[0]?.children)).toBe(true);
-    expect(() => { (snapshot.document.project.nodes as unknown as string[]).push("external"); }).toThrow();
-    expect(store.getSnapshot()).toBe(snapshot);
-  });
-
-  it("publishes one complete transaction and stores reversible deltas", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const observed: ReturnType<typeof store.getSnapshot>[] = [];
-    store.subscribe(() => observed.push(store.getSnapshot()));
-    const result = store.executeTransaction([
-      rename("Новое имя", "mesh-node", "one"), rename("Новая деталь", "mesh-node", "two"),
-    ], 0, "batch");
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(observed).toHaveLength(1);
-    const after = observed[0]!;
-    expect(after).toBe(store.getSnapshot());
-    expect(after.document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
-    expect(after.document.revision).toBe(result.revision);
-    expect(after.document.dirty).toBe(true);
-    expect(after.derived).toEqual({ generation: 1, documentRevision: 1, scope: "all" });
-    expect(after.history.entries).toHaveLength(1);
-    expect(after.history.entries[0]?.id).toBe("batch");
-    expect(applyProjectPatch(before.document.project as Parameters<typeof applyProjectPatch>[0], result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.document.project);
-    expect(after.history.entries[0]?.patch).toEqual(result.patch);
-    expect(after.history.entries[0]?.undoPatch).toEqual(result.undoPatch);
-    expect(Object.isFrozen(after.history.entries[0]?.patch.changes)).toBe(true);
-    result.project.nodes[0]?.children.push("caller mutation");
-    expect(after.document.project.nodes[0]?.children).not.toContain("caller mutation");
-  });
-
-  it("does not publish failures or semantic no-ops", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const listener = vi.fn();
-    store.subscribe(listener);
-    expect(store.executeCommand(rename("Куб"), 0)).toMatchObject({ ok: true, changed: false, revision: 0 });
-    expect(store.executeCommand(rename("Wrong", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
-    expect(store.executeTransaction([rename("A", "mesh-node", "first"), rename("B", "missing", "second")], 0))
-      .toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
-    expect(store.getSnapshot()).toBe(before);
-    expect(listener).not.toHaveBeenCalled();
-    expect(before.history.entries).toHaveLength(0);
-    expect(selectDerived(before).generation).toBe(0);
-  });
-
-  it("keeps selection, tool and view outside document revision and derived generation", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const project = before.document.project;
-    const listener = vi.fn();
-    const unsubscribe = store.subscribe(listener);
-    store.setSelection(["mesh-node", "missing", "mesh-node", "nested-group"], "nested-group");
-    expect(store.getSnapshot().selection).toEqual({ ids: ["mesh-node", "nested-group"], activeId: "nested-group" });
-    store.setSelection(["mesh-node", "nested-group"], "nested-group");
-    store.setTool({ mode: "scene", active: "move", space: "local" });
-    store.setView({ leftTab: "assets", timelineExpanded: false });
-    expect(listener).toHaveBeenCalledTimes(3);
-    const after = store.getSnapshot();
-    expect(after.document).toBe(before.document);
-    expect(after.document.project).toBe(project);
-    expect(after.history).toBe(before.history);
-    expect(after.derived).toBe(before.derived);
-    store.setSelection(["missing"]);
-    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
-    unsubscribe();
-    store.setView({ timelineExpanded: true });
-    expect(listener).toHaveBeenCalledTimes(4);
-  });
-
-  it("keeps session revision distinct from model revision", () => {
-    const input = createNestedMeshProject();
-    input.model.revision = 7;
-    const store = createEditorStore(input);
-    expect(store.getSnapshot().document.revision).toBe(0);
-    expect(store.getSnapshot().document.project.model.revision).toBe(7);
-    expect(store.executeCommand(rename("Новое"), 0)).toMatchObject({ ok: true, revision: 1 });
-    expect(store.getSnapshot().document.project.model.revision).toBe(8);
-    expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
-    expect(store.getSnapshot().document.revision).toBe(1);
-  });
-
-  it("atomically replaces project, command bus, assets, selection and history", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    store.executeCommand(rename("Changed"), 0);
-    store.setSelection(["mesh-node"]);
-    const oldIdentity = store.captureDocument().identity;
-    const next = createNestedMeshProject();
-    next.model.revision = 17;
-    const bytes = new AssetBytes([["asset", new Uint8Array([1, 2])]]);
-    const seen: ReturnType<typeof store.getSnapshot>[] = [];
-    store.subscribe(() => seen.push(store.getSnapshot()));
-    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(true);
-    expect(seen).toHaveLength(1);
-    expect(store.getSnapshot().document.project.model.revision).toBe(17);
-    expect(store.getSnapshot().document.revision).toBe(0);
-    expect(store.getSnapshot().history.entries).toHaveLength(0);
-    expect(store.getSnapshot().selection.ids).toHaveLength(0);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
-    bytes.clear();
-    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
-    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(false);
-    expect(store.executeCommand(rename("After load"), 0)).toMatchObject({ ok: true, revision: 1 });
-  });
-
-  it("does not acknowledge a stale save or replace after an edit", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const captured = store.captureDocument();
-    store.executeCommand(rename("Later"), 0);
-    expect(store.confirmSaved(captured.revision, captured.identity)).toBe(false);
-    expect(store.replaceProject({ project: createNestedMeshProject(), assets: new AssetBytes() }, captured.identity)).toBe(false);
-    expect(store.getSnapshot().document.dirty).toBe(true);
-    const current = store.captureDocument();
-    expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-  });
-});
-</file>
-
 <file path="tsconfig.json">
 {
   "compilerOptions": {
@@ -7445,184 +7160,343 @@ export const selectCanUndo = (state: EditorState) => state.history.canUndo;
 export const selectCanRedo = (state: EditorState) => state.history.canRedo;
 </file>
 
-<file path="src/ui/App.tsx">
-import { createProject } from "../domain";
-import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject, selectRevision } from "../app/editor-store";
-import { useEditorStore } from "../app/use-editor-store";
-import { lazy, Suspense } from "react";
-import { useEffect, useRef, useState } from "react";
-import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
-import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
-import packageInfo from "../../package.json";
-
-const RendererSpike = import.meta.env.DEV
-  ? lazy(() => import("../spikes/renderer/RendererSpike"))
-  : null;
-const CsgSpike = import.meta.env.DEV
-  ? lazy(() => import("../spikes/csg/CsgSpike"))
-  : null;
-
-const editorStore = createEditorStore(createProject());
-
-export function App() {
-  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
-    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
-  }
-  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
-    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
-  }
-  return <EditorShell />;
+<file path="src/ui/styles/app.css">
+body { margin: 0; }
+#root { min-height: 100vh; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
+.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
+.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
+.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
+.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.file-actions { display: flex; align-items: center; gap: var(--space-2); }
+.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.file-actions button:disabled { opacity: .5; cursor: wait; }
+.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
+.import-confirm span { flex: 1; }
+.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
+.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
+.dock { background: var(--color-surface-base); }
+.left-dock { border-right: var(--border-default); }
+.right-dock { border-left: var(--border-default); }
+.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+.panel-content { padding: var(--space-4) var(--space-3); }
+.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
+.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
+.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
+.tree-row:first-of-type { background: var(--color-state-info-surface); }
+.tree-row span { color: var(--color-primary-accent-strong); }
+.tree-row small { margin-left: auto; color: var(--color-text-muted); }
+.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
+.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
+.info-block span { color: var(--color-text-secondary); }
+.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
+.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
+.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
+.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
+.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
+.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
+.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
+.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
+.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
+.topbar { height: auto; min-height: var(--toolbar-height); justify-content: flex-start; gap: var(--space-3); padding: var(--space-2) var(--space-3); }
+.brand { min-width: 0; white-space: nowrap; }
+.project-title { max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: var(--color-text-secondary); }
+.dirty-indicator { color: var(--color-state-success); font-size: var(--font-size-sm); }
+.dirty-indicator.is-dirty { color: var(--color-state-warning); }
+.mode-switch, .dock-tabs { display: flex; gap: 2px; }
+.file-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
+.topbar button, .dock-tabs button, .timeline button, .import-confirm button, .file-status button { min-height: 32px; padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.mode-switch button[aria-pressed="true"], .dock-tabs button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
+.topbar button:disabled, .dock-tabs button:disabled { opacity: .5; cursor: not-allowed; }
+.file-status { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.status-success { background: var(--color-state-success-surface); color: var(--color-state-success); }
+.status-error { background: var(--color-state-danger-surface); color: var(--color-state-danger); }
+.status-info { background: var(--color-state-info-surface); color: var(--color-state-info); }
+.file-status button { min-height: 24px; }
+.workspace-grid { min-height: 420px; }
+.dock, .stage { min-width: 0; }
+.dock { overflow: auto; }
+.dock-resizer { background: var(--color-surface-sunken); border-inline: 1px solid var(--color-stroke); cursor: col-resize; touch-action: none; }
+.dock-resizer:hover, .dock-resizer:focus-visible, .is-resizing .dock-resizer { background: var(--color-primary-accent); }
+.dock-tabs { padding: var(--space-2); border-bottom: var(--border-default); }
+.dock-tabs button { flex: 1; }
+.timeline.is-collapsed { height: 40px; }
+.timeline-body[hidden] { display: none; }
+.narrow-screen { display: none; }
+@media (max-width: 1279px) and (min-width: 960px) {
+  .topbar { flex-wrap: wrap; }
+  .file-actions { flex: 1 1 100%; justify-content: flex-start; }
+  .project-title { max-width: 110px; }
 }
+@media (max-width: 959px) {
+  .app-shell > :not(.narrow-screen) { display: none; }
+  .narrow-screen { display: flex; min-height: 100vh; flex-direction: column; justify-content: center; align-items: center; padding: var(--space-6); text-align: center; }
+  .narrow-screen strong { font-size: var(--font-size-xl); }
+  .narrow-screen p { max-width: 34rem; line-height: 1.6; }
+}
+</file>
 
-function EditorShell() {
-  const state = useEditorStore(editorStore);
-  const fileInput = useRef<HTMLInputElement>(null);
-  const glbInput = useRef<HTMLInputElement>(null);
-  const [fileBusy, setFileBusy] = useState(false);
-  const [fileStatus, setFileStatus] = useState("");
-  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
-  const project = selectProject(state);
-  const revision = selectRevision(state);
-  const dirty = selectDirty(state);
-  const canUndo = selectCanUndo(state);
-  const canRedo = selectCanRedo(state);
-  function travel(direction: "undo" | "redo") {
-    if (fileBusy || pendingGlb) return;
-    const current = editorStore.getSnapshot();
-    const result = editorStore[direction](current.document.revision);
-    if (!result.ok) setFileStatus(result.message);
-    else setFileStatus(direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
-  }
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.ctrlKey || event.altKey || event.metaKey || fileBusy || pendingGlb || event.isComposing) return;
-      const target = event.target;
-      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
-      const key = event.key.toLowerCase();
-      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
-      if (!direction) return;
-      const current = editorStore.getSnapshot();
-      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
-      event.preventDefault();
-      travel(direction);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+<file path="tests/app/editor-store.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { applyProjectPatch, createProject } from "../../src/domain";
+import type { GroupNode, ProjectCommand } from "../../src/domain";
+import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
+import { createNestedMeshProject } from "../fixtures/projects";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+
+const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
+  commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
+});
+
+describe("editor store", () => {
+  it("replays 100 changes in both directions with monotonic session revisions", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    for (let index = 1; index <= 100; index += 1) {
+      expect(store.executeCommand(rename(`Name ${index}`), index - 1).ok).toBe(true);
+    }
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 100, canUndo: true, canRedo: false });
+    for (let index = 100; index > 0; index -= 1) expect(store.undo(200 - index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.getSnapshot().document.project.model.revision).toBe(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    for (let index = 0; index < 100; index += 1) expect(store.redo(200 + index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Name 100");
+    expect(store.getSnapshot().document.project.model.revision).toBe(100);
+    expect(store.getSnapshot().document.revision).toBe(300);
   });
-  async function saveProject() {
-    if (fileBusy) return;
-    setFileBusy(true);
-    setFileStatus("Подготовка архива…");
-    const captured = editorStore.captureDocument();
-    const filename = `${captured.project.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 80) || "project"}.triad3d`;
-    const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
-    try {
-      // The picker needs the original click activation; acquire the handle before asynchronous hashing.
-      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
-      const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
-      if (!result.ok) { setFileStatus(result.error.message); return; }
-      if (handle) {
-        const writable = await handle.createWritable();
-        await writable.write(result.value);
-        await writable.close();
-        setFileStatus(editorStore.confirmSaved(captured.revision, captured.identity) ? "Проект сохранён." : "Файл записан; после подготовки проекта были новые изменения.");
-      } else {
-        const url = URL.createObjectURL(result.value);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-        setFileStatus("Загрузка файла запущена. Проверьте его сохранение в браузере.");
-      }
-    } catch (error) {
-      setFileStatus(error instanceof DOMException && error.name === "AbortError" ? "Сохранение отменено." : "Не удалось сохранить проект.");
-    } finally { setFileBusy(false); }
-  }
 
-  async function openProject(file: File) {
-    if (fileBusy) return;
-    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Открыть другой проект и потерять их?")) return;
-    const expected = editorStore.captureDocument().identity;
-    setFileBusy(true);
-    setFileStatus("Проверка архива…");
-    try {
-      const result = await openNativeProjectArchive(file);
-      if (!result.ok) { setFileStatus(result.error.message); return; }
-      if (!editorStore.replaceProject(result.value, expected)) { setFileStatus("Проект изменился во время открытия файла. Повторите операцию."); return; }
-      setFileStatus("Проект открыт.");
-    } catch { setFileStatus("Не удалось открыть проект."); }
-    finally { setFileBusy(false); }
-  }
-  async function importGlb(file: File) {
-    if (fileBusy) return;
-    const captured = editorStore.captureDocument();
-    setPendingGlb(null);
-    setFileBusy(true);
-    setFileStatus("Проверка GLB…");
-    try {
-      const result = await prepareGlb(file);
-      if (!result.ok) { setFileStatus(result.error.message); return; }
-      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
-      setFileStatus("GLB проверен. Подтвердите добавление в текущую модель.");
-    } catch { setFileStatus("Не удалось проверить GLB."); }
-    finally { setFileBusy(false); }
-  }
-  function confirmGlb() {
-    if (!pendingGlb) return;
-    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
-    setPendingGlb(null);
-    setFileStatus(result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
-  }
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
-        <div className="file-actions">
-          <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
-          <button type="button" disabled={!canUndo || fileBusy || !!pendingGlb} onClick={() => travel("undo")}>Отменить</button>
-          <button type="button" disabled={!canRedo || fileBusy || !!pendingGlb} onClick={() => travel("redo")}>Повторить</button>
-          <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
-          <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
-          <button type="button" disabled={fileBusy} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
-          <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
-          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
-        </div>
-      </header>
-      {fileStatus && <div className="file-status" role="status" aria-live="polite">{fileStatus}</div>}
-      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
-        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются. 3D-просмотр появится позже.</span>
-        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
-        <button type="button" onClick={() => { setPendingGlb(null); setFileStatus("Импорт отменён."); }}>Отмена</button>
-      </div>}
-      <div className="workspace-grid">
-        <aside className="dock left-dock" aria-label="Структура проекта">
-          <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
-          <div className="panel-content">
-            <p className="eyebrow">Текущий проект</p>
-            <div className="project-name">{project.name}</div>
-            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
-            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
-            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
-          </div>
-        </aside>
-        <main className="stage" aria-label="Рабочая область">
-          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-008</span></div>
-          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{dirty ? "Есть несохранённые изменения" : `Проект в памяти · ревизия ${revision}`}</span></div>
-          <div className="stage-footer">3D-просмотр пока недоступен</div>
-        </main>
-        <aside className="dock right-dock" aria-label="Инспектор">
-          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><p className="eyebrow">Свойства</p><p className="panel-hint">Выберите объект после появления инструментов моделирования.</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
-        </aside>
-      </div>
-      <section className="timeline" aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><span>Подготовлено для TASK-039</span></div><div className="timeline-body">Дорожки анимации пока недоступны</div></section>
-    </div>
-  );
-}
+  it("treats a transaction and an explicit gesture as single reversible steps", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    expect(store.executeTransaction([rename("A", "mesh-node", "a"), rename("B", "mesh-node", "b")], 0).ok).toBe(true);
+    expect(store.executeCommand(rename("C"), 1, "drag-1").ok).toBe(true);
+    expect(store.executeCommand(rename("D"), 2, "drag-1").ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("B");
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.redo(5).ok).toBe(true);
+    expect(store.redo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("D");
+  });
+
+  it("preserves checkpoints, branches, and publication atomicity", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    store.executeCommand(rename("A"), 0, "gesture");
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    store.executeCommand(rename("B"), 1, "gesture");
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    const before = store.getSnapshot();
+    expect(store.redo(4)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.executeCommand(rename("missing", "missing"), 5).ok).toBe(false);
+    expect(store.executeCommand(rename("A"), 5)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot()).toBe(before);
+    store.executeCommand(rename("D"), 5);
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 2, canRedo: false });
+    expect(store.redo(6).ok).toBe(false);
+    expect(store.undo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(seen.every((snapshot) => snapshot.document.revision === snapshot.derived.documentRevision)).toBe(true);
+  });
+
+  it("does not mark a new branch clean after discarding its saved position", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("A"), 0);
+    store.executeCommand(rename("B"), 1);
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.executeCommand(rename("D"), 3).ok).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+  });
+
+  it("undoes a locked hidden node and rejects corrupt history patches atomically", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const flags: ProjectCommand = { commandId: "flags", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", locked: true, visible: false } };
+    expect(store.executeCommand(flags, 0).ok).toBe(true);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
+    expect(store.redo(2).ok).toBe(true);
+    const mutable = store.getSnapshot().history.entries[0] as unknown as { patch: { changes: unknown[] } };
+    expect(Object.isFrozen(mutable.patch.changes)).toBe(true);
+  });
+
+  it("removes a selection when undo removes its node", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const node: GroupNode = { id: "new-node", kind: "group", name: "New", parentId: "nested-group", children: [],
+      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+      visible: true, locked: false, materialSlots: [], modifierIds: [] };
+    const command: ProjectCommand = { commandId: "add", type: "ADD_NODE", targetIds: ["nested-group", node.id],
+      payload: { parentId: "nested-group", node } };
+    expect(store.executeCommand(command, 0).ok).toBe(true);
+    store.setSelection(["new-node"], "new-node");
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+  });
+  it("initializes a stable, immutable RAM snapshot independently of its input", () => {
+    const input = createNestedMeshProject();
+    const store = createEditorStore(input);
+    const snapshot = store.getSnapshot();
+    input.nodes[0]?.children.push("external");
+    expect(store.getSnapshot()).toBe(snapshot);
+    expect(selectProject(snapshot).nodes[0]?.children).not.toContain("external");
+    expect(selectRevision(snapshot)).toBe(0);
+    expect(selectDirty(snapshot)).toBe(false);
+    expect(snapshot.job.status).toBe("idle");
+    expect(Object.isFrozen(snapshot.document.project.nodes[0]?.children)).toBe(true);
+    expect(() => { (snapshot.document.project.nodes as unknown as string[]).push("external"); }).toThrow();
+    expect(store.getSnapshot()).toBe(snapshot);
+  });
+
+  it("publishes one complete transaction and stores reversible deltas", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const observed: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => observed.push(store.getSnapshot()));
+    const result = store.executeTransaction([
+      rename("Новое имя", "mesh-node", "one"), rename("Новая деталь", "mesh-node", "two"),
+    ], 0, "batch");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(observed).toHaveLength(1);
+    const after = observed[0]!;
+    expect(after).toBe(store.getSnapshot());
+    expect(after.document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
+    expect(after.document.revision).toBe(result.revision);
+    expect(after.document.dirty).toBe(true);
+    expect(after.derived).toEqual({ generation: 1, documentRevision: 1, scope: "all" });
+    expect(after.history.entries).toHaveLength(1);
+    expect(after.history.entries[0]?.id).toBe("batch");
+    expect(applyProjectPatch(before.document.project as Parameters<typeof applyProjectPatch>[0], result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.document.project);
+    expect(after.history.entries[0]?.patch).toEqual(result.patch);
+    expect(after.history.entries[0]?.undoPatch).toEqual(result.undoPatch);
+    expect(Object.isFrozen(after.history.entries[0]?.patch.changes)).toBe(true);
+    result.project.nodes[0]?.children.push("caller mutation");
+    expect(after.document.project.nodes[0]?.children).not.toContain("caller mutation");
+  });
+
+  it("does not publish failures or semantic no-ops", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    expect(store.executeCommand(rename("Куб"), 0)).toMatchObject({ ok: true, changed: false, revision: 0 });
+    expect(store.executeCommand(rename("Wrong", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.executeTransaction([rename("A", "mesh-node", "first"), rename("B", "missing", "second")], 0))
+      .toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.getSnapshot()).toBe(before);
+    expect(listener).not.toHaveBeenCalled();
+    expect(before.history.entries).toHaveLength(0);
+    expect(selectDerived(before).generation).toBe(0);
+  });
+
+  it("keeps selection, tool and view outside document revision and derived generation", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const project = before.document.project;
+    const listener = vi.fn();
+    const unsubscribe = store.subscribe(listener);
+    store.setSelection(["mesh-node", "missing", "mesh-node", "nested-group"], "nested-group");
+    expect(store.getSnapshot().selection).toEqual({ ids: ["mesh-node", "nested-group"], activeId: "nested-group" });
+    store.setSelection(["mesh-node", "nested-group"], "nested-group");
+    store.setTool({ mode: "scene", active: "move", space: "local" });
+    store.setView({ leftTab: "assets", timelineExpanded: false });
+    expect(listener).toHaveBeenCalledTimes(3);
+    const after = store.getSnapshot();
+    expect(after.document).toBe(before.document);
+    expect(after.document.project).toBe(project);
+    expect(after.history).toBe(before.history);
+    expect(after.derived).toBe(before.derived);
+    store.setSelection(["missing"]);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+    unsubscribe();
+    store.setView({ timelineExpanded: true });
+    expect(listener).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps session revision distinct from model revision", () => {
+    const input = createNestedMeshProject();
+    input.model.revision = 7;
+    const store = createEditorStore(input);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().document.project.model.revision).toBe(7);
+    expect(store.executeCommand(rename("Новое"), 0)).toMatchObject({ ok: true, revision: 1 });
+    expect(store.getSnapshot().document.project.model.revision).toBe(8);
+    expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.getSnapshot().document.revision).toBe(1);
+  });
+
+  it("atomically replaces project, command bus, assets, selection and history", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("Changed"), 0);
+    store.setSelection(["mesh-node"]);
+    const oldIdentity = store.captureDocument().identity;
+    const next = createNestedMeshProject();
+    next.model.revision = 17;
+    const bytes = new AssetBytes([["asset", new Uint8Array([1, 2])]]);
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(store.getSnapshot().document.project.model.revision).toBe(17);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().selection.ids).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    bytes.clear();
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(false);
+    expect(store.executeCommand(rename("After load"), 0)).toMatchObject({ ok: true, revision: 1 });
+  });
+
+  it("starts a clean new project without carrying old session data", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    expect(store.executeCommand(rename("Changed"), 0).ok).toBe(true);
+    store.setSelection(["mesh-node"]);
+    const stale = store.captureDocument();
+    const fresh = createProject();
+    expect(store.replaceProject({ project: fresh, assets: new AssetBytes() }, stale.identity)).toBe(true);
+    const state = store.getSnapshot();
+    expect(state.document.project.id).toBe(fresh.id);
+    expect(state.document.project.model.rootNodeId).toBe(state.document.project.nodes[0]?.id);
+    expect(state.document.project.scene.instances).toEqual([]);
+    expect(state.document.dirty).toBe(false);
+    expect(state.history.entries).toEqual([]);
+    expect(state.selection.ids).toEqual([]);
+    expect(store.getAssetBytes().ids()).toEqual([]);
+    expect(store.replaceProject({ project: stale.project, assets: stale.assets }, stale.identity)).toBe(false);
+  });
+
+  it("does not acknowledge a stale save or replace after an edit", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const captured = store.captureDocument();
+    store.executeCommand(rename("Later"), 0);
+    expect(store.confirmSaved(captured.revision, captured.identity)).toBe(false);
+    expect(store.replaceProject({ project: createNestedMeshProject(), assets: new AssetBytes() }, captured.identity)).toBe(false);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    const current = store.captureDocument();
+    expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
+});
 </file>
 
 <file path="package.json">
@@ -7664,8 +7538,289 @@ function EditorShell() {
 }
 </file>
 
+<file path="src/ui/App.tsx">
+import { createProject } from "../domain";
+import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { useEditorStore } from "../app/use-editor-store";
+import { lazy, Suspense, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
+import { AssetBytes } from "../assets/asset-bytes";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
+import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
+import packageInfo from "../../package.json";
+
+const RendererSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/renderer/RendererSpike"))
+  : null;
+const CsgSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/csg/CsgSpike"))
+  : null;
+
+const editorStore = createEditorStore(createProject());
+const DOCK_MIN = 220;
+const STAGE_MIN = 320;
+const HANDLE_WIDTH = 8;
+type Notice = { kind: "info" | "success" | "error"; text: string };
+
+function clampDocks(width: number, left: number, right: number, changed?: "left" | "right"): [number, number] {
+  const available = Math.max(DOCK_MIN * 2, width - STAGE_MIN - HANDLE_WIDTH * 2);
+  if (changed === "left") {
+    const fixedRight = Math.min(Math.max(right, DOCK_MIN), available - DOCK_MIN);
+    return [Math.min(Math.max(left, DOCK_MIN), available - fixedRight), fixedRight];
+  }
+  const fixedLeft = Math.min(Math.max(left, DOCK_MIN), available - DOCK_MIN);
+  return [fixedLeft, Math.min(Math.max(right, DOCK_MIN), available - fixedLeft)];
+}
+
+export function App() {
+  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
+    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
+  }
+  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
+    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
+  }
+  return <EditorShell />;
+}
+
+function EditorShell() {
+  const state = useEditorStore(editorStore);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const glbInput = useRef<HTMLInputElement>(null);
+  const workspace = useRef<HTMLDivElement>(null);
+  const fileLock = useRef(false);
+  const [fileBusy, setFileBusy] = useState(false);
+  const [fileStatus, setFileStatus] = useState<Notice | null>(null);
+  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
+  const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
+  const [dragging, setDragging] = useState(false);
+  const dragCleanup = useRef<(() => void) | null>(null);
+  const project = selectProject(state);
+  const revision = selectRevision(state);
+  const dirty = selectDirty(state);
+  const canUndo = selectCanUndo(state);
+  const canRedo = selectCanRedo(state);
+  const blocked = fileBusy || !!pendingGlb || state.job.status === "validating" || state.job.status === "running" || state.job.status === "applying";
+  const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
+  const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
+  useEffect(() => () => { dragCleanup.current?.(); }, []);
+  useEffect(() => {
+    const element = workspace.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => setDockWidths(([left, right]) => clampDocks(element.clientWidth, left, right)));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  function setDock(side: "left" | "right", value: number) {
+    const width = workspace.current?.clientWidth ?? window.innerWidth;
+    setDockWidths(([left, right]) => clampDocks(width, side === "left" ? value : left, side === "right" ? value : right, side));
+  }
+  function startDrag(event: React.PointerEvent<HTMLDivElement>, side: "left" | "right") {
+    if (event.button !== 0 || dragCleanup.current) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const startX = event.clientX;
+    const startWidth = dockWidths[side === "left" ? 0 : 1];
+    const oldUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = "none";
+    handle.setPointerCapture(event.pointerId);
+    setDragging(true);
+    const move = (next: PointerEvent) => setDock(side, startWidth + (next.clientX - startX) * (side === "left" ? 1 : -1));
+    const cleanup = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", stopDrag);
+      handle.removeEventListener("pointercancel", stopDrag);
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      document.body.style.userSelect = oldUserSelect;
+    };
+    dragCleanup.current = cleanup;
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", stopDrag);
+    handle.addEventListener("pointercancel", stopDrag);
+  }
+  function travel(direction: "undo" | "redo") {
+    if (blocked) return;
+    const current = editorStore.getSnapshot();
+    const result = editorStore[direction](current.document.revision);
+    if (!result.ok) notice("error", result.message);
+    else notice("success", direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.keyCode === 229) return;
+      const target = event.target;
+      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
+      const key = event.key.toLowerCase();
+      if (key === "s" && !event.shiftKey) { event.preventDefault(); void saveProject(); return; }
+      if (blocked) return;
+      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
+      if (!direction) return;
+      const current = editorStore.getSnapshot();
+      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
+      event.preventDefault();
+      travel(direction);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+  useEffect(() => {
+    if (!pendingGlb) return;
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.isComposing) {
+        setPendingGlb(null);
+        notice("info", "Импорт отменён.");
+      }
+    };
+    window.addEventListener("keydown", onEscape);
+    return () => window.removeEventListener("keydown", onEscape);
+  }, [pendingGlb]);
+  function newProject() {
+    if (blocked || fileLock.current) return;
+    const current = editorStore.captureDocument();
+    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Создать новый проект и потерять их?")) return;
+    if (!editorStore.replaceProject({ project: createProject(), assets: new AssetBytes() }, current.identity)) {
+      notice("error", "Проект изменился. Повторите создание нового проекта.");
+      return;
+    }
+    setPendingGlb(null);
+    notice("success", "Новый проект создан.");
+  }
+  async function saveProject() {
+    if (blocked || fileLock.current) return;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Подготовка архива…");
+    const captured = editorStore.captureDocument();
+    const filename = `${captured.project.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 80) || "project"}.triad3d`;
+    const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
+    try {
+      // The picker needs the original click activation; acquire the handle before asynchronous hashing.
+      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
+      const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      if (handle) {
+        const writable = await handle.createWritable();
+        await writable.write(result.value);
+        await writable.close();
+        notice("success", editorStore.confirmSaved(captured.revision, captured.identity) ? "Проект сохранён." : "Файл записан; после подготовки проекта были новые изменения.");
+      } else {
+        const url = URL.createObjectURL(result.value);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        notice("info", "Загрузка файла запущена. Проверьте его сохранение в браузере.");
+      }
+    } catch (error) {
+      notice(error instanceof DOMException && error.name === "AbortError" ? "info" : "error", error instanceof DOMException && error.name === "AbortError" ? "Сохранение отменено." : "Не удалось сохранить проект.");
+    } finally { fileLock.current = false; setFileBusy(false); }
+  }
+
+  async function openProject(file: File) {
+    if (blocked || fileLock.current) return;
+    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Открыть другой проект и потерять их?")) return;
+    const expected = editorStore.captureDocument().identity;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка архива…");
+    try {
+      const result = await openNativeProjectArchive(file);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      if (!editorStore.replaceProject(result.value, expected)) { notice("error", "Проект изменился во время открытия файла. Повторите операцию."); return; }
+      notice("success", "Проект открыт.");
+    } catch { notice("error", "Не удалось открыть проект."); }
+    finally { fileLock.current = false; setFileBusy(false); }
+  }
+  async function importGlb(file: File) {
+    if (blocked || fileLock.current) return;
+    const captured = editorStore.captureDocument();
+    setPendingGlb(null);
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка GLB…");
+    try {
+      const result = await prepareGlb(file);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
+      notice("info", "GLB проверен. Подтвердите добавление в текущую модель.");
+    } catch { notice("error", "Не удалось проверить GLB."); }
+    finally { fileLock.current = false; setFileBusy(false); }
+  }
+  function confirmGlb() {
+    if (!pendingGlb) return;
+    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
+    setPendingGlb(null);
+    notice(result.ok ? "success" : "error", result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
+  }
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="project-title" title={project.name}>{project.name}</span><span className={`dirty-indicator ${dirty ? "is-dirty" : ""}`} title={dirty ? "Есть несохранённые изменения" : "Нет несохранённых изменений"}>{dirty ? "● Не сохранено" : "Сохранено"}</span></div>
+        <div className="mode-switch" role="group" aria-label="Режим редактора">
+          <button type="button" aria-pressed={state.tool.mode === "model"} onClick={() => editorStore.setTool({ mode: "model" })}>Модель</button>
+          <button type="button" aria-pressed={state.tool.mode === "scene"} onClick={() => editorStore.setTool({ mode: "scene" })}>Сцена</button>
+        </div>
+        <div className="file-actions">
+          <button type="button" disabled={blocked} onClick={newProject}>Новый проект</button>
+          <button type="button" disabled={!canUndo || blocked} onClick={() => travel("undo")}>Отменить</button>
+          <button type="button" disabled={!canRedo || blocked} onClick={() => travel("redo")}>Повторить</button>
+          <button type="button" disabled={blocked} onClick={saveProject}>Сохранить проект</button>
+          <button type="button" disabled={blocked} onClick={() => fileInput.current?.click()}>Открыть проект</button>
+          <button type="button" disabled={blocked} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
+          <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
+          <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
+          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
+        </div>
+      </header>
+      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
+      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
+        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются. 3D-просмотр появится позже.</span>
+        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
+        <button type="button" onClick={() => { setPendingGlb(null); notice("info", "Импорт отменён."); }}>Отмена</button>
+      </div>}
+      <div className={`workspace-grid ${dragging ? "is-resizing" : ""}`} ref={workspace} style={{ gridTemplateColumns: `${dockWidths[0]}px ${HANDLE_WIDTH}px minmax(0, 1fr) ${HANDLE_WIDTH}px ${dockWidths[1]}px` }}>
+        <aside className="dock left-dock" aria-label="Структура проекта">
+          <div className="panel-heading"><h2>{state.view.leftTab === "structure" ? "Структура" : "Библиотека"}</h2></div>
+          <div className="dock-tabs" role="group" aria-label="Левая панель"><button type="button" aria-pressed={state.view.leftTab === "structure"} onClick={() => editorStore.setView({ leftTab: "structure" })}>Структура</button><button type="button" aria-pressed={state.view.leftTab === "assets"} onClick={() => editorStore.setView({ leftTab: "assets" })}>Библиотека</button></div>
+          {state.view.leftTab === "structure" ?
+          <div className="panel-content">
+            <p className="eyebrow">Текущий проект</p>
+            <div className="project-name">{project.name}</div>
+            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
+            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
+            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
+            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
+          </div> : <div className="panel-content"><p className="panel-hint">Библиотека ресурсов появится в следующих задачах. Импортированный GLB сохраняется в проекте.</p></div>}
+        </aside>
+        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
+        <main className="stage" aria-label="Рабочая область">
+          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ · {state.tool.mode === "model" ? "МОДЕЛЬ" : "СЦЕНА"}</span><span>Проект только в памяти вкладки</span></div>
+          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>{state.tool.mode === "model" ? "Пространство для вашей модели" : "Пространство сцены"}</h1><p>{state.tool.mode === "model" ? "3D-просмотр и редактирование модели появятся в следующих задачах." : "Размещение экземпляров и настройка окружения появятся в следующих задачах. Основная модель остаётся общей для проекта."}</p><span className="status-pill">{dirty ? "Есть несохранённые изменения" : `Проект в памяти · ревизия ${revision}`}</span></div>
+          <div className="stage-footer">3D-просмотр пока недоступен</div>
+        </main>
+        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
+        <aside className="dock right-dock" aria-label="Инспектор">
+          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
+          <div className="panel-content"><p className="eyebrow">{state.tool.mode === "scene" ? "Окружение" : "Свойства"}</p><p className="panel-hint">{state.selection.activeId ? "Редактирование свойств выбранного объекта появится в следующих задачах." : state.tool.mode === "scene" ? "Объект не выделен. Настройки окружения сцены появятся в следующих задачах." : "Объект не выделен. Инспектор свойств появится в следующих задачах."}</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
+        </aside>
+      </div>
+      <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
+      <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
+    </div>
+  );
+}
+</file>
+
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-012 — Desktop workspace and topbar
+
+- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
+- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
+- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
 
 ## TASK-011 — Undo/Redo delta history
 
