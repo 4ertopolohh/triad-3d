@@ -1,4 +1,4 @@
-import type { EntityId, Keyframe, Light, Node, Project, Track } from "./types";
+import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
