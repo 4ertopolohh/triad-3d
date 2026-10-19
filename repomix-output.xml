@@ -45,6 +45,7 @@ docs/
     webgl2.jpg
     webgpu.jpg
   architecture.md
+  csg-feasibility.md
   data-contracts.md
   implementation-plan.md
   implementation-status.md
@@ -66,6 +67,12 @@ src/
     types.ts
     validate-project.ts
   spikes/
+    csg/
+      client.ts
+      core.ts
+      csg.worker.ts
+      CsgSpike.tsx
+      protocol.ts
     renderer/
       assets/
         studio_small_03_1k.hdr
@@ -80,6 +87,10 @@ src/
   main.tsx
   vite-env.d.ts
 tests/
+  csg/
+    benchmark.test.ts
+    client.test.ts
+    csg.test.ts
   domain/
     project.test.ts
   fixtures/
@@ -196,6 +207,46 @@ Why: Высокое качество preview и экспорт для обычн
 Decision: Draft/Quality/Final для редактора, Max/Balanced/Lite для экспорта.
 Consequences: Визуальная эквивалентность не обещается для всех эффектов.
 Alternatives: Единый quality toggle для всего.
+</file>
+
+<file path="docs/csg-feasibility.md">
+# TASK-003 — пригодность Manifold WASM для CSG
+
+## Проверенная конфигурация
+
+- Локальный Windows, Node/Vitest 5, TypeScript 5.9, Vite 8.3.4, Three 0.186.1, `manifold-3d` 3.5.4 (Apache-2.0). Пакет содержит `manifold.wasm`, JS и типы TS. Версия закреплена в lockfile.
+- Изолированный код: `src/spikes/csg/`. Dev-маршрут: `/?spike=csg`. Доменный документ и renderer spike не изменены.
+- Использованы документированные `Mesh`, `Mesh.merge()`, `Manifold`, `getMesh()`, `status()` и `delete()`. [API Manifold](https://github.com/elalish/manifold/blob/master/bindings/wasm/documents/bindings.md), [пример Three](https://github.com/elalish/manifold/blob/master/bindings/wasm/examples/three/three.ts).
+
+## Подтверждённые результаты
+
+- Subtract: тор и отдельный цилиндрический cutter, расположенный в теле тора поперёк трубки; исходное центральное отверстие не используется как свидетельство вычитания. Union и intersect: две пересекающиеся сферы. Все три операции вернули непустую сетку и `NoError` в Vitest.
+- Конвертер принимает indexed и non-indexed `BufferGeometry`, проверяет индексы, конечность координат и невырожденность треугольников. `Mesh.merge()` восстанавливает связь совпадающих позиций на швах, не меняя исходные буферы. Открытая сетка даёт структурированную ошибку `GEOMETRY_NON_MANIFOLD`; NaN и вырожденный треугольник отклоняются до WASM. Пересечение непересекающихся тел возвращает пустой результат со статусом `NoError`.
+- На выходе выполняется повторная проверка чисел, индексов и площади каждого треугольника. Сетка отображается через Three. Встроенный браузер фактически выполнил subtract в Worker (`NoError`, 4224 входных и 4232 выходных треугольника, 21.0 мс CSG) и отобразил результат. Узкий viewport ограничил визуальную оценку поверхности.
+- Клиент отменяет синхронную WASM-операцию через `Worker.terminate()`, отвергает текущий Promise с `JOB_CANCELLED` и создаёт новый Worker для следующего задания. Тест с управляемым Worker подтвердил отсутствие принятия позднего ответа и восстановление после отмены. В браузере на высокой детализации получен `JOB_CANCELLED`, затем повторное задание завершилось (`NoError`, 16640 → 16512 треугольников, 110.3 мс CSG). Точный момент отмены относительно входа в синхронный WASM-вызов инструментально не измерен.
+
+## Атрибуты и ограничения
+
+- Прототип передаёт в Manifold только XYZ. UV исходной развёртки **не сохраняются**; на новых cut-поверхностях UV также отсутствуют. Выходные нормали пересчитываются `computeVertexNormals()`; это пригодно для просмотра, но не гарантирует сохранение исходных жёстких граней и пользовательских нормалей. Заглушки UV не создаются.
+- `Mesh.merge()` — best effort; совпадение пространственных координат само по себе не доказывает корректную топологию. Входная ориентация треугольников должна быть согласованной: произвольное исправление winding не выполняется. Проверка закрытости поручена Manifold.
+- Каждый созданный объект Manifold удаляется в `finally`. Отмена уничтожает весь Worker и его WASM heap. Прямое измерение peak WASM/браузерной памяти не выполнено; производственный лимит памяти не установлен.
+- Отсутствует preservation материалов, UV, исходных нормалей и provenance по граням. Для TASK-020 нужны семантика атрибутов и материалов, протокол результата/ошибок и реальные браузерные cancel tests. TASK-021 потребует стабильной идентификации входов, порядка модификаторов и invalidation; данный spike этого не реализует.
+
+## Измерения
+
+Один прогон `npx vitest run tests/csg/benchmark.test.ts --reporter=verbose --silent=false` на этом Windows-хосте. Время `computeMs` включает вызов CSG и `status()`, но не конвертацию и валидацию. Это наблюдения, не гарантии.
+
+| Детализация | Входных треугольников | Выходных | CSG, мс | Статус |
+| --- | ---: | ---: | ---: | --- |
+| low | 1088 | 1104 | 15.6 | NoError |
+| medium | 4224 | 4232 | 12.4 | NoError |
+| high | 16640 | 16512 | 75.2 | NoError |
+
+Инициализация WASM отдельно: 17.7 мс. Разброс low/medium показывает влияние однократного прогрева и среды; нужны повторы для статистики. Потребление памяти не измерено.
+
+## Решение по ADR-003
+
+Manifold 3.5.4 пригоден как основа будущего CSG Worker для закрытых тел: реальные операции и базовая геометрическая валидация прошли, Vite dev-маршрут запущен. **ADR-003 остаётся PROPOSED** до проверки UV/материалов, отмены во время тяжёлого вычисления, устойчивости на сложных импортированных сетках и памяти. Блокирующей ошибки в проверенных простых телах нет; для production-интеграции эти риски существенны.
 </file>
 
 <file path="docs/data-contracts.md">
@@ -3469,6 +3520,247 @@ export interface Keyframe {
 }
 </file>
 
+<file path="src/spikes/csg/client.ts">
+import type { MeshData, Operation } from "./core";
+import type { Request, Response } from "./protocol";
+
+export class CsgClient {
+  private worker: Worker | undefined;
+  private sequence = 0;
+  private rejectPending: ((error: Error) => void) | undefined;
+
+  run(operation: Operation, first: MeshData, second: MeshData): Promise<Response & { ok: true }> {
+    this.cancel();
+    const id = ++this.sequence;
+    const worker = new Worker(new URL("./csg.worker.ts", import.meta.url), { type: "module" });
+    this.worker = worker;
+    return new Promise((resolve, reject) => {
+      this.rejectPending = reject;
+      worker.onmessage = (event: MessageEvent<Response>) => {
+        if (this.worker !== worker || event.data.id !== id) return;
+        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
+        if (event.data.ok) resolve(event.data);
+        else reject(new Error(`${event.data.code}: ${event.data.message}`));
+      };
+      worker.onerror = (event) => {
+        if (this.worker !== worker) return;
+        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
+        reject(new Error(event.message));
+      };
+      const request: Request = { id, operation, first, second };
+      worker.postMessage(request); // structured clone preserves caller-owned buffers
+    });
+  }
+
+  cancel() {
+    ++this.sequence;
+    this.worker?.terminate();
+    this.worker = undefined;
+    this.rejectPending?.(new Error("JOB_CANCELLED: Вычисление отменено"));
+    this.rejectPending = undefined;
+  }
+
+  dispose() { this.cancel(); }
+}
+</file>
+
+<file path="src/spikes/csg/core.ts">
+import Module, { type ManifoldToplevel } from "manifold-3d";
+import { BufferAttribute, BufferGeometry, CylinderGeometry, SphereGeometry, TorusGeometry } from "three";
+
+export type Operation = "subtract" | "union" | "intersect";
+export type Detail = "low" | "medium" | "high";
+export type MeshData = { positions: Float32Array; indices: Uint32Array };
+export type CsgErrorCode = "GEOMETRY_NON_MANIFOLD" | "GEOMETRY_DEGENERATE" | "FILE_INVALID" | "JOB_CANCELLED";
+export class CsgError extends Error {
+  constructor(public readonly code: CsgErrorCode, message: string) { super(message); }
+}
+
+let initialized: Promise<ManifoldToplevel> | undefined;
+export function manifoldModule() {
+  return initialized ??= Module().then((api) => { api.setup(); return api; });
+}
+
+export function fromThree(geometry: BufferGeometry): MeshData {
+  const position = geometry.getAttribute("position");
+  if (!position || position.itemSize !== 3) throw new CsgError("FILE_INVALID", "Ожидается атрибут position из трёх координат");
+  const positions = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    positions[i * 3] = position.getX(i);
+    positions[i * 3 + 1] = position.getY(i);
+    positions[i * 3 + 2] = position.getZ(i);
+  }
+  const sourceIndex = geometry.getIndex();
+  const indices = sourceIndex ? Uint32Array.from(sourceIndex.array) : Uint32Array.from({ length: position.count }, (_, i) => i);
+  const data = { positions, indices };
+  validateMesh(data);
+  return data;
+}
+
+export function toThree(data: MeshData): BufferGeometry {
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(data.positions.slice(), 3));
+  geometry.setIndex(new BufferAttribute(data.indices.slice(), 1));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+export function validateMesh(data: MeshData, allowEmpty = false): void {
+  const { positions, indices } = data;
+  if (positions.length % 3 || indices.length % 3 || (!allowEmpty && !indices.length)) throw new CsgError("FILE_INVALID", "Некорректная длина буфера сетки");
+  if (positions.some((v) => !Number.isFinite(v))) throw new CsgError("FILE_INVALID", "Координаты содержат NaN или Infinity");
+  for (let i = 0; i < indices.length; i += 3) {
+    const a = indices[i]!, b = indices[i + 1]!, c = indices[i + 2]!;
+    if (a >= positions.length / 3 || b >= positions.length / 3 || c >= positions.length / 3) throw new CsgError("FILE_INVALID", "Индекс вне диапазона");
+    const ax = positions[3 * b]! - positions[3 * a]!, ay = positions[3 * b + 1]! - positions[3 * a + 1]!, az = positions[3 * b + 2]! - positions[3 * a + 2]!;
+    const bx = positions[3 * c]! - positions[3 * a]!, by = positions[3 * c + 1]! - positions[3 * a + 1]!, bz = positions[3 * c + 2]! - positions[3 * a + 2]!;
+    const x = ay * bz - az * by, y = az * bx - ax * bz, z = ax * by - ay * bx;
+    if (x * x + y * y + z * z < 1e-20) throw new CsgError("GEOMETRY_DEGENERATE", `Вырожденный треугольник ${i / 3}`);
+  }
+}
+
+export function makeInputs(operation: Operation, detail: Detail): [MeshData, MeshData] {
+  const segments = { low: 16, medium: 32, high: 64 }[detail];
+  const first = operation === "subtract"
+    ? new TorusGeometry(1.4, 0.48, segments, segments * 2)
+    : new SphereGeometry(1, segments * 2, segments);
+  const second = operation === "subtract"
+    ? new CylinderGeometry(0.27, 0.27, 1.5, segments, 1, false)
+    : new SphereGeometry(1, segments * 2, segments);
+  second.translate(operation === "subtract" ? 1.4 : 0.65, 0, 0);
+  if (operation === "subtract") second.rotateX(Math.PI / 2);
+  try { return [fromThree(first), fromThree(second)]; }
+  finally { first.dispose(); second.dispose(); }
+}
+
+export async function compute(operation: Operation, first: MeshData, second: MeshData) {
+  validateMesh(first); validateMesh(second);
+  const api = await manifoldModule();
+  const owned: InstanceType<typeof api.Manifold>[] = [];
+  try {
+    const importMesh = (data: MeshData) => {
+      const mesh = new api.Mesh({ numProp: 3, vertProperties: data.positions.slice(), triVerts: data.indices.slice() });
+      mesh.merge(); // Weld only coincident open-edge positions; no source attributes are altered.
+      const solid = new api.Manifold(mesh);
+      owned.push(solid);
+      if (solid.status() !== "NoError" || solid.isEmpty()) throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold input: ${solid.status()}`);
+      return solid;
+    };
+    const a = importMesh(first), b = importMesh(second);
+    const start = performance.now();
+    const result = operation === "subtract" ? a.subtract(b) : operation === "union" ? a.add(b) : a.intersect(b);
+    owned.push(result);
+    const status = result.status();
+    const computeMs = performance.now() - start;
+    if (status !== "NoError") throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold output: ${status}`);
+    const mesh = result.getMesh();
+    const output = { positions: new Float32Array(mesh.vertProperties), indices: new Uint32Array(mesh.triVerts) };
+    validateMesh(output, result.isEmpty());
+    return { output, status, computeMs, empty: result.isEmpty(), inputTriangles: (first.indices.length + second.indices.length) / 3, outputTriangles: output.indices.length / 3 };
+  } catch (error) {
+    if (error instanceof CsgError) throw error;
+    throw new CsgError("GEOMETRY_NON_MANIFOLD", error instanceof Error ? error.message : String(error));
+  } finally { for (const item of owned.reverse()) item.delete(); }
+}
+</file>
+
+<file path="src/spikes/csg/csg.worker.ts">
+import { compute, CsgError } from "./core";
+import type { Request, Response } from "./protocol";
+
+self.onmessage = async (event: MessageEvent<Request>) => {
+  const { id, operation, first, second } = event.data;
+  try {
+    const result = await compute(operation, first, second);
+    const response: Response = { id, ok: true, result };
+    self.postMessage(response, { transfer: [result.output.positions.buffer, result.output.indices.buffer] });
+  } catch (error) {
+    const response: Response = { id, ok: false, code: error instanceof CsgError ? error.code : "FILE_INVALID", message: error instanceof Error ? error.message : String(error) };
+    self.postMessage(response);
+  }
+};
+</file>
+
+<file path="src/spikes/csg/CsgSpike.tsx">
+import { useEffect, useRef, useState } from "react";
+import { AmbientLight, Color, DirectionalLight, DoubleSide, Mesh, MeshStandardMaterial, PerspectiveCamera, Scene, WebGLRenderer } from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { CsgClient } from "./client";
+import { makeInputs, toThree, type Detail, type MeshData, type Operation } from "./core";
+
+export default function CsgSpike() {
+  const mount = useRef<HTMLDivElement>(null);
+  const client = useRef(new CsgClient());
+  const [operation, setOperation] = useState<Operation>("subtract");
+  const [detail, setDetail] = useState<Detail>("medium");
+  const [view, setView] = useState<"input" | "result">("result");
+  const [data, setData] = useState<{ inputs: [MeshData, MeshData]; output: MeshData; metrics: string }>();
+  const [status, setStatus] = useState("Готово к запуску");
+
+  useEffect(() => () => client.current.dispose(), []);
+  useEffect(() => {
+    const host = mount.current;
+    if (!host) return;
+    const renderer = new WebGLRenderer({ antialias: true });
+    renderer.setSize(host.clientWidth, 480);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    host.appendChild(renderer.domElement);
+    const scene = new Scene(); scene.background = new Color("#141a24");
+    const camera = new PerspectiveCamera(45, host.clientWidth / 480, 0.1, 100);
+    camera.position.set(3.5, 3, 5);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    scene.add(new AmbientLight("white", 1.8));
+    const light = new DirectionalLight("white", 3); light.position.set(3, 4, 6); scene.add(light);
+    const meshes: Mesh[] = [];
+    const add = (meshData: MeshData, color: string, opacity = 1) => {
+      const mesh = new Mesh(toThree(meshData), new MeshStandardMaterial({ color, metalness: 0.25, roughness: 0.35, transparent: opacity < 1, opacity, side: DoubleSide }));
+      scene.add(mesh); meshes.push(mesh);
+    };
+    if (data) {
+      if (view === "result") add(data.output, "#65d8e5");
+      else { add(data.inputs[0], "#73a7fa", 0.68); add(data.inputs[1], "#f5a75c", 0.68); }
+    }
+    let frame = 0;
+    const animate = () => { frame = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); };
+    animate();
+    return () => { cancelAnimationFrame(frame); controls.dispose(); for (const mesh of meshes) { mesh.geometry.dispose(); (mesh.material as MeshStandardMaterial).dispose(); } renderer.dispose(); renderer.domElement.remove(); };
+  }, [data, view]);
+
+  async function run() {
+    const inputs = makeInputs(operation, detail);
+    setStatus("Вычисление…");
+    try {
+      const response = await client.current.run(operation, ...inputs);
+      const result = response.result;
+      setData({ inputs, output: result.output, metrics: `Вход: ${result.inputTriangles} треугольников · Выход: ${result.outputTriangles} · CSG: ${result.computeMs.toFixed(1)} мс · ${result.status}` });
+      setStatus(result.empty ? "Пустое пересечение" : "Готово");
+    } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); }
+  }
+
+  return <main style={{ padding: 24, color: "#e8eef6", background: "#141a24", minHeight: "100vh", fontFamily: "sans-serif" }}>
+    <h1>CSG · TASK-003</h1>
+    <p>Эксперимент Manifold WASM. Вращайте камеру мышью.</p>
+    <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+      <select aria-label="Операция" value={operation} onChange={(event) => setOperation(event.target.value as Operation)}><option value="subtract">Вычитание</option><option value="union">Объединение</option><option value="intersect">Пересечение</option></select>
+      <select aria-label="Детализация" value={detail} onChange={(event) => setDetail(event.target.value as Detail)}><option value="low">Низкая</option><option value="medium">Средняя</option><option value="high">Высокая</option></select>
+      <button onClick={run}>Запустить</button><button onClick={() => { client.current.cancel(); setStatus("JOB_CANCELLED: Вычисление отменено"); }}>Отменить</button>
+      <button onClick={() => setView(view === "input" ? "result" : "input")}>Показать {view === "input" ? "результат" : "исходные тела"}</button>
+    </div>
+    <div ref={mount} style={{ width: "100%", maxWidth: 1000, height: 480 }} />
+    <p>{status}</p><p>{data?.metrics}</p>
+  </main>;
+}
+</file>
+
+<file path="src/spikes/csg/protocol.ts">
+import type { MeshData, Operation } from "./core";
+export type Request = { id: number; operation: Operation; first: MeshData; second: MeshData };
+export type Response =
+  | { id: number; ok: true; result: Awaited<ReturnType<typeof import("./core").compute>> }
+  | { id: number; ok: false; code: string; message: string };
+</file>
+
 <file path="src/spikes/renderer/reference-scene.ts">
 import * as THREE from "three/webgpu";
 
@@ -3930,6 +4222,115 @@ createRoot(document.getElementById("root")!).render(
 
 <file path="src/vite-env.d.ts">
 /// <reference types="vite/client" />
+</file>
+
+<file path="tests/csg/benchmark.test.ts">
+import { it } from "vitest";
+import { compute, makeInputs, manifoldModule } from "../../src/spikes/csg/core";
+
+it("records repeatable CSG measurements", async () => {
+  const initStart = performance.now();
+  await manifoldModule();
+  console.log(`WASM init: ${(performance.now() - initStart).toFixed(1)} ms`);
+  for (const detail of ["low", "medium", "high"] as const) {
+    const [a, b] = makeInputs("subtract", detail);
+    const result = await compute("subtract", a, b);
+    console.log(`${detail}: in=${result.inputTriangles} out=${result.outputTriangles} csg=${result.computeMs.toFixed(1)}ms status=${result.status}`);
+  }
+});
+</file>
+
+<file path="tests/csg/client.test.ts">
+import { afterEach, expect, it, vi } from "vitest";
+import { CsgClient } from "../../src/spikes/csg/client";
+import { makeInputs } from "../../src/spikes/csg/core";
+import type { Response } from "../../src/spikes/csg/protocol";
+
+class FakeWorker {
+  static all: FakeWorker[] = [];
+  onmessage: ((event: MessageEvent<Response>) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  terminated = false;
+  requestId = 0;
+  constructor() { FakeWorker.all.push(this); }
+  postMessage(request: { id: number }) { this.requestId = request.id; }
+  terminate() { this.terminated = true; }
+  respond() { this.onmessage?.({ data: { id: this.requestId, ok: true, result: { output: { positions: new Float32Array(), indices: new Uint32Array() }, status: "NoError", computeMs: 0, empty: true, inputTriangles: 0, outputTriangles: 0 } } } as MessageEvent<Response>); }
+}
+
+afterEach(() => { vi.unstubAllGlobals(); FakeWorker.all = []; });
+
+it("cancels the active worker, ignores late results and runs again", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const client = new CsgClient();
+  const [a, b] = makeInputs("union", "low");
+  const snapshot = a.positions.slice();
+  const pending = client.run("union", a, b);
+  const old = FakeWorker.all[0]!;
+  client.cancel();
+  await expect(pending).rejects.toThrow("JOB_CANCELLED");
+  expect(old.terminated).toBe(true);
+  const next = client.run("union", a, b);
+  old.respond();
+  const current = FakeWorker.all[1]!;
+  current.respond();
+  await expect(next).resolves.toMatchObject({ ok: true });
+  expect(a.positions).toEqual(snapshot);
+  client.dispose();
+});
+</file>
+
+<file path="tests/csg/csg.test.ts">
+import { describe, expect, it } from "vitest";
+import { BufferGeometry, Float32BufferAttribute, TorusGeometry } from "three";
+import { compute, CsgError, fromThree, makeInputs, manifoldModule, validateMesh } from "../../src/spikes/csg/core";
+
+describe("Manifold CSG spike", () => {
+  it("initializes WASM and performs all operations without mutating inputs", async () => {
+    const api = await manifoldModule();
+    expect(api.Manifold).toBeDefined();
+    for (const operation of ["subtract", "union", "intersect"] as const) {
+      const [a, b] = makeInputs(operation, "low");
+      const aCopy = a.positions.slice(), bCopy = b.positions.slice();
+      const result = await compute(operation, a, b);
+      expect(result.status).toBe("NoError");
+      expect(result.outputTriangles).toBeGreaterThan(0);
+      validateMesh(result.output);
+      expect(a.positions).toEqual(aCopy);
+      expect(b.positions).toEqual(bCopy);
+      if (operation === "subtract") expect(result.outputTriangles).toBeGreaterThan(a.indices.length / 3);
+    }
+  });
+
+  it("handles indexed and non-indexed seam vertices", async () => {
+    const indexed = new TorusGeometry(1, 0.3, 12, 24);
+    const flat = indexed.toNonIndexed();
+    expect(fromThree(indexed).indices.length).toBe(fromThree(flat).indices.length);
+    indexed.dispose(); flat.dispose();
+  });
+
+  it("rejects invalid coordinates, degenerate triangles and open surfaces", async () => {
+    const [a, b] = makeInputs("union", "low");
+    const invalid = { positions: a.positions.slice(), indices: a.indices.slice() };
+    invalid.positions[0] = Number.NaN;
+    expect(() => validateMesh(invalid)).toThrow(CsgError);
+    const degenerate = { positions: a.positions.slice(), indices: a.indices.slice() };
+    degenerate.indices[1] = degenerate.indices[0]!;
+    expect(() => validateMesh(degenerate)).toThrow(CsgError);
+    await expect(compute("subtract", a, degenerate)).rejects.toMatchObject({ code: "GEOMETRY_DEGENERATE" });
+    const open = new BufferGeometry();
+    open.setAttribute("position", new Float32BufferAttribute([0, 0, 0, 1, 0, 0, 0, 1, 0], 3));
+    await expect(compute("union", fromThree(open), b)).rejects.toMatchObject({ code: "GEOMETRY_NON_MANIFOLD" });
+  });
+
+  it("returns an explicit empty intersection for separated solids", async () => {
+    const [a, b] = makeInputs("intersect", "low");
+    for (let i = 0; i < b.positions.length; i += 3) b.positions[i]! += 100;
+    const result = await compute("intersect", a, b);
+    expect(result.empty).toBe(true);
+    expect(result.outputTriangles).toBe(0);
+  });
+});
 </file>
 
 <file path="tests/domain/project.test.ts">
@@ -4425,25 +4826,6 @@ export default defineConfig({
 });
 </file>
 
-<file path="docs/implementation-status.md">
-# Implementation status
-
-## TASK-002 — Renderer/PBR spike
-
-- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
-- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
-- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
-
-## TASK-006 — React/Vite foundation
-
-- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
-- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
-- The document remains in memory only. No browser storage or backend is used.
-- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
-- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
-- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
-</file>
-
 <file path="src/domain/validate-project.ts">
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 
@@ -4646,6 +5028,50 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
+<file path="docs/implementation-status.md">
+# Implementation status
+
+## TASK-003 — CSG/Manifold WASM spike
+
+- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
+- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
+
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
+## TASK-006 — React/Vite foundation
+
+- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
+- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
+- The document remains in memory only. No browser storage or backend is used.
+- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
+- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
+- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+</file>
+
 <file path="src/ui/App.tsx">
 import { createProject, validateProject } from "../domain";
 import { lazy, Suspense } from "react";
@@ -4653,11 +5079,17 @@ import { lazy, Suspense } from "react";
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
   : null;
+const CsgSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/csg/CsgSpike"))
+  : null;
 
 const project = createProject();
 const issues = validateProject(project);
 
 export function App() {
+  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
+    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
+  }
   if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
     return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
   }
@@ -4694,26 +5126,6 @@ export function App() {
 }
 </file>
 
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "lib": ["ES2022", "DOM"]
-  },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
-}
-</file>
-
 <file path="package.json">
 {
   "name": "triad-3d",
@@ -4742,6 +5154,7 @@ export function App() {
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "manifold-3d": "^3.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "three": "0.186.1"

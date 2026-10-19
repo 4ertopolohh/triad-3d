@@ -33,6 +33,8 @@ export function createNestedMeshProject(): Project {
     name: "Куб",
     parentId: groupId,
     children: [],
+    materialSlots: [],
+    modifierIds: [],
     meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
   };
   project.nodes.push(group, mesh);

@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "export:check": "node scripts/check-export-harness.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
