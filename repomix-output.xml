@@ -74,6 +74,7 @@ scripts/
   check-export-harness.mjs
 src/
   domain/
+    command-bus.ts
     create-project.ts
     index.ts
     types.ts
@@ -106,6 +107,7 @@ tests/
     client.test.ts
     csg.test.ts
   domain/
+    commands.test.ts
     project.test.ts
   export/
     generate-tsx.test.ts
@@ -3411,6 +3413,249 @@ await stat(join(isolated, "dist", "index.html"));
 console.log(`Independent harness PASS: ${isolated}`);
 </file>
 
+<file path="src/domain/command-bus.ts">
+import type { EntityId, Node, Project, Transform } from "./types";
+import { validateProject, type ValidationIssue } from "./validate-project";
+
+export type ProjectCommand =
+  | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
+  | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
+  | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
+  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
+
+export const CommandErrorCode = {
+  REVISION_CONFLICT: "REVISION_CONFLICT",
+  INVALID_COMMAND: "INVALID_COMMAND",
+  INVALID_REFERENCE: "INVALID_REFERENCE",
+  NODE_LOCKED: "NODE_LOCKED",
+  NODE_HIDDEN: "NODE_HIDDEN",
+  VALIDATION_FAILED: "VALIDATION_FAILED",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+} as const;
+export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
+
+export type PatchChange =
+  | { kind: "addNode"; node: Node }
+  | { kind: "removeNode"; node: Node }
+  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "modelRevision"; before: number; after: number };
+export interface ProjectPatch { changes: PatchChange[] }
+
+export type CommandResult =
+  | { ok: true; id: string; project: Project; revision: number; patch: ProjectPatch; undoPatch: ProjectPatch; changed: boolean }
+  | { ok: false; id: string; code: CommandErrorCode; message: string; issues?: ValidationIssue[] };
+
+export interface CommandBus {
+  /** Session revision starts at 0, regardless of the serialized model revision. */
+  getRevision(): number;
+  getSnapshot(): Project;
+  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+}
+
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+const idList = (value: unknown): value is string[] => Array.isArray(value) && value.every(id);
+const numbers = (value: unknown, count: number): value is number[] =>
+  Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
+const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key));
+
+function validTransform(value: unknown): value is Transform {
+  return record(value) && ownKeys(value, ["position", "rotationQuat", "scale"])
+    && numbers(value.position, 3) && numbers(value.rotationQuat, 4) && numbers(value.scale, 3);
+}
+
+function validNode(value: unknown): value is Node {
+  if (!record(value) || !id(value.id) || !["group", "mesh"].includes(String(value.kind))) return false;
+  const keys = ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"];
+  if (!ownKeys(value, value.kind === "mesh" ? [...keys, "meshSource"] : keys)) return false;
+  if (typeof value.name !== "string" || !value.name.trim() || !id(value.parentId) || !idList(value.children)
+    || !validTransform(value.transform) || typeof value.visible !== "boolean" || typeof value.locked !== "boolean"
+    || !Array.isArray(value.materialSlots) || !value.materialSlots.every((slot: unknown) =>
+      record(slot) && ownKeys(slot, ["name", "materialId"]) && typeof slot.name === "string" && id(slot.materialId))
+    || !idList(value.modifierIds)) return false;
+  if (value.kind === "group") return true;
+  const source = value.meshSource;
+  if (!record(source)) return false;
+  if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
+  return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
+    && ["cube", "sphere", "torus", "cylinder", "cone", "plane"].includes(String(source.primitive))
+    && record(source.parameters) && Object.values(source.parameters).every((item) => typeof item === "number" && Number.isFinite(item));
+}
+
+function validCommand(value: unknown): value is ProjectCommand {
+  if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
+  const payload = value.payload;
+  if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+    && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
+    && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
+  if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
+    || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  switch (value.type) {
+    case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
+    case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
+    case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
+      && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
+      && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
+      && (!Object.hasOwn(payload, "locked") || typeof payload.locked === "boolean");
+    default: return false;
+  }
+}
+
+function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
+  return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
+}
+
+function blocked(project: Project, node: Node, flags = false): CommandErrorCode | null {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current.locked && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_LOCKED;
+    if (!current.visible && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_HIDDEN;
+    current = current.parentId === null ? undefined : project.nodes.find((entry) => entry.id === current?.parentId);
+  }
+  return null;
+}
+
+function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_NODE") {
+    const { parentId, node } = command.payload;
+    const parent = project.nodes.find((entry) => entry.id === parentId);
+    if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
+    const block = blocked(project, parent);
+    if (block) return failure(command.commandId, block, "Родительский узел недоступен для редактирования.");
+    if (node.parentId !== parentId || node.children.length !== 0 || node.modifierIds.length !== 0)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Добавляемый узел должен быть согласованным листом без модификаторов.");
+    if (project.nodes.some((entry) => entry.id === node.id) || entityIds(project).has(node.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
+    project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
+    project.nodes.push(structuredClone(node));
+    return null;
+  }
+  const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
+  if (!current) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Целевой узел не найден.");
+  const block = blocked(project, current, command.type === "SET_NODE_FLAGS");
+  if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
+  if (command.type === "SET_NODE_FLAGS") {
+    if (current.locked && command.payload.locked !== false)
+      return failure(command.commandId, CommandErrorCode.NODE_LOCKED, "Для изменения узла сначала снимите его блокировку.");
+    if (!current.visible && command.payload.visible !== true)
+      return failure(command.commandId, CommandErrorCode.NODE_HIDDEN, "Для изменения узла сначала восстановите его видимость.");
+  }
+  let next: Node;
+  switch (command.type) {
+    case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
+    case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
+    case "SET_NODE_FLAGS": next = { ...current,
+      visible: command.payload.visible ?? current.visible,
+      locked: command.payload.locked ?? current.locked }; break;
+  }
+  project.nodes = project.nodes.map((entry) => entry.id === current.id ? next : entry);
+  return null;
+}
+
+function entityIds(project: Project): Set<string> {
+  return new Set([project.id, project.model.id, project.scene.id,
+    ...project.nodes.map((item) => item.id), ...project.modifiers.map((item) => item.id),
+    ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
+    ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
+    ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
+    ...project.keyframes.map((item) => item.id)]);
+}
+
+function diff(before: Project, after: Project): ProjectPatch {
+  const changes: PatchChange[] = [];
+  for (const node of after.nodes) {
+    const old = before.nodes.find((entry) => entry.id === node.id);
+    if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
+    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
+      if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
+        before: structuredClone(old[field]), after: structuredClone(node[field]) });
+    }
+  }
+  if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
+  return { changes };
+}
+
+function inverse(patch: ProjectPatch): ProjectPatch {
+  return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
+    if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
+    if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+  }) };
+}
+
+/** Replays a patch against a matching semantic base; throws on stale or invalid input. */
+export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
+  const result = structuredClone(project);
+  for (const change of patch.changes) {
+    if (change.kind === "addNode") {
+      if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
+      result.nodes.push(structuredClone(change.node));
+    } else if (change.kind === "removeNode") {
+      const index = result.nodes.findIndex((node) => node.id === change.node.id);
+      if (index < 0 || !same(result.nodes[index], change.node)) throw new Error("Patch node conflict");
+      result.nodes.splice(index, 1);
+    } else if (change.kind === "modelRevision") {
+      if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
+      result.model.revision = change.after;
+    } else {
+      const node = result.nodes.find((entry) => entry.id === change.nodeId);
+      if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
+      Object.assign(node, { [change.field]: structuredClone(change.after) });
+    }
+  }
+  if (validateProject(result).length) throw new Error("Patch produces invalid project");
+  return result;
+}
+
+export function createCommandBus(initialProject: Project): CommandBus {
+  const initial = structuredClone(initialProject);
+  const issues = validateProject(initial);
+  if (issues.length) throw new Error(`Invalid initial project: ${issues[0]?.message}`);
+  let committed = initial;
+  let revision = 0;
+  const executeTransaction = (commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult => {
+    const resultId = transactionId ?? (Array.isArray(commands) && commands.length === 1 && id(commands[0]?.commandId)
+      ? commands[0].commandId : "transaction");
+    if (expectedRevision !== revision) return failure(resultId, CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+    if (!Array.isArray(commands) || commands.length === 0 || !commands.every(validCommand)
+      || new Set(commands.map((command) => command.commandId)).size !== commands.length)
+      return failure(resultId, CommandErrorCode.INVALID_COMMAND, "Некорректная команда или транзакция.");
+    try {
+      const candidate = structuredClone(committed);
+      for (const command of commands) {
+        const error = applyCommand(candidate, command);
+        if (error) return error;
+      }
+      const contentPatch = diff(committed, candidate);
+      if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
+      candidate.model.revision += 1;
+      const validationIssues = validateProject(candidate);
+      if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
+      const patch = diff(committed, candidate);
+      const undoPatch = inverse(patch);
+      committed = candidate;
+      revision += 1;
+      return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: structuredClone(patch), undoPatch: structuredClone(undoPatch), changed: true };
+    } catch {
+      return failure(resultId, CommandErrorCode.INTERNAL_ERROR, "Не удалось выполнить транзакцию.");
+    }
+  };
+  return {
+    getRevision: () => revision,
+    getSnapshot: () => structuredClone(committed),
+    executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
+    executeTransaction,
+  };
+}
+</file>
+
 <file path="src/domain/create-project.ts">
 import type { EntityId, Project } from "./types";
 
@@ -3469,14 +3714,6 @@ export function createProject(idFactory: IdFactory = () => crypto.randomUUID()):
     keyframes: [],
   };
 }
-</file>
-
-<file path="src/domain/index.ts">
-export { createProject } from "./create-project";
-export type { IdFactory } from "./create-project";
-export { validateProject } from "./validate-project";
-export type { ValidationCode, ValidationIssue } from "./validate-project";
-export type * from "./types";
 </file>
 
 <file path="src/domain/types.ts">
@@ -4642,6 +4879,175 @@ describe("Manifold CSG spike", () => {
 });
 </file>
 
+<file path="tests/domain/commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { applyProjectPatch, createCommandBus } from "../../src/domain";
+import type { GroupNode, ProjectCommand } from "../../src/domain";
+import { validateProject } from "../../src/domain/validate-project";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand =>
+  ({ commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name } });
+const flags = (nodeId: string, values: { visible?: boolean; locked?: boolean }, commandId = "flags"): ProjectCommand =>
+  ({ commandId, type: "SET_NODE_FLAGS", targetIds: [nodeId], payload: { nodeId, ...values } });
+const transform = (position: readonly [number, number, number]): ProjectCommand =>
+  ({ commandId: "transform", type: "SET_NODE_TRANSFORM", targetIds: ["mesh-node"], payload: {
+    nodeId: "mesh-node", transform: { position, rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+  } });
+function add(id: string, parentId = "nested-group"): ProjectCommand {
+  const node: GroupNode = { id, kind: "group", name: "Деталь", parentId, children: [],
+    transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+    visible: true, locked: false, materialSlots: [], modifierIds: [] };
+  return { commandId: `add-${id}`, type: "ADD_NODE", targetIds: [parentId, id], payload: { parentId, node } };
+}
+
+describe("command bus", () => {
+  it("adds a leaf and keeps both hierarchy links and revisions consistent", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeCommand(add("new-leaf"), 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.changed).toBe(true);
+    expect(result.revision).toBe(1);
+    expect(result.project.model.revision).toBe(1);
+    expect(result.project.nodes.find((node) => node.id === "new-leaf")?.parentId).toBe("nested-group");
+    expect(result.project.nodes.find((node) => node.id === "nested-group")?.children).toContain("new-leaf");
+    expect(validateProject(result.project)).toEqual([]);
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+  });
+
+  it("renames and transforms only the target and accepts a multi-command transaction once", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeTransaction([rename("Новая деталь"), transform([3, 2, 1])], 0, "batch-1");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.id).toBe("batch-1");
+    expect(result.revision).toBe(1);
+    expect(result.project.model.revision).toBe(before.model.revision + 1);
+    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
+    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.transform.position).toEqual([3, 2, 1]);
+    expect(result.project.nodes.find((node) => node.id === "nested-group")).toEqual(before.nodes.find((node) => node.id === "nested-group"));
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+  });
+
+  it("changes flags partially and can unlock or reveal its own node", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
+    expect(bus.executeCommand(rename("Forbidden"), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
+    expect(bus.executeCommand(rename("Forbidden"), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+    expect(bus.executeCommand(flags("mesh-node", { visible: true }), 3).ok).toBe(true);
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "mesh-node")).toMatchObject({ visible: true, locked: false });
+  });
+
+  it("requires recovery actions when a node is locked or hidden", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+  });
+
+  it("rejects invalid references in a new leaf after final validation", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const command = add("bad-ref");
+    if (command.type === "ADD_NODE") command.payload.node.materialSlots.push({ name: "Missing", materialId: "absent" });
+    expect(bus.executeCommand(command, 0)).toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+  });
+
+  it.each([
+    ["missing target", rename("A", "absent"), "INVALID_REFERENCE"],
+    ["duplicate ID", add("mesh-node"), "INVALID_COMMAND"],
+    ["missing parent", add("new", "absent"), "INVALID_REFERENCE"],
+    ["empty name", rename("   "), "INVALID_COMMAND"],
+    ["NaN", transform([Number.NaN, 0, 0]), "INVALID_COMMAND"],
+    ["Infinity", transform([Infinity, 0, 0]), "INVALID_COMMAND"],
+    ["target mismatch", { ...rename("A"), targetIds: ["nested-group"] }, "INVALID_COMMAND"],
+    ["invalid transform shape", { ...transform([1, 2, 3]), payload: { nodeId: "mesh-node", transform: { position: [1, 2], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] } } }, "INVALID_COMMAND"],
+  ] as const)("rejects %s without mutation", (_label, command, code) => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    expect(bus.executeCommand(command as ProjectCommand, 0)).toMatchObject({ ok: false, code });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+  });
+
+  it("rejects locked and hidden ancestors, including attempts to change descendant flags", () => {
+    for (const ancestorFlag of [{ locked: true }, { visible: false }]) {
+      const bus = createCommandBus(createNestedMeshProject());
+      expect(bus.executeCommand(flags("nested-group", ancestorFlag), 0).ok).toBe(true);
+      const before = bus.getSnapshot();
+      const code = "locked" in ancestorFlag ? "NODE_LOCKED" : "NODE_HIDDEN";
+      expect(bus.executeCommand(rename("No"), 1)).toMatchObject({ ok: false, code });
+      expect(bus.executeCommand(flags("mesh-node", { locked: false, visible: true }), 1)).toMatchObject({ ok: false, code });
+      expect(bus.getSnapshot()).toEqual(before);
+      expect(bus.getRevision()).toBe(1);
+    }
+  });
+
+  it("rolls back a failing second command and allows the next valid operation", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    expect(bus.executeTransaction([add("new-leaf"), rename("No", "missing")], 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.executeCommand(rename("Да"), 0).ok).toBe(true);
+  });
+
+  it("captures the final state when a transaction adds and then edits one node", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeTransaction([add("new-leaf"), rename("Итог", "new-leaf")], 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+    expect(() => applyProjectPatch(result.project, result.patch)).toThrow();
+  });
+
+  it("rejects stale revisions and leaves semantic no-ops without a revision or patch", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const noOp = bus.executeCommand(rename("Куб"), 0);
+    expect(noOp).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
+    expect(bus.executeCommand(rename("New"), 1)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(bus.getSnapshot()).toEqual(before);
+  });
+
+  it("treats a transaction with no net document change as a no-op", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const result = bus.executeTransaction([rename("Temporary", "mesh-node", "first"), rename("Куб", "mesh-node", "second")], 0);
+    expect(result).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.getSnapshot().model.revision).toBe(0);
+  });
+
+  it("does not leak input, snapshot, command payload or result references", () => {
+    const input = createNestedMeshProject();
+    const bus = createCommandBus(input);
+    const old = bus.getSnapshot();
+    input.nodes[0]?.children.push("injected");
+    old.nodes[0]?.children.push("injected");
+    const command = add("new-leaf");
+    const result = bus.executeCommand(command, 0);
+    if (command.type === "ADD_NODE") command.payload.node.name = "Tampered";
+    if (result.ok) result.project.nodes[0]?.children.push("tampered");
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "new-leaf")?.name).toBe("Деталь");
+    expect(validateProject(bus.getSnapshot())).toEqual([]);
+    expect(old.nodes.find((node) => node.id === "new-leaf")).toBeUndefined();
+  });
+});
+</file>
+
 <file path="tests/domain/project.test.ts">
 import { describe, expect, it } from "vitest";
 import { createProject } from "../../src/domain/create-project";
@@ -5122,6 +5528,16 @@ export default defineConfig({
 });
 </file>
 
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
+export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
 <file path="src/domain/validate-project.ts">
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 
@@ -5523,6 +5939,13 @@ export function App() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-007 — Domain commands and transactions
+
+- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
+- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
+- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
+- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
 
 ## TASK-004 — TSX export harness spike
 

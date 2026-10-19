@@ -1,4 +1,6 @@
-import { createProject, validateProject } from "../domain";
+import { createProject } from "../domain";
+import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
 
 const RendererSpike = import.meta.env.DEV
@@ -8,8 +10,7 @@ const CsgSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/csg/CsgSpike"))
   : null;
 
-const project = createProject();
-const issues = validateProject(project);
+const editorStore = createEditorStore(createProject());
 
 export function App() {
   if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
@@ -18,6 +19,14 @@ export function App() {
   if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
     return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
   }
+  return <EditorShell />;
+}
+
+function EditorShell() {
+  const state = useEditorStore(editorStore);
+  const project = selectProject(state);
+  const revision = selectRevision(state);
+  const dirty = selectDirty(state);
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -36,8 +45,8 @@ export function App() {
           </div>
         </aside>
         <main className="stage" aria-label="Рабочая область">
-          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-006</span></div>
-          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{issues.length === 0 ? "Структура проекта проверена" : "Ошибка структуры проекта"}</span></div>
+          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-008</span></div>
+          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{dirty ? "Есть несохранённые изменения" : `Проект в памяти · ревизия ${revision}`}</span></div>
           <div className="stage-footer">3D-просмотр пока недоступен</div>
         </main>
         <aside className="dock right-dock" aria-label="Инспектор">
