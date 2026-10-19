@@ -76,6 +76,9 @@ src/
   app/
     editor-store.ts
     use-editor-store.ts
+  assets/
+    asset-bytes.ts
+    native-project-archive.ts
   domain/
     schemas/
       document-v1.schema.json
@@ -111,6 +114,8 @@ src/
 tests/
   app/
     editor-store.test.ts
+  assets/
+    native-project-archive.test.ts
   csg/
     benchmark.test.ts
     client.test.ts
@@ -3367,133 +3372,193 @@ await stat(join(isolated, "dist", "index.html"));
 console.log(`Independent harness PASS: ${isolated}`);
 </file>
 
-<file path="src/app/editor-store.ts">
-import { createCommandBus } from "../domain/command-bus";
-import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
-import type { EntityId, Project } from "../domain/types";
-
-export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
-  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
-
-export interface EditorState {
-  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
-  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
-  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
-  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
-  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
-  readonly history: { readonly entries: readonly HistoryEntry[] };
-  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
-}
-
-export interface HistoryEntry {
-  readonly id: string;
-  readonly revision: number;
-  readonly patch: DeepReadonly<ProjectPatch>;
-  readonly undoPatch: DeepReadonly<ProjectPatch>;
-}
-
-export interface EditorStore {
-  getSnapshot(): EditorState;
-  subscribe(listener: () => void): () => void;
-  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
-  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
-  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
-  setTool(next: Partial<EditorState["tool"]>): void;
-  setView(next: Partial<EditorState["view"]>): void;
-}
-
-function deepFreeze<T>(value: T): DeepReadonly<T> {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
-  }
-  return value as DeepReadonly<T>;
-}
-
-export function createEditorStore(initialProject: Project): EditorStore {
-  const bus = createCommandBus(initialProject);
-  const listeners = new Set<() => void>();
-  let state: EditorState = Object.freeze({
-    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
-    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
-    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
-    job: Object.freeze({ status: "idle" as const }),
-    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
-    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
-  });
-
-  function publish(next: EditorState): void {
-    state = Object.freeze(next);
-    for (const listener of [...listeners]) {
-      if (listeners.has(listener)) listener();
-    }
-  }
-
-  function commit(result: CommandResult): CommandResult {
-    if (!result.ok || !result.changed) return result;
-    const entry: HistoryEntry = Object.freeze({
-      id: result.id,
-      revision: result.revision,
-      patch: deepFreeze(structuredClone(result.patch)),
-      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
-    });
-    publish({
-      ...state,
-      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
-      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
-      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
-    });
-    return result;
-  }
-
-  return {
-    getSnapshot: () => state,
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => { listeners.delete(listener); };
-    },
-    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
-    executeTransaction: (commands, expectedRevision, transactionId) =>
-      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
-    setSelection(ids, activeId) {
-      const valid = new Set(state.document.project.nodes.map((node) => node.id));
-      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
-      const active = activeId === undefined ? (selected[0] ?? null) :
-        activeId !== null && selected.includes(activeId) ? activeId : null;
-      if (active === state.selection.activeId && selected.length === state.selection.ids.length
-        && selected.every((id, index) => id === state.selection.ids[index])) return;
-      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
-    },
-    setTool(next) {
-      const tool = { ...state.tool, ...next };
-      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
-      publish({ ...state, tool: Object.freeze(tool) });
-    },
-    setView(next) {
-      const view = { ...state.view, ...next };
-      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
-      publish({ ...state, view: Object.freeze(view) });
-    },
-  };
-}
-
-export const selectProject = (state: EditorState) => state.document.project;
-export const selectRevision = (state: EditorState) => state.document.revision;
-export const selectDirty = (state: EditorState) => state.document.dirty;
-export const selectSelectedIds = (state: EditorState) => state.selection.ids;
-export const selectActiveId = (state: EditorState) => state.selection.activeId;
-export const selectTool = (state: EditorState) => state.tool;
-export const selectJob = (state: EditorState) => state.job;
-export const selectDerived = (state: EditorState) => state.derived;
-</file>
-
 <file path="src/app/use-editor-store.ts">
 import { useSyncExternalStore } from "react";
 import type { EditorState, EditorStore } from "./editor-store";
 
 export function useEditorStore(store: EditorStore): EditorState {
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+}
+</file>
+
+<file path="src/assets/asset-bytes.ts">
+export class AssetBytes {
+  private readonly values = new Map<string, Uint8Array>();
+
+  constructor(entries: Iterable<readonly [string, Uint8Array]> = []) {
+    for (const [id, bytes] of entries) this.set(id, bytes);
+  }
+
+  get(id: string): Uint8Array | undefined {
+    const bytes = this.values.get(id);
+    return bytes?.slice();
+  }
+
+  set(id: string, bytes: Uint8Array): void {
+    this.values.set(id, bytes.slice());
+  }
+
+  ids(): string[] { return [...this.values.keys()]; }
+  clear(): void { this.values.clear(); }
+  clone(): AssetBytes { return new AssetBytes(this.values); }
+}
+</file>
+
+<file path="src/assets/native-project-archive.ts">
+import { BlobReader, BlobWriter, TextReader, Uint8ArrayReader, ZipReader, ZipWriter } from "@zip.js/zip.js";
+import { deserializeProjectDocument, serializeProjectDocument, validateNativeManifest, NATIVE_FORMAT_VERSION } from "../domain/project-serialization";
+import type { NativeManifest } from "../domain/project-serialization";
+import type { Project } from "../domain/types";
+import { AssetBytes } from "./asset-bytes";
+
+const MiB = 1024 * 1024;
+export const ARCHIVE_LIMITS = Object.freeze({ archive: 128 * MiB, expanded: 256 * MiB, entries: 1024, asset: 64 * MiB, document: 16 * MiB, manifest: MiB });
+export type ArchiveError = { code: "FILE_INVALID" | "SCHEMA_UNSUPPORTED" | "ASSET_MISSING" | "ASSET_INTEGRITY"; message: string; path?: string };
+export type ArchiveResult<T> = { ok: true; value: T } | { ok: false; error: ArchiveError };
+export interface LoadedProject { project: Project; assets: AssetBytes }
+const fail = (code: ArchiveError["code"], message: string, path?: string): ArchiveResult<never> => ({ ok: false, error: { code, message, ...(path ? { path } : {}) } });
+const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8", { fatal: true });
+const folded = (path: string) => path.normalize("NFC").toLocaleLowerCase("en-US");
+const assetPathPattern = /^assets\/[a-f0-9]{64}\.(?:png|jpe?g|webp|hdr|exr|glb|bin)$/;
+const sha = async (bytes: Uint8Array): Promise<string> => [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource))].map((n) => n.toString(16).padStart(2, "0")).join("");
+const forbiddenPayload = (bytes: Uint8Array) =>
+  (bytes[0] === 0x50 && bytes[1] === 0x4b) || // nested ZIP
+  (bytes[0] === 0x4d && bytes[1] === 0x5a) || // Windows executable
+  (bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46); // ELF executable
+
+function safePath(path: string): boolean {
+  return path.length > 0 && path.length <= 1024 && path === path.normalize("NFC") && !/[\\:%]/.test(path)
+    && !path.startsWith("/") && !path.endsWith("/") && !Array.from(path).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)
+    && path.split("/").every((part) => part !== "" && part !== "." && part !== ".." && !/[. ]$/.test(part)
+      && !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part));
+}
+
+function checkAssets(project: Project, manifest: NativeManifest): ArchiveResult<true> {
+  if (project.assets.length !== manifest.assets.length) return fail("ASSET_INTEGRITY", "Список ресурсов документа и архива различается.");
+  const byId = new Map(manifest.assets.map((asset) => [asset.id, asset]));
+  for (const asset of project.assets) {
+    const record = byId.get(asset.id);
+    if (!record) return fail("ASSET_MISSING", `Ресурс «${asset.id}» отсутствует в manifest.`);
+    if (record.path !== asset.path || record.sha256.toLowerCase() !== asset.hash.toLowerCase()) return fail("ASSET_INTEGRITY", `Метаданные ресурса «${asset.id}» не совпадают.`, asset.path);
+    if (!safePath(asset.path) || !assetPathPattern.test(asset.path)) return fail("FILE_INVALID", "Недопустимый путь ресурса.", asset.path);
+    if (asset.path.slice(7, 71) !== asset.hash.toLowerCase()) return fail("ASSET_INTEGRITY", "Имя ресурса не соответствует хешу.", asset.path);
+  }
+  return { ok: true, value: true };
+}
+
+async function buildNativeProjectArchive(project: Project, assets: AssetBytes, appVersion: string): Promise<ArchiveResult<Blob>> {
+  const serialized = serializeProjectDocument(project);
+  if (!serialized.ok) return { ok: false, error: serialized.error };
+  const documentBytes = encoder.encode(serialized.value);
+  if (documentBytes.byteLength > ARCHIVE_LIMITS.document) return fail("FILE_INVALID", "Документ слишком велик.");
+  const records: NativeManifest["assets"] = [];
+  const contents = new Map<string, Uint8Array>();
+  let total = documentBytes.byteLength;
+  for (const asset of project.assets) {
+    const bytes = assets.get(asset.id);
+    if (!bytes) return fail("ASSET_MISSING", `Ресурс «${asset.id}» отсутствует в памяти.`, asset.path);
+    if (bytes.byteLength > ARCHIVE_LIMITS.asset) return fail("FILE_INVALID", "Ресурс слишком велик.", asset.path);
+    if (forbiddenPayload(bytes)) return fail("FILE_INVALID", "Вложенный архив или исполняемый ресурс запрещён.", asset.path);
+    const hash = await sha(bytes);
+    if (hash !== asset.hash.toLowerCase()) return fail("ASSET_INTEGRITY", `Хеш ресурса «${asset.id}» не совпадает.`, asset.path);
+    records.push({ id: asset.id, path: asset.path, sha256: hash });
+    contents.set(asset.path, bytes);
+    total += bytes.byteLength;
+    if (total > ARCHIVE_LIMITS.expanded) return fail("FILE_INVALID", "Превышен общий размер проекта.");
+  }
+  const manifest: NativeManifest = { formatVersion: NATIVE_FORMAT_VERSION, appVersion, document: { path: "document.json", sha256: await sha(documentBytes) }, assets: records };
+  const checked = validateNativeManifest(manifest);
+  if (!checked.ok) return { ok: false, error: checked.error };
+  const consistency = checkAssets(project, manifest);
+  if (!consistency.ok) return consistency;
+  const manifestText = JSON.stringify(manifest);
+  total += encoder.encode(manifestText).byteLength;
+  if (encoder.encode(manifestText).byteLength > ARCHIVE_LIMITS.manifest || total > ARCHIVE_LIMITS.expanded || contents.size + 2 > ARCHIVE_LIMITS.entries) return fail("FILE_INVALID", "Превышен лимит архива.");
+  try {
+    const writer = new ZipWriter(new BlobWriter("application/x-triad3d"));
+    await writer.add("manifest.json", new TextReader(manifestText));
+    await writer.add("document.json", new Uint8ArrayReader(documentBytes));
+    for (const [path, bytes] of contents) await writer.add(path, new Uint8ArrayReader(bytes));
+    const blob = await writer.close();
+    if (blob.size > ARCHIVE_LIMITS.archive) return fail("FILE_INVALID", "Архив слишком велик.");
+    return { ok: true, value: blob };
+  } catch { return fail("FILE_INVALID", "Не удалось создать архив проекта."); }
+}
+
+export async function createNativeProjectArchive(project: Project, assets: AssetBytes, appVersion: string): Promise<ArchiveResult<Blob>> {
+  try { return await buildNativeProjectArchive(project, assets, appVersion); }
+  catch { return fail("FILE_INVALID", "Не удалось подготовить архив проекта."); }
+}
+
+export async function openNativeProjectArchive(input: Blob | ArrayBuffer): Promise<ArchiveResult<LoadedProject>> {
+  const blob = input instanceof Blob ? input : new Blob([input]);
+  if (blob.size < 4 || blob.size > ARCHIVE_LIMITS.archive) return fail("FILE_INVALID", "Недопустимый размер архива.");
+  const signature = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+  if (signature[0] !== 0x50 || signature[1] !== 0x4b || signature[2] !== 3 || signature[3] !== 4) return fail("FILE_INVALID", "Файл не является ZIP-архивом проекта.");
+  const reader = new ZipReader(new BlobReader(blob), { strictness: "strict", checkCrc32: true, checkOverlappingEntry: true });
+  try {
+    const paths = new Map<string, Awaited<ReturnType<typeof reader.getEntries>>[number]>();
+    let declared = 0;
+    for await (const entry of reader.getEntriesGenerator()) {
+      if (paths.size >= ARCHIVE_LIMITS.entries) return fail("FILE_INVALID", "Слишком много записей ZIP.");
+      const path = entry.filename;
+      if (entry.directory || !safePath(path) || entry.encrypted || ((entry.externalFileAttributes >>> 16) & 0o170000) === 0o120000) return fail("FILE_INVALID", "Недопустимая запись ZIP.", path);
+      const key = folded(path);
+      if (paths.has(key)) return fail("FILE_INVALID", "Повторяющийся путь ZIP.", path);
+      if (path !== "manifest.json" && path !== "document.json" && !assetPathPattern.test(path)) return fail("FILE_INVALID", "Неизвестная запись ZIP.", path);
+      paths.set(key, entry);
+      const limit = path === "manifest.json" ? ARCHIVE_LIMITS.manifest : path === "document.json" ? ARCHIVE_LIMITS.document : ARCHIVE_LIMITS.asset;
+      if (entry.uncompressedSize > limit) return fail("FILE_INVALID", "Запись ZIP превышает лимит.", path);
+      declared += entry.uncompressedSize;
+      if (declared > ARCHIVE_LIMITS.expanded) return fail("FILE_INVALID", "Превышен общий размер распаковки.");
+    }
+    if (!paths.has("manifest.json") || !paths.has("document.json")) return fail("FILE_INVALID", "В архиве нет manifest.json или document.json.");
+    let actualTotal = 0;
+    async function read(path: string, limit: number): Promise<Uint8Array> {
+      const entry = paths.get(folded(path));
+      if (!entry || entry.directory) throw new Error("missing entry");
+      const chunks: Uint8Array[] = [];
+      let length = 0;
+      await entry.getData(new WritableStream<Uint8Array>({
+        write(chunk) {
+          length += chunk.byteLength;
+          actualTotal += chunk.byteLength;
+          if (length > limit || actualTotal > ARCHIVE_LIMITS.expanded) throw new Error("expanded limit");
+          chunks.push(chunk.slice());
+        },
+      }));
+      const bytes = new Uint8Array(length);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      return bytes;
+    }
+    const manifestBytes = await read("manifest.json", ARCHIVE_LIMITS.manifest);
+    let manifestValue: unknown;
+    try { manifestValue = JSON.parse(decoder.decode(manifestBytes)); } catch { return fail("FILE_INVALID", "Некорректный manifest.json."); }
+    const checked = validateNativeManifest(manifestValue);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    const manifest = checked.value;
+    const documentBytes = await read("document.json", ARCHIVE_LIMITS.document);
+    if (await sha(documentBytes) !== manifest.document.sha256.toLowerCase()) return fail("ASSET_INTEGRITY", "Хеш документа не совпадает.");
+    const document = deserializeProjectDocument(decoder.decode(documentBytes));
+    if (!document.ok) return { ok: false, error: document.error };
+    const consistency = checkAssets(document.value, manifest);
+    if (!consistency.ok) return consistency;
+    for (const asset of manifest.assets) {
+      if (paths.get(folded(asset.path))?.filename !== asset.path) return fail("ASSET_MISSING", `Ресурс «${asset.id}» отсутствует в архиве.`, asset.path);
+    }
+    if (paths.size !== manifest.assets.length + 2) return fail("FILE_INVALID", "Архив содержит необъявленные ресурсы.");
+    const assets = new AssetBytes();
+    for (const asset of manifest.assets) {
+      const bytes = await read(asset.path, ARCHIVE_LIMITS.asset);
+      if (forbiddenPayload(bytes)) return fail("FILE_INVALID", "Вложенный архив или исполняемый ресурс запрещён.", asset.path);
+      if (await sha(bytes) !== asset.sha256.toLowerCase()) return fail("ASSET_INTEGRITY", `Хеш ресурса «${asset.id}» не совпадает.`, asset.path);
+      assets.set(asset.id, bytes);
+    }
+    return { ok: true, value: { project: document.value, assets } };
+  } catch { return fail("FILE_INVALID", "Архив повреждён или превышает лимит распаковки."); }
+  finally { await reader.close(); }
 }
 </file>
 
@@ -4925,42 +4990,6 @@ export default function RendererSpike() {
 }
 </file>
 
-<file path="src/ui/styles/app.css">
-body { margin: 0; min-width: 960px; }
-#root { min-height: 100vh; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
-.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
-.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
-.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
-.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
-.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
-.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
-.dock { background: var(--color-surface-base); }
-.left-dock { border-right: var(--border-default); }
-.right-dock { border-left: var(--border-default); }
-.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
-.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
-.panel-content { padding: var(--space-4) var(--space-3); }
-.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
-.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
-.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
-.tree-row:first-of-type { background: var(--color-state-info-surface); }
-.tree-row span { color: var(--color-primary-accent-strong); }
-.tree-row small { margin-left: auto; color: var(--color-text-muted); }
-.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
-.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
-.info-block span { color: var(--color-text-secondary); }
-.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
-.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
-.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
-.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
-.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
-.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
-.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
-.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
-.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
-</file>
-
 <file path="src/ui/styles/tokens.css">
 :root {
   color-scheme: light;
@@ -5123,110 +5152,93 @@ createRoot(document.getElementById("root")!).render(
 /// <reference types="vite/client" />
 </file>
 
-<file path="tests/app/editor-store.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import { applyProjectPatch } from "../../src/domain";
-import type { ProjectCommand } from "../../src/domain";
-import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
+<file path="tests/assets/native-project-archive.test.ts">
+import { describe, expect, it } from "vitest";
+import { BlobReader, BlobWriter, TextReader, TextWriter, ZipReader, ZipWriter } from "@zip.js/zip.js";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { ARCHIVE_LIMITS, createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { createProject } from "../../src/domain";
 import { createNestedMeshProject } from "../fixtures/projects";
 
-const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
-  commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
-});
+async function zip(entries: readonly [string, string][]): Promise<Blob> {
+  const writer = new ZipWriter(new BlobWriter());
+  for (const [path, value] of entries) await writer.add(path, new TextReader(value));
+  return writer.close();
+}
 
-describe("editor store", () => {
-  it("initializes a stable, immutable RAM snapshot independently of its input", () => {
-    const input = createNestedMeshProject();
-    const store = createEditorStore(input);
-    const snapshot = store.getSnapshot();
-    input.nodes[0]?.children.push("external");
-    expect(store.getSnapshot()).toBe(snapshot);
-    expect(selectProject(snapshot).nodes[0]?.children).not.toContain("external");
-    expect(selectRevision(snapshot)).toBe(0);
-    expect(selectDirty(snapshot)).toBe(false);
-    expect(snapshot.job.status).toBe("idle");
-    expect(Object.isFrozen(snapshot.document.project.nodes[0]?.children)).toBe(true);
-    expect(() => { (snapshot.document.project.nodes as unknown as string[]).push("external"); }).toThrow();
-    expect(store.getSnapshot()).toBe(snapshot);
+describe("native project archive", () => {
+  it("round-trips an empty project", async () => {
+    const project = createProject();
+    const saved = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    const loaded = await openNativeProjectArchive(saved.value);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) expect(loaded.value.project).toEqual(project);
   });
 
-  it("publishes one complete transaction and stores reversible deltas", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const observed: ReturnType<typeof store.getSnapshot>[] = [];
-    store.subscribe(() => observed.push(store.getSnapshot()));
-    const result = store.executeTransaction([
-      rename("Новое имя", "mesh-node", "one"), rename("Новая деталь", "mesh-node", "two"),
-    ], 0, "batch");
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(observed).toHaveLength(1);
-    const after = observed[0]!;
-    expect(after).toBe(store.getSnapshot());
-    expect(after.document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
-    expect(after.document.revision).toBe(result.revision);
-    expect(after.document.dirty).toBe(true);
-    expect(after.derived).toEqual({ generation: 1, documentRevision: 1, scope: "all" });
-    expect(after.history.entries).toHaveLength(1);
-    expect(after.history.entries[0]?.id).toBe("batch");
-    expect(applyProjectPatch(before.document.project as Parameters<typeof applyProjectPatch>[0], result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.document.project);
-    expect(after.history.entries[0]?.patch).toEqual(result.patch);
-    expect(after.history.entries[0]?.undoPatch).toEqual(result.undoPatch);
-    expect(Object.isFrozen(after.history.entries[0]?.patch.changes)).toBe(true);
-    result.project.nodes[0]?.children.push("caller mutation");
-    expect(after.document.project.nodes[0]?.children).not.toContain("caller mutation");
+  it("round-trips hierarchy, modifiers, materials, animation and resource bytes", async () => {
+    const project = createNestedMeshProject();
+    const bytes = new TextEncoder().encode("actual binary resource");
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((n) => n.toString(16).padStart(2, "0")).join("");
+    project.assets.push({ id: "texture-1", hash, path: `assets/${hash}.png`, mediaType: "image/png", colorSpace: "srgb" });
+    const source = new AssetBytes([["texture-1", bytes]]);
+    const saved = await createNativeProjectArchive(project, source, "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    bytes[0] = 0;
+    const loaded = await openNativeProjectArchive(saved.value);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.value.project).toEqual(project);
+    expect(new TextDecoder().decode(loaded.value.assets.get("texture-1"))).toBe("actual binary resource");
+    const exported = loaded.value.assets.get("texture-1")!;
+    exported[0] = 0;
+    expect(loaded.value.assets.get("texture-1")?.[0]).not.toBe(0);
   });
 
-  it("does not publish failures or semantic no-ops", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const listener = vi.fn();
-    store.subscribe(listener);
-    expect(store.executeCommand(rename("Куб"), 0)).toMatchObject({ ok: true, changed: false, revision: 0 });
-    expect(store.executeCommand(rename("Wrong", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
-    expect(store.executeTransaction([rename("A", "mesh-node", "first"), rename("B", "missing", "second")], 0))
-      .toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
-    expect(store.getSnapshot()).toBe(before);
-    expect(listener).not.toHaveBeenCalled();
-    expect(before.history.entries).toHaveLength(0);
-    expect(selectDerived(before).generation).toBe(0);
+  it("rejects missing and modified resource bytes", async () => {
+    const project = createProject();
+    project.assets.push({ id: "a", hash: "0".repeat(64), path: `assets/${"0".repeat(64)}.png`, mediaType: "image/png", colorSpace: "srgb" });
+    expect(await createNativeProjectArchive(project, new AssetBytes(), "0.1.0")).toMatchObject({ ok: false, error: { code: "ASSET_MISSING" } });
+    expect(await createNativeProjectArchive(project, new AssetBytes([["a", new Uint8Array([1])]]), "0.1.0")).toMatchObject({ ok: false, error: { code: "ASSET_INTEGRITY" } });
   });
 
-  it("keeps selection, tool and view outside document revision and derived generation", () => {
-    const store = createEditorStore(createNestedMeshProject());
-    const before = store.getSnapshot();
-    const project = before.document.project;
-    const listener = vi.fn();
-    const unsubscribe = store.subscribe(listener);
-    store.setSelection(["mesh-node", "missing", "mesh-node", "nested-group"], "nested-group");
-    expect(store.getSnapshot().selection).toEqual({ ids: ["mesh-node", "nested-group"], activeId: "nested-group" });
-    store.setSelection(["mesh-node", "nested-group"], "nested-group");
-    store.setTool({ mode: "scene", active: "move", space: "local" });
-    store.setView({ leftTab: "assets", timelineExpanded: false });
-    expect(listener).toHaveBeenCalledTimes(3);
-    const after = store.getSnapshot();
-    expect(after.document).toBe(before.document);
-    expect(after.document.project).toBe(project);
-    expect(after.history).toBe(before.history);
-    expect(after.derived).toBe(before.derived);
-    store.setSelection(["missing"]);
-    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
-    unsubscribe();
-    store.setView({ timelineExpanded: true });
-    expect(listener).toHaveBeenCalledTimes(4);
+  it("rejects malformed containers, traversal, unknown paths and conflicting names", async () => {
+    expect(await openNativeProjectArchive(new Blob(["not zip"]))).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
+    for (const paths of [["../manifest.json"], ["manifest.json", "MANIFEST.json"], ["manifest.json", "script.js"]]) {
+      const blob = await zip(paths.map((path) => [path, "{}"]));
+      expect(await openNativeProjectArchive(blob)).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
+    }
   });
 
-  it("keeps session revision distinct from model revision", () => {
-    const input = createNestedMeshProject();
-    input.model.revision = 7;
-    const store = createEditorStore(input);
-    expect(store.getSnapshot().document.revision).toBe(0);
-    expect(store.getSnapshot().document.project.model.revision).toBe(7);
-    expect(store.executeCommand(rename("Новое"), 0)).toMatchObject({ ok: true, revision: 1 });
-    expect(store.getSnapshot().document.project.model.revision).toBe(8);
-    expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
-    expect(store.getSnapshot().document.revision).toBe(1);
+  it("rejects oversized archive and invalid manifest", async () => {
+    expect(await openNativeProjectArchive(new Blob([new Uint8Array(ARCHIVE_LIMITS.archive + 1)]))).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
+    const blob = await zip([["manifest.json", "{"], ["document.json", "{}"]]);
+    expect(await openNativeProjectArchive(blob)).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
+  });
+
+  it("rejects changed document checksum, unsupported versions and undeclared files", async () => {
+    const saved = await createNativeProjectArchive(createProject(), new AssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    const reader = new ZipReader(new BlobReader(saved.value));
+    const entries = await reader.getEntries();
+    const manifestEntry = entries.find((entry) => entry.filename === "manifest.json");
+    const documentEntry = entries.find((entry) => entry.filename === "document.json");
+    if (!manifestEntry || manifestEntry.directory || !documentEntry || documentEntry.directory) throw new Error("fixture archive incomplete");
+    const manifest = await manifestEntry.getData(new TextWriter());
+    const document = await documentEntry.getData(new TextWriter());
+    await reader.close();
+    expect(await openNativeProjectArchive(await zip([["manifest.json", manifest], ["document.json", document + " "]]))).toMatchObject({ ok: false, error: { code: "ASSET_INTEGRITY" } });
+    const newer = JSON.stringify({ ...JSON.parse(manifest), formatVersion: "2.0.0" });
+    expect(await openNativeProjectArchive(await zip([["manifest.json", newer], ["document.json", document]]))).toMatchObject({ ok: false, error: { code: "SCHEMA_UNSUPPORTED" } });
+    expect(await openNativeProjectArchive(await zip([["manifest.json", manifest], ["document.json", document], [`assets/${"a".repeat(64)}.png`, "orphan"]]))).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
+  });
+
+  it("enforces the manifest expansion limit on compressed data", async () => {
+    const blob = await zip([["manifest.json", "x".repeat(ARCHIVE_LIMITS.manifest + 1)], ["document.json", "{}"]]);
+    expect(await openNativeProjectArchive(blob)).toMatchObject({ ok: false, error: { code: "FILE_INVALID" } });
   });
 });
 </file>
@@ -6102,51 +6114,158 @@ export default defineConfig({
 });
 </file>
 
-<file path="docs/data-contracts.md">
-# Data and contracts
+<file path="src/app/editor-store.ts">
+import { createCommandBus } from "../domain/command-bus";
+import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
+import type { EntityId, Project } from "../domain/types";
+import { AssetBytes } from "../assets/asset-bytes";
+import type { LoadedProject } from "../assets/native-project-archive";
 
-## Project invariants
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
 
-- Exactly one Model and one Scene.
-- Node has unique stable ID and parent cannot form cycle.
-- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
-- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
-- Session history in RAM only, no autosave on tab close.
+export interface EditorState {
+  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
+  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
+  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
+  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
+  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
+  readonly history: { readonly entries: readonly HistoryEntry[] };
+  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
+}
 
-## Entities
+export interface HistoryEntry {
+  readonly id: string;
+  readonly revision: number;
+  readonly patch: DeepReadonly<ProjectPatch>;
+  readonly undoPatch: DeepReadonly<ProjectPatch>;
+}
 
-- `Project`: schemaVersion/modelId/sceneId/assets/animations
-- `Model`: rootNodeId/revision/child hierarchy
-- `Scene`: camera/background/HDRI/light/instances
-- `Node`: id/type/transform/parent/material/modifiers
-- `Modifier`: id/type/order/args/enabled
-- `Material`: PBR fields + slots
-- `Asset`: hash/mediaType/path/colorspace
-- `AnimationClip`: duration/loop/trackRefs
-- `Track`: nodeId/propertyPath/keyframes
-- `InteractionRule NEXT`: typed event/condition/action
+export interface EditorStore {
+  getSnapshot(): EditorState;
+  subscribe(listener: () => void): () => void;
+  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
+  setTool(next: Partial<EditorState["tool"]>): void;
+  setView(next: Partial<EditorState["view"]>): void;
+  getAssetBytes(): AssetBytes;
+  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  confirmSaved(revision: number, identity: object): boolean;
+  replaceProject(loaded: LoadedProject, identity: object): boolean;
+}
 
-## Messages
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
+}
 
-- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
-- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
-- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
-- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
-- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
-- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
+export function createEditorStore(initialProject: Project): EditorStore {
+  let bus = createCommandBus(initialProject);
+  let assetBytes = new AssetBytes();
+  let identity: object = {};
+  const listeners = new Set<() => void>();
+  let state: EditorState = Object.freeze({
+    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
+    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
+    job: Object.freeze({ status: "idle" as const }),
+    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
+  });
 
-## JSON document and native manifest v1
+  function publish(next: EditorState): void {
+    state = Object.freeze(next);
+    for (const listener of [...listeners]) {
+      if (listeners.has(listener)) listener();
+    }
+  }
 
-- `document.json` uses the current `Project` shape and `schemaVersion: "1.0.0"`. Its authoritative machine-readable contract is [`document-v1.schema.json`](../src/domain/schemas/document-v1.schema.json). `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
-- `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
-- Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. No migration is registered until a real earlier schema exists.
-- Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
+  function commit(result: CommandResult): CommandResult {
+    if (!result.ok || !result.changed) return result;
+    identity = {};
+    const entry: HistoryEntry = Object.freeze({
+      id: result.id,
+      revision: result.revision,
+      patch: deepFreeze(structuredClone(result.patch)),
+      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
+    });
+    publish({
+      ...state,
+      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
+      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+    });
+    return result;
+  }
 
-The earlier illustrative example used `formatVersion`, `projectId`, and `scene.modelInstances` inside the document. The implemented domain type instead uses `schemaVersion`, `id`, and `scene.instances`; TASK-009 fixes the JSON contract to those existing types without inventing fields.
+  return {
+    getSnapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
+    executeTransaction: (commands, expectedRevision, transactionId) =>
+      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
+    getAssetBytes: () => assetBytes.clone(),
+    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    confirmSaved(revision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
+      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
+      return true;
+    },
+    replaceProject(loaded, expectedIdentity) {
+      if (identity !== expectedIdentity) return false;
+      const nextBus = createCommandBus(loaded.project);
+      const nextAssets = loaded.assets.clone();
+      bus = nextBus;
+      assetBytes.clear();
+      assetBytes = nextAssets;
+      identity = {};
+      publish({
+        ...state,
+        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+        history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
+      });
+      return true;
+    },
+    setSelection(ids, activeId) {
+      const valid = new Set(state.document.project.nodes.map((node) => node.id));
+      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
+      const active = activeId === undefined ? (selected[0] ?? null) :
+        activeId !== null && selected.includes(activeId) ? activeId : null;
+      if (active === state.selection.activeId && selected.length === state.selection.ids.length
+        && selected.every((id, index) => id === state.selection.ids[index])) return;
+      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
+    },
+    setTool(next) {
+      const tool = { ...state.tool, ...next };
+      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
+      publish({ ...state, tool: Object.freeze(tool) });
+    },
+    setView(next) {
+      const view = { ...state.view, ...next };
+      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
+      publish({ ...state, view: Object.freeze(view) });
+    },
+  };
+}
 
-## Error codes
-
-FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+export const selectProject = (state: EditorState) => state.document.project;
+export const selectRevision = (state: EditorState) => state.document.revision;
+export const selectDirty = (state: EditorState) => state.document.dirty;
+export const selectSelectedIds = (state: EditorState) => state.selection.ids;
+export const selectActiveId = (state: EditorState) => state.selection.activeId;
+export const selectTool = (state: EditorState) => state.tool;
+export const selectJob = (state: EditorState) => state.job;
+export const selectDerived = (state: EditorState) => state.derived;
 </file>
 
 <file path="src/domain/validate-project.ts">
@@ -6351,6 +6470,193 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
+<file path="src/ui/styles/app.css">
+body { margin: 0; min-width: 960px; }
+#root { min-height: 100vh; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
+.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
+.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
+.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
+.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.file-actions { display: flex; align-items: center; gap: var(--space-2); }
+.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.file-actions button:disabled { opacity: .5; cursor: wait; }
+.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
+.dock { background: var(--color-surface-base); }
+.left-dock { border-right: var(--border-default); }
+.right-dock { border-left: var(--border-default); }
+.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+.panel-content { padding: var(--space-4) var(--space-3); }
+.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
+.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
+.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
+.tree-row:first-of-type { background: var(--color-state-info-surface); }
+.tree-row span { color: var(--color-primary-accent-strong); }
+.tree-row small { margin-left: auto; color: var(--color-text-muted); }
+.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
+.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
+.info-block span { color: var(--color-text-secondary); }
+.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
+.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
+.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
+.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
+.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
+.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
+.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
+.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
+.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
+</file>
+
+<file path="tests/app/editor-store.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { applyProjectPatch } from "../../src/domain";
+import type { ProjectCommand } from "../../src/domain";
+import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
+import { createNestedMeshProject } from "../fixtures/projects";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+
+const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
+  commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
+});
+
+describe("editor store", () => {
+  it("initializes a stable, immutable RAM snapshot independently of its input", () => {
+    const input = createNestedMeshProject();
+    const store = createEditorStore(input);
+    const snapshot = store.getSnapshot();
+    input.nodes[0]?.children.push("external");
+    expect(store.getSnapshot()).toBe(snapshot);
+    expect(selectProject(snapshot).nodes[0]?.children).not.toContain("external");
+    expect(selectRevision(snapshot)).toBe(0);
+    expect(selectDirty(snapshot)).toBe(false);
+    expect(snapshot.job.status).toBe("idle");
+    expect(Object.isFrozen(snapshot.document.project.nodes[0]?.children)).toBe(true);
+    expect(() => { (snapshot.document.project.nodes as unknown as string[]).push("external"); }).toThrow();
+    expect(store.getSnapshot()).toBe(snapshot);
+  });
+
+  it("publishes one complete transaction and stores reversible deltas", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const observed: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => observed.push(store.getSnapshot()));
+    const result = store.executeTransaction([
+      rename("Новое имя", "mesh-node", "one"), rename("Новая деталь", "mesh-node", "two"),
+    ], 0, "batch");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(observed).toHaveLength(1);
+    const after = observed[0]!;
+    expect(after).toBe(store.getSnapshot());
+    expect(after.document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
+    expect(after.document.revision).toBe(result.revision);
+    expect(after.document.dirty).toBe(true);
+    expect(after.derived).toEqual({ generation: 1, documentRevision: 1, scope: "all" });
+    expect(after.history.entries).toHaveLength(1);
+    expect(after.history.entries[0]?.id).toBe("batch");
+    expect(applyProjectPatch(before.document.project as Parameters<typeof applyProjectPatch>[0], result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.document.project);
+    expect(after.history.entries[0]?.patch).toEqual(result.patch);
+    expect(after.history.entries[0]?.undoPatch).toEqual(result.undoPatch);
+    expect(Object.isFrozen(after.history.entries[0]?.patch.changes)).toBe(true);
+    result.project.nodes[0]?.children.push("caller mutation");
+    expect(after.document.project.nodes[0]?.children).not.toContain("caller mutation");
+  });
+
+  it("does not publish failures or semantic no-ops", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    expect(store.executeCommand(rename("Куб"), 0)).toMatchObject({ ok: true, changed: false, revision: 0 });
+    expect(store.executeCommand(rename("Wrong", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.executeTransaction([rename("A", "mesh-node", "first"), rename("B", "missing", "second")], 0))
+      .toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.getSnapshot()).toBe(before);
+    expect(listener).not.toHaveBeenCalled();
+    expect(before.history.entries).toHaveLength(0);
+    expect(selectDerived(before).generation).toBe(0);
+  });
+
+  it("keeps selection, tool and view outside document revision and derived generation", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const project = before.document.project;
+    const listener = vi.fn();
+    const unsubscribe = store.subscribe(listener);
+    store.setSelection(["mesh-node", "missing", "mesh-node", "nested-group"], "nested-group");
+    expect(store.getSnapshot().selection).toEqual({ ids: ["mesh-node", "nested-group"], activeId: "nested-group" });
+    store.setSelection(["mesh-node", "nested-group"], "nested-group");
+    store.setTool({ mode: "scene", active: "move", space: "local" });
+    store.setView({ leftTab: "assets", timelineExpanded: false });
+    expect(listener).toHaveBeenCalledTimes(3);
+    const after = store.getSnapshot();
+    expect(after.document).toBe(before.document);
+    expect(after.document.project).toBe(project);
+    expect(after.history).toBe(before.history);
+    expect(after.derived).toBe(before.derived);
+    store.setSelection(["missing"]);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+    unsubscribe();
+    store.setView({ timelineExpanded: true });
+    expect(listener).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps session revision distinct from model revision", () => {
+    const input = createNestedMeshProject();
+    input.model.revision = 7;
+    const store = createEditorStore(input);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().document.project.model.revision).toBe(7);
+    expect(store.executeCommand(rename("Новое"), 0)).toMatchObject({ ok: true, revision: 1 });
+    expect(store.getSnapshot().document.project.model.revision).toBe(8);
+    expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.getSnapshot().document.revision).toBe(1);
+  });
+
+  it("atomically replaces project, command bus, assets, selection and history", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("Changed"), 0);
+    store.setSelection(["mesh-node"]);
+    const oldIdentity = store.captureDocument().identity;
+    const next = createNestedMeshProject();
+    next.model.revision = 17;
+    const bytes = new AssetBytes([["asset", new Uint8Array([1, 2])]]);
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(store.getSnapshot().document.project.model.revision).toBe(17);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().selection.ids).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    bytes.clear();
+    expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
+    expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(false);
+    expect(store.executeCommand(rename("After load"), 0)).toMatchObject({ ok: true, revision: 1 });
+  });
+
+  it("does not acknowledge a stale save or replace after an edit", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const captured = store.captureDocument();
+    store.executeCommand(rename("Later"), 0);
+    expect(store.confirmSaved(captured.revision, captured.identity)).toBe(false);
+    expect(store.replaceProject({ project: createNestedMeshProject(), assets: new AssetBytes() }, captured.identity)).toBe(false);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    const current = store.captureDocument();
+    expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
+});
+</file>
+
 <file path="tests/fixtures/projects.ts">
 import { createProject } from "../../src/domain/create-project";
 import type { Material, MeshNode, Project } from "../../src/domain/types";
@@ -6474,6 +6780,59 @@ export default tseslint.config(
 );
 </file>
 
+<file path="docs/data-contracts.md">
+# Data and contracts
+
+## Native `.triad3d` container (TASK-010A)
+
+The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. The document uses schema v1 (`schemaVersion: "1.0.0"`); the manifest uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
+
+The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
+
+## Project invariants
+
+- Exactly one Model and one Scene.
+- Node has unique stable ID and parent cannot form cycle.
+- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
+- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
+- Session history in RAM only, no autosave on tab close.
+
+## Entities
+
+- `Project`: schemaVersion/modelId/sceneId/assets/animations
+- `Model`: rootNodeId/revision/child hierarchy
+- `Scene`: camera/background/HDRI/light/instances
+- `Node`: id/type/transform/parent/material/modifiers
+- `Modifier`: id/type/order/args/enabled
+- `Material`: PBR fields + slots
+- `Asset`: hash/mediaType/path/colorspace
+- `AnimationClip`: duration/loop/trackRefs
+- `Track`: nodeId/propertyPath/keyframes
+- `InteractionRule NEXT`: typed event/condition/action
+
+## Messages
+
+- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
+- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
+- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
+- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
+- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
+- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
+
+## JSON document and native manifest v1
+
+- `document.json` uses the current `Project` shape and `schemaVersion: "1.0.0"`. Its authoritative machine-readable contract is [`document-v1.schema.json`](../src/domain/schemas/document-v1.schema.json). `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
+- `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
+- Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. No migration is registered until a real earlier schema exists.
+- Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
+
+The earlier illustrative example used `formatVersion`, `projectId`, and `scene.modelInstances` inside the document. The implemented domain type instead uses `schemaVersion`, `id`, and `scene.instances`; TASK-009 fixes the JSON contract to those existing types without inventing fields.
+
+## Error codes
+
+FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+</file>
+
 <file path="src/domain/index.ts">
 export { createProject } from "./create-project";
 export type { IdFactory } from "./create-project";
@@ -6512,6 +6871,9 @@ import { createProject } from "../domain";
 import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
+import { useRef, useState } from "react";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
+import packageInfo from "../../package.json";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -6534,15 +6896,71 @@ export function App() {
 
 function EditorShell() {
   const state = useEditorStore(editorStore);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [fileBusy, setFileBusy] = useState(false);
+  const [fileStatus, setFileStatus] = useState("");
   const project = selectProject(state);
   const revision = selectRevision(state);
   const dirty = selectDirty(state);
+  async function saveProject() {
+    if (fileBusy) return;
+    setFileBusy(true);
+    setFileStatus("Подготовка архива…");
+    const captured = editorStore.captureDocument();
+    const filename = `${captured.project.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 80) || "project"}.triad3d`;
+    const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
+    try {
+      // The picker needs the original click activation; acquire the handle before asynchronous hashing.
+      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
+      const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
+      if (!result.ok) { setFileStatus(result.error.message); return; }
+      if (handle) {
+        const writable = await handle.createWritable();
+        await writable.write(result.value);
+        await writable.close();
+        setFileStatus(editorStore.confirmSaved(captured.revision, captured.identity) ? "Проект сохранён." : "Файл записан; после подготовки проекта были новые изменения.");
+      } else {
+        const url = URL.createObjectURL(result.value);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        setFileStatus("Загрузка файла запущена. Проверьте его сохранение в браузере.");
+      }
+    } catch (error) {
+      setFileStatus(error instanceof DOMException && error.name === "AbortError" ? "Сохранение отменено." : "Не удалось сохранить проект.");
+    } finally { setFileBusy(false); }
+  }
+
+  async function openProject(file: File) {
+    if (fileBusy) return;
+    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Открыть другой проект и потерять их?")) return;
+    const expected = editorStore.captureDocument().identity;
+    setFileBusy(true);
+    setFileStatus("Проверка архива…");
+    try {
+      const result = await openNativeProjectArchive(file);
+      if (!result.ok) { setFileStatus(result.error.message); return; }
+      if (!editorStore.replaceProject(result.value, expected)) { setFileStatus("Проект изменился во время открытия файла. Повторите операцию."); return; }
+      setFileStatus("Проект открыт.");
+    } catch { setFileStatus("Не удалось открыть проект."); }
+    finally { setFileBusy(false); }
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
-        <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
+        <div className="file-actions">
+          <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
+          <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
+          <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
+          <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
+        </div>
       </header>
+      {fileStatus && <div className="file-status" role="status" aria-live="polite">{fileStatus}</div>}
       <div className="workspace-grid">
         <aside className="dock left-dock" aria-label="Структура проекта">
           <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
@@ -6572,6 +6990,13 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-010A — Native project archive and manual file actions
+
+- Added `.triad3d` ZIP save/open with `manifest.json`, `document.json`, SHA-256 verified binary assets, strict entry/path checks, and bounded streaming extraction. Asset bytes remain in RAM and are excluded from JSON and command history.
+- EditorStore now replaces a validated loaded project and its asset store in one publication, resets selection/history, keeps serialized `model.revision`, and rejects stale asynchronous replacements. Confirmed File System Access writes mark the captured revision clean; browser download fallback reports only that download was initiated.
+- Added Russian save/open controls and status messages. Security limits are temporary protective bounds pending performance profiling: 128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest.
+- TASK-010 remains partial: the GLB/GLTF import adapter is not included in TASK-010A.
 
 ## TASK-009 — Versioned project JSON serialization
 
@@ -6641,6 +7066,7 @@ function EditorShell() {
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "@zip.js/zip.js": "^2.24.0",
     "ajv": "^8.20.0",
     "manifold-3d": "^3.5.4",
     "react": "^19.3.1",

@@ -1,8 +1,9 @@
-import type { EntityId, Node, Project, Transform } from "./types";
+import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
+  | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
   | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
   | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
@@ -21,6 +22,8 @@ export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandError
 export type PatchChange =
   | { kind: "addNode"; node: Node }
   | { kind: "removeNode"; node: Node }
+  | { kind: "addAsset"; asset: Asset }
+  | { kind: "removeAsset"; asset: Asset }
   | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
   | { kind: "modelRevision"; before: number; after: number };
 export interface ProjectPatch { changes: PatchChange[] }
@@ -73,6 +76,19 @@ function validNode(value: unknown): value is Node {
 function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
+  if (value.type === "ADD_MESH_ASSET") {
+    const asset = payload.asset;
+    const node = payload.node;
+    return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+      && ownKeys(payload, ["parentId", "node", "asset"]) && id(payload.parentId)
+      && validNode(node) && node.kind === "mesh" && node.meshSource.kind === "asset"
+      && (asset === null || (record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+        && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
+        && asset.path === `assets/${asset.hash}.glb` && asset.mediaType === "model/gltf-binary" && asset.colorSpace === "none"))
+      && value.targetIds.length === 3 && value.targetIds[0] === payload.parentId
+      && value.targetIds[1] === node.id && value.targetIds[2] === node.meshSource.assetId
+      && (asset === null || asset.id === node.meshSource.assetId);
+  }
   if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
     && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
     && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
@@ -104,8 +120,20 @@ function blocked(project: Project, node: Node, flags = false): CommandErrorCode 
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
-  if (command.type === "ADD_NODE") {
+  if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
     const { parentId, node } = command.payload;
+    if (command.type === "ADD_MESH_ASSET") {
+      const { asset } = command.payload;
+      const assetId = command.payload.node.meshSource.kind === "asset" ? command.payload.node.meshSource.assetId : "";
+      if (asset === null) {
+        if (!project.assets.some((entry) => entry.id === assetId && entry.mediaType === "model/gltf-binary"))
+          return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Ресурс GLB не найден.");
+      } else {
+        if (entityIds(project).has(asset.id) || asset.id === node.id || project.assets.some((entry) => entry.path === asset.path))
+          return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
+        project.assets.push(structuredClone(asset));
+      }
+    }
     const parent = project.nodes.find((entry) => entry.id === parentId);
     if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
     const block = blocked(project, parent);
@@ -151,6 +179,7 @@ function entityIds(project: Project): Set<string> {
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
+  for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
@@ -167,6 +196,8 @@ function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
     if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
+    if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
     return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
   }) };
@@ -176,7 +207,14 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
-    if (change.kind === "addNode") {
+    if (change.kind === "addAsset") {
+      if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
+      result.assets.push(structuredClone(change.asset));
+    } else if (change.kind === "removeAsset") {
+      const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
+      if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
+      result.assets.splice(index, 1);
+    } else if (change.kind === "addNode") {
       if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
       result.nodes.push(structuredClone(change.node));
     } else if (change.kind === "removeNode") {

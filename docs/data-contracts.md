@@ -6,6 +6,10 @@ The native file is a ZIP with exactly one `manifest.json`, one `document.json`, 
 
 The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
 
+## GLB import (TASK-010B)
+
+A confirmed static GLB 2.0 is stored unchanged as `assets/<sha256>.glb` with `mediaType: model/gltf-binary` and `colorSpace: none`. One domain mesh node with identity transform points to the asset under the existing model root; glTF transforms and PBR data remain inside the binary source. No material slots or editable child meshes are synthesized. Import metadata is covered by reversible command patches, while bytes stay in RAM and in the explicit native archive. Duplicate identical GLBs reuse the existing asset ID and bytes. Unsupported animations, skinning, morph targets, multiple mesh nodes or scenes, glTF extensions and any URI are rejected before parsing; this is a partial implementation of FR-064.
+
 ## Project invariants
 
 - Exactly one Model and one Scene.

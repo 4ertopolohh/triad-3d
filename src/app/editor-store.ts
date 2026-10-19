@@ -1,4 +1,5 @@
 import { createCommandBus } from "../domain/command-bus";
+import { CommandErrorCode } from "../domain/command-bus";
 import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
 import type { EntityId, Project } from "../domain/types";
 import { AssetBytes } from "../assets/asset-bytes";
@@ -29,6 +30,7 @@ export interface EditorStore {
   subscribe(listener: () => void): () => void;
   executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
   executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   setTool(next: Partial<EditorState["tool"]>): void;
   setView(next: Partial<EditorState["view"]>): void;
@@ -95,6 +97,24 @@ export function createEditorStore(initialProject: Project): EditorStore {
     executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
     executeTransaction: (commands, expectedRevision, transactionId) =>
       commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
+    addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      if (command.payload.asset && (bytes.byteLength === 0 || assetBytes.ids().includes(command.payload.asset.id)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Байты ресурса отсутствуют или ID уже занят." };
+      if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
+      try {
+        const nextAssets = assetBytes.clone();
+        if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
+        const result = bus.executeCommand(command, expectedRevision);
+        if (!result.ok) return result;
+        assetBytes = nextAssets;
+        return commit(result);
+      } catch {
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
+      }
+    },
     getAssetBytes: () => assetBytes.clone(),
     captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
     confirmSaved(revision, expectedIdentity) {

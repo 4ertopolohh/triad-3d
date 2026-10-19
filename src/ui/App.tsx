@@ -4,6 +4,7 @@ import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
 import { useRef, useState } from "react";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
+import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
 
 const RendererSpike = import.meta.env.DEV
@@ -28,8 +29,10 @@ export function App() {
 function EditorShell() {
   const state = useEditorStore(editorStore);
   const fileInput = useRef<HTMLInputElement>(null);
+  const glbInput = useRef<HTMLInputElement>(null);
   const [fileBusy, setFileBusy] = useState(false);
   const [fileStatus, setFileStatus] = useState("");
+  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const project = selectProject(state);
   const revision = selectRevision(state);
   const dirty = selectDirty(state);
@@ -80,6 +83,26 @@ function EditorShell() {
     } catch { setFileStatus("Не удалось открыть проект."); }
     finally { setFileBusy(false); }
   }
+  async function importGlb(file: File) {
+    if (fileBusy) return;
+    const captured = editorStore.captureDocument();
+    setPendingGlb(null);
+    setFileBusy(true);
+    setFileStatus("Проверка GLB…");
+    try {
+      const result = await prepareGlb(file);
+      if (!result.ok) { setFileStatus(result.error.message); return; }
+      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
+      setFileStatus("GLB проверен. Подтвердите добавление в текущую модель.");
+    } catch { setFileStatus("Не удалось проверить GLB."); }
+    finally { setFileBusy(false); }
+  }
+  function confirmGlb() {
+    if (!pendingGlb) return;
+    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
+    setPendingGlb(null);
+    setFileStatus(result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -88,10 +111,17 @@ function EditorShell() {
           <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
           <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
           <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
+          <button type="button" disabled={fileBusy} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
+          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
         </div>
       </header>
       {fileStatus && <div className="file-status" role="status" aria-live="polite">{fileStatus}</div>}
+      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
+        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются. 3D-просмотр появится позже.</span>
+        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
+        <button type="button" onClick={() => { setPendingGlb(null); setFileStatus("Импорт отменён."); }}>Отмена</button>
+      </div>}
       <div className="workspace-grid">
         <aside className="dock left-dock" aria-label="Структура проекта">
           <div className="panel-heading"><h2>Структура</h2><span>01</span></div>
@@ -99,6 +129,7 @@ function EditorShell() {
             <p className="eyebrow">Текущий проект</p>
             <div className="project-name">{project.name}</div>
             <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
+            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
             <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
             <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
           </div>
