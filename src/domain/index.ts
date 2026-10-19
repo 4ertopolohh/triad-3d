@@ -3,5 +3,7 @@ export type { IdFactory } from "./create-project";
 export { validateProject } from "./validate-project";
 export type { ValidationCode, ValidationIssue } from "./validate-project";
 export type * from "./types";
+export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
+export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
 export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";

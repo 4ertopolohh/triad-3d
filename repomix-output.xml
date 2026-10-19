@@ -73,6 +73,9 @@ harness/
 scripts/
   check-export-harness.mjs
 src/
+  app/
+    editor-store.ts
+    use-editor-store.ts
   domain/
     command-bus.ts
     create-project.ts
@@ -102,6 +105,8 @@ src/
   main.tsx
   vite-env.d.ts
 tests/
+  app/
+    editor-store.test.ts
   csg/
     benchmark.test.ts
     client.test.ts
@@ -3413,6 +3418,136 @@ await stat(join(isolated, "dist", "index.html"));
 console.log(`Independent harness PASS: ${isolated}`);
 </file>
 
+<file path="src/app/editor-store.ts">
+import { createCommandBus } from "../domain/command-bus";
+import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
+import type { EntityId, Project } from "../domain/types";
+
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+
+export interface EditorState {
+  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
+  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
+  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
+  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
+  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
+  readonly history: { readonly entries: readonly HistoryEntry[] };
+  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
+}
+
+export interface HistoryEntry {
+  readonly id: string;
+  readonly revision: number;
+  readonly patch: DeepReadonly<ProjectPatch>;
+  readonly undoPatch: DeepReadonly<ProjectPatch>;
+}
+
+export interface EditorStore {
+  getSnapshot(): EditorState;
+  subscribe(listener: () => void): () => void;
+  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
+  setTool(next: Partial<EditorState["tool"]>): void;
+  setView(next: Partial<EditorState["view"]>): void;
+}
+
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
+}
+
+export function createEditorStore(initialProject: Project): EditorStore {
+  const bus = createCommandBus(initialProject);
+  const listeners = new Set<() => void>();
+  let state: EditorState = Object.freeze({
+    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
+    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
+    job: Object.freeze({ status: "idle" as const }),
+    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
+    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
+  });
+
+  function publish(next: EditorState): void {
+    state = Object.freeze(next);
+    for (const listener of [...listeners]) {
+      if (listeners.has(listener)) listener();
+    }
+  }
+
+  function commit(result: CommandResult): CommandResult {
+    if (!result.ok || !result.changed) return result;
+    const entry: HistoryEntry = Object.freeze({
+      id: result.id,
+      revision: result.revision,
+      patch: deepFreeze(structuredClone(result.patch)),
+      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
+    });
+    publish({
+      ...state,
+      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
+      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+    });
+    return result;
+  }
+
+  return {
+    getSnapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
+    executeTransaction: (commands, expectedRevision, transactionId) =>
+      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
+    setSelection(ids, activeId) {
+      const valid = new Set(state.document.project.nodes.map((node) => node.id));
+      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
+      const active = activeId === undefined ? (selected[0] ?? null) :
+        activeId !== null && selected.includes(activeId) ? activeId : null;
+      if (active === state.selection.activeId && selected.length === state.selection.ids.length
+        && selected.every((id, index) => id === state.selection.ids[index])) return;
+      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
+    },
+    setTool(next) {
+      const tool = { ...state.tool, ...next };
+      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
+      publish({ ...state, tool: Object.freeze(tool) });
+    },
+    setView(next) {
+      const view = { ...state.view, ...next };
+      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
+      publish({ ...state, view: Object.freeze(view) });
+    },
+  };
+}
+
+export const selectProject = (state: EditorState) => state.document.project;
+export const selectRevision = (state: EditorState) => state.document.revision;
+export const selectDirty = (state: EditorState) => state.document.dirty;
+export const selectSelectedIds = (state: EditorState) => state.selection.ids;
+export const selectActiveId = (state: EditorState) => state.selection.activeId;
+export const selectTool = (state: EditorState) => state.tool;
+export const selectJob = (state: EditorState) => state.job;
+export const selectDerived = (state: EditorState) => state.derived;
+</file>
+
+<file path="src/app/use-editor-store.ts">
+import { useSyncExternalStore } from "react";
+import type { EditorState, EditorStore } from "./editor-store";
+
+export function useEditorStore(store: EditorStore): EditorState {
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+}
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { EntityId, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -4770,6 +4905,114 @@ createRoot(document.getElementById("root")!).render(
 /// <reference types="vite/client" />
 </file>
 
+<file path="tests/app/editor-store.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { applyProjectPatch } from "../../src/domain";
+import type { ProjectCommand } from "../../src/domain";
+import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand => ({
+  commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name },
+});
+
+describe("editor store", () => {
+  it("initializes a stable, immutable RAM snapshot independently of its input", () => {
+    const input = createNestedMeshProject();
+    const store = createEditorStore(input);
+    const snapshot = store.getSnapshot();
+    input.nodes[0]?.children.push("external");
+    expect(store.getSnapshot()).toBe(snapshot);
+    expect(selectProject(snapshot).nodes[0]?.children).not.toContain("external");
+    expect(selectRevision(snapshot)).toBe(0);
+    expect(selectDirty(snapshot)).toBe(false);
+    expect(snapshot.job.status).toBe("idle");
+    expect(Object.isFrozen(snapshot.document.project.nodes[0]?.children)).toBe(true);
+    expect(() => { (snapshot.document.project.nodes as unknown as string[]).push("external"); }).toThrow();
+    expect(store.getSnapshot()).toBe(snapshot);
+  });
+
+  it("publishes one complete transaction and stores reversible deltas", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const observed: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => observed.push(store.getSnapshot()));
+    const result = store.executeTransaction([
+      rename("Новое имя", "mesh-node", "one"), rename("Новая деталь", "mesh-node", "two"),
+    ], 0, "batch");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(observed).toHaveLength(1);
+    const after = observed[0]!;
+    expect(after).toBe(store.getSnapshot());
+    expect(after.document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
+    expect(after.document.revision).toBe(result.revision);
+    expect(after.document.dirty).toBe(true);
+    expect(after.derived).toEqual({ generation: 1, documentRevision: 1, scope: "all" });
+    expect(after.history.entries).toHaveLength(1);
+    expect(after.history.entries[0]?.id).toBe("batch");
+    expect(applyProjectPatch(before.document.project as Parameters<typeof applyProjectPatch>[0], result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.document.project);
+    expect(after.history.entries[0]?.patch).toEqual(result.patch);
+    expect(after.history.entries[0]?.undoPatch).toEqual(result.undoPatch);
+    expect(Object.isFrozen(after.history.entries[0]?.patch.changes)).toBe(true);
+    result.project.nodes[0]?.children.push("caller mutation");
+    expect(after.document.project.nodes[0]?.children).not.toContain("caller mutation");
+  });
+
+  it("does not publish failures or semantic no-ops", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const listener = vi.fn();
+    store.subscribe(listener);
+    expect(store.executeCommand(rename("Куб"), 0)).toMatchObject({ ok: true, changed: false, revision: 0 });
+    expect(store.executeCommand(rename("Wrong", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.executeTransaction([rename("A", "mesh-node", "first"), rename("B", "missing", "second")], 0))
+      .toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(store.getSnapshot()).toBe(before);
+    expect(listener).not.toHaveBeenCalled();
+    expect(before.history.entries).toHaveLength(0);
+    expect(selectDerived(before).generation).toBe(0);
+  });
+
+  it("keeps selection, tool and view outside document revision and derived generation", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const before = store.getSnapshot();
+    const project = before.document.project;
+    const listener = vi.fn();
+    const unsubscribe = store.subscribe(listener);
+    store.setSelection(["mesh-node", "missing", "mesh-node", "nested-group"], "nested-group");
+    expect(store.getSnapshot().selection).toEqual({ ids: ["mesh-node", "nested-group"], activeId: "nested-group" });
+    store.setSelection(["mesh-node", "nested-group"], "nested-group");
+    store.setTool({ mode: "scene", active: "move", space: "local" });
+    store.setView({ leftTab: "assets", timelineExpanded: false });
+    expect(listener).toHaveBeenCalledTimes(3);
+    const after = store.getSnapshot();
+    expect(after.document).toBe(before.document);
+    expect(after.document.project).toBe(project);
+    expect(after.history).toBe(before.history);
+    expect(after.derived).toBe(before.derived);
+    store.setSelection(["missing"]);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+    unsubscribe();
+    store.setView({ timelineExpanded: true });
+    expect(listener).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps session revision distinct from model revision", () => {
+    const input = createNestedMeshProject();
+    input.model.revision = 7;
+    const store = createEditorStore(input);
+    expect(store.getSnapshot().document.revision).toBe(0);
+    expect(store.getSnapshot().document.project.model.revision).toBe(7);
+    expect(store.executeCommand(rename("Новое"), 0)).toMatchObject({ ok: true, revision: 1 });
+    expect(store.getSnapshot().document.project.model.revision).toBe(8);
+    expect(store.executeCommand(rename("Поздно"), 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.getSnapshot().document.revision).toBe(1);
+  });
+});
+</file>
+
 <file path="tests/csg/benchmark.test.ts">
 import { it } from "vitest";
 import { compute, makeInputs, manifoldModule } from "../../src/spikes/csg/core";
@@ -5884,7 +6127,9 @@ export default tseslint.config(
 </file>
 
 <file path="src/ui/App.tsx">
-import { createProject, validateProject } from "../domain";
+import { createProject } from "../domain";
+import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
 
 const RendererSpike = import.meta.env.DEV
@@ -5894,8 +6139,7 @@ const CsgSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/csg/CsgSpike"))
   : null;
 
-const project = createProject();
-const issues = validateProject(project);
+const editorStore = createEditorStore(createProject());
 
 export function App() {
   if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
@@ -5904,6 +6148,14 @@ export function App() {
   if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
     return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
   }
+  return <EditorShell />;
+}
+
+function EditorShell() {
+  const state = useEditorStore(editorStore);
+  const project = selectProject(state);
+  const revision = selectRevision(state);
+  const dirty = selectDirty(state);
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -5922,8 +6174,8 @@ export function App() {
           </div>
         </aside>
         <main className="stage" aria-label="Рабочая область">
-          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-006</span></div>
-          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{issues.length === 0 ? "Структура проекта проверена" : "Ошибка структуры проекта"}</span></div>
+          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ</span><span>Основа · TASK-008</span></div>
+          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>Пространство для вашей модели</h1><p>Основа приложения готова. Просмотр и редактирование 3D будут добавлены в следующих этапах.</p><span className="status-pill">{dirty ? "Есть несохранённые изменения" : `Проект в памяти · ревизия ${revision}`}</span></div>
           <div className="stage-footer">3D-просмотр пока недоступен</div>
         </main>
         <aside className="dock right-dock" aria-label="Инспектор">

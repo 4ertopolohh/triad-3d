@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triad-3d.local/schemas/manifest-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["formatVersion", "appVersion", "document", "assets"],
+  "properties": {
+    "formatVersion": { "const": "1.0.0" },
+    "appVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "document": { "$ref": "#/$defs/document" },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+    "path": { "type": "string", "minLength": 1 },
+    "document": { "type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": { "path": { "const": "document.json" }, "sha256": { "$ref": "#/$defs/sha256" } } },
+    "asset": { "type": "object", "additionalProperties": false, "required": ["id", "path", "sha256"], "properties": { "id": { "type": "string", "minLength": 1, "pattern": "\\S" }, "path": { "$ref": "#/$defs/path" }, "sha256": { "$ref": "#/$defs/sha256" } } }
+  }
+}

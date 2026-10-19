@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-009 — Versioned project JSON serialization
+
+- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
+- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
+- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
+
 ## TASK-007 — Domain commands and transactions
 
 - Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
