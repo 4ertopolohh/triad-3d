@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>TRIAD-3D — проверка дизайн-токенов</title>
+    <link rel="stylesheet" href="../../src/ui/styles/tokens.css" />
+    <style>
+      body { margin: 0; min-width: 760px; background: var(--color-surface-background); }
+      .page { max-width: 1440px; margin: 0 auto; padding: var(--space-8); }
+      .page-header { display: flex; align-items: end; justify-content: space-between; margin-bottom: var(--space-6); }
+      .eyebrow { margin: 0 0 var(--space-1); color: var(--color-text-muted); font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold); letter-spacing: .09em; text-transform: uppercase; }
+      h1, h2, h3, p { margin-top: 0; }
+      h1 { margin-bottom: 0; font-family: var(--font-family-display); font-size: var(--font-size-display); line-height: var(--line-height-tight); }
+      h2 { margin-bottom: var(--space-3); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+      h3 { margin-bottom: var(--space-2); font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+      .caption { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .workspace { overflow: hidden; border: var(--border-default); border-radius: var(--radius-lg); background: var(--color-surface-base); box-shadow: var(--shadow-panel); }
+      .topbar { display: flex; height: var(--toolbar-height); align-items: center; justify-content: space-between; padding: 0 var(--space-4); border-bottom: var(--border-default); background: var(--color-surface-base); }
+      .brand, .toolbar-group, .row { display: flex; align-items: center; gap: var(--space-2); }
+      .brand { gap: var(--space-3); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+      .brand-mark { display: grid; width: 26px; height: 26px; place-items: center; border-radius: var(--radius-sm); background: var(--color-primary-accent); font-size: var(--font-size-xs); }
+      .topbar-label { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .toolbar-separator { width: 1px; height: 20px; margin: 0 var(--space-2); background: var(--color-stroke); }
+      .button { display: inline-flex; min-height: var(--control-height-md); align-items: center; justify-content: center; gap: var(--space-2); padding: 0 var(--control-padding-inline); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); font-size: var(--font-size-sm); font-weight: var(--font-weight-medium); cursor: pointer; transition: background-color var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease); }
+      .button:hover:not(:disabled) { background: var(--color-surface-background); }
+      .button--primary { border-color: var(--color-primary-accent-strong); background: var(--color-primary-accent); color: var(--color-text-on-accent); font-weight: var(--font-weight-semibold); }
+      .button--primary:hover:not(:disabled) { background: #86a5e2; }
+      .button--selected { border-color: var(--color-primary-accent-strong); background: rgb(116 151 220 / 22%); }
+      .button:disabled { border-color: var(--color-stroke); background: var(--color-surface-background); color: var(--color-text-muted); opacity: .72; }
+      .icon-button { width: var(--control-hit-target); min-height: var(--control-hit-target); padding: 0; }
+      .workarea { display: grid; min-height: 500px; grid-template-columns: 248px minmax(260px, 1fr) 292px; }
+      .dock { padding: var(--panel-padding); background: var(--color-surface-base); }
+      .dock--left { border-right: var(--border-default); }
+      .dock--right { border-left: var(--border-default); }
+      .dock-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
+      .dock-heading h2 { margin: 0; }
+      .muted { color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .search { width: 100%; height: var(--control-height-sm); margin-bottom: var(--space-3); padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+      .tree { display: grid; gap: 2px; }
+      .tree-item { display: flex; min-height: var(--control-height-md); align-items: center; gap: var(--space-2); padding: 0 var(--space-2); border-radius: var(--radius-sm); color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .tree-item--selected { background: rgb(116 151 220 / 24%); color: var(--color-text-primary); font-weight: var(--font-weight-semibold); box-shadow: inset 2px 0 var(--color-primary-accent-strong); }
+      .tree-item__icon { width: 16px; text-align: center; color: var(--color-text-muted); }
+      .tree-item__meta { margin-left: auto; color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .section { margin-top: var(--space-6); }
+      .viewport { display: grid; min-width: 0; grid-template-rows: 1fr auto; background: radial-gradient(ellipse at 50% 42%, #f6f6f6 0%, #ececec 55%, #e6e6e6 100%); }
+      .viewport-stage { display: grid; min-height: 350px; place-items: center; background-image: linear-gradient(rgb(201 201 201 / 22%) 1px, transparent 1px), linear-gradient(90deg, rgb(201 201 201 / 22%) 1px, transparent 1px); background-position: center; background-size: 28px 28px; }
+      .object-preview { display: grid; width: 112px; height: 112px; place-items: center; border: 1px solid rgb(48 48 48 / 14%); border-radius: 28px; background: linear-gradient(145deg, #91afe7, #5c83d2); box-shadow: 16px 20px 30px rgb(48 48 48 / 18%), inset -8px -10px 18px rgb(39 71 130 / 22%), inset 8px 8px 18px rgb(255 255 255 / 52%); transform: rotate(-12deg) skewY(-3deg); }
+      .object-preview span { color: rgb(255 255 255 / 86%); font-family: var(--font-family-display); font-size: 30px; font-weight: var(--font-weight-semibold); transform: rotate(12deg); }
+      .viewport-caption { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .property-group { margin-bottom: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+      .property-group__title { display: flex; min-height: var(--control-height-md); align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+      .property-group__body { display: grid; gap: var(--space-3); padding: var(--space-3); }
+      .field-label { display: block; margin-bottom: var(--space-1); color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+      .field { display: flex; width: 100%; height: var(--control-height-md); align-items: center; padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+      .field--error { border-color: var(--color-state-danger); background: var(--color-state-danger-surface); }
+      .field-note { margin: var(--space-1) 0 0; color: var(--color-state-danger); font-size: var(--font-size-xs); }
+      .field-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-2); }
+      .swatches { display: grid; grid-template-columns: repeat(4, minmax(100px, 1fr)); gap: var(--space-2); }
+      .swatch { overflow: hidden; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); }
+      .swatch__color { height: 38px; border-bottom: var(--border-default); }
+      .swatch__label { padding: var(--space-2); font-size: var(--font-size-xs); }
+      .swatch__label strong, .swatch__label code { display: block; }
+      .swatch__label code { margin-top: 2px; color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: 10px; }
+      .token-board { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-top: var(--space-4); }
+      .card { padding: var(--space-4); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-base); box-shadow: var(--shadow-panel); }
+      .card > :last-child { margin-bottom: 0; }
+      .button-states { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+      .semantic-row { display: grid; gap: var(--space-2); }
+      .state { padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); font-size: var(--font-size-sm); }
+      .state--info { color: var(--color-state-info); background: var(--color-state-info-surface); }
+      .state--success { color: var(--color-state-success); background: var(--color-state-success-surface); }
+      .state--warning { color: var(--color-state-warning); background: var(--color-state-warning-surface); }
+      .state--danger { color: var(--color-state-danger); background: var(--color-state-danger-surface); }
+      .type-sample { display: flex; align-items: baseline; justify-content: space-between; padding: var(--space-2) 0; border-bottom: 1px solid var(--color-surface-background); }
+      .type-sample:last-child { border: 0; }
+      .type-sample span:last-child { color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: var(--font-size-xs); }
+      .glass-card { padding: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: rgb(227 227 227 / 76%); color: var(--color-text-primary); backdrop-filter: blur(8px); }
+      .tooltip { position: relative; display: inline-flex; z-index: var(--z-tooltip); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: #303030; color: #f2f2f2; box-shadow: var(--shadow-popover); font-size: var(--font-size-xs); }
+      .timeline { margin-top: var(--space-4); padding: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-base); }
+      .timeline-ruler { display: grid; grid-template-columns: repeat(9, 1fr); margin-top: var(--space-3); padding-top: var(--space-2); border-top: 1px solid var(--color-stroke); color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: 10px; }
+      .track { position: relative; height: 24px; margin-top: var(--space-2); border-radius: var(--radius-xs); background: var(--color-surface-background); }
+      .track::before { position: absolute; top: 11px; right: 6%; left: 8%; height: 2px; background: var(--color-primary-accent-strong); content: ""; }
+      .key { position: absolute; top: 7px; width: 9px; height: 9px; border: 1px solid var(--color-primary-accent-strong); background: var(--color-primary-accent); transform: rotate(45deg); }
+      .key:nth-child(1) { left: 8%; } .key:nth-child(2) { left: 34%; } .key:nth-child(3) { left: 61%; } .key:nth-child(4) { left: 91%; }
+      .footer-note { margin-top: var(--space-4); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      @media (max-width: 980px) { .page { padding: var(--space-4); } .workarea { grid-template-columns: 210px minmax(250px, 1fr) 260px; } .swatches { grid-template-columns: repeat(2, 1fr); } }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div><p class="eyebrow">TRIAD-3D · UI foundation</p><h1>Проверка дизайн-токенов</h1></div>
+        <p class="caption">Компактный desktop · светлая тема · статический макет</p>
+      </header>
+
+      <section class="workspace" aria-label="Пример рабочего пространства редактора">
+        <div class="topbar">
+          <div class="brand"><span class="brand-mark" aria-hidden="true">T</span><span>TRIAD-3D</span><span class="topbar-label">· Новый проект</span></div>
+          <div class="toolbar-group" aria-label="Команды проекта">
+            <button class="button icon-button" type="button" aria-label="Отменить" title="Отменить">↶</button>
+            <button class="button icon-button" type="button" aria-label="Повторить" title="Повторить">↷</button>
+            <span class="toolbar-separator" aria-hidden="true"></span>
+            <button class="button" type="button">Сохранить</button>
+            <button class="button button--primary" type="button">Экспорт</button>
+          </div>
+        </div>
+        <div class="workarea">
+          <aside class="dock dock--left" aria-label="Дерево объектов">
+            <div class="dock-heading"><h2>Объекты</h2><span class="muted">3 узла</span></div>
+            <input class="search" type="search" aria-label="Поиск объектов" placeholder="Найти объект…" />
+            <div class="tree" role="tree" aria-label="Иерархия сцены">
+              <div class="tree-item" role="treeitem" tabindex="0"><span class="tree-item__icon" aria-hidden="true">⌄</span><span class="tree-item__icon" aria-hidden="true">▱</span><span>Модель</span></div>
+              <div class="tree-item tree-item--selected" role="treeitem" aria-selected="true" tabindex="0"><span class="tree-item__icon" aria-hidden="true">◈</span><span>Тор</span><span class="tree-item__meta">Выбран</span></div>
+              <div class="tree-item" role="treeitem" tabindex="0"><span class="tree-item__icon" aria-hidden="true">◉</span><span>Сцена</span></div>
+            </div>
+            <div class="section"><div class="dock-heading"><h2>Состояния дерева</h2></div>
+              <div class="tree-item tree-item--selected" aria-label="Выбранный элемент"><span class="tree-item__icon" aria-hidden="true">◈</span><span>Выбранный</span></div>
+              <div class="tree-item" aria-disabled="true"><span class="tree-item__icon" aria-hidden="true">▣</span><span>Заблокированный</span><span class="tree-item__meta">🔒</span></div>
+            </div>
+          </aside>
+
+          <section class="viewport" aria-label="Область просмотра">
+            <div class="viewport-stage"><div class="object-preview" aria-label="Декоративный пример выбранного объекта"><span>3D</span></div></div>
+            <div class="viewport-caption"><span>Перспектива · Материал: базовый</span><span>100%</span></div>
+          </section>
+
+          <aside class="dock dock--right" aria-label="Инспектор свойств">
+            <div class="dock-heading"><h2>Инспектор</h2><span class="muted">Тор</span></div>
+            <section class="property-group">
+              <div class="property-group__title"><span>Преобразование</span><span aria-hidden="true">⌃</span></div>
+              <div class="property-group__body">
+                <div><label class="field-label" for="position-x">Позиция</label><div class="field-row"><input class="field" id="position-x" value="0.00" aria-label="Позиция по X" /><input class="field" value="0.00" aria-label="Позиция по Y" /><input class="field" value="0.00" aria-label="Позиция по Z" /></div></div>
+                <div><label class="field-label" for="radius">Радиус</label><input class="field" id="radius" value="1.25" /></div>
+              </div>
+            </section>
+            <section class="property-group">
+              <div class="property-group__title"><span>Геометрия · пример ошибки</span><span aria-hidden="true">⌃</span></div>
+              <div class="property-group__body">
+                <div><label class="field-label" for="segments">Сегменты</label><input class="field field--error" id="segments" value="NaN" aria-invalid="true" aria-describedby="segments-error" /><p class="field-note" id="segments-error">Введите целое число от 3 до 256</p></div>
+                <button class="button" type="button" disabled>Пересчитать · недоступно</button>
+              </div>
+            </section>
+            <section class="property-group">
+              <div class="property-group__title"><span>Материал</span><span aria-hidden="true">⌄</span></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section class="token-board" aria-label="Примеры токенов и контролов">
+        <article class="card">
+          <h2>Основные поверхности и цвета</h2>
+          <div class="swatches">
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-surface-base)"></div><div class="swatch__label"><strong>Surface base</strong><code>#F2F2F2</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-surface-background)"></div><div class="swatch__label"><strong>Background</strong><code>#E5E5E5</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-primary-accent)"></div><div class="swatch__label"><strong>Accent</strong><code>#7497DC</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-primary-accent-strong)"></div><div class="swatch__label"><strong>Accent strong</strong><code>#5C83D2</code></div></div>
+          </div>
+          <div class="section"><h3>Полупрозрачная поверхность</h3><div class="glass-card">Текст сохраняет контраст на glass-поверхности. Прозрачность применяется к самой поверхности.</div></div>
+        </article>
+
+        <article class="card">
+          <h2>Типографика</h2>
+          <div class="type-sample"><span style="font-size:var(--font-size-display);font-weight:var(--font-weight-semibold)">Заголовок панели</span><span>22 px / 600</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-lg);font-weight:var(--font-weight-medium)">Название свойства</span><span>15 px / 500</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-md)">Подпись контрола</span><span>13 px / 400</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-xs);color:var(--color-text-secondary)">Вспомогательный текст</span><span>11 px / 400</span></div>
+          <p class="footer-note">Системный стек Windows; внешние шрифты не загружаются.</p>
+        </article>
+
+        <article class="card">
+          <h2>Кнопки и фокус клавиатуры</h2>
+          <div class="button-states">
+            <button class="button" type="button">Обычная</button>
+            <button class="button button--primary" type="button">Основная</button>
+            <button class="button button--selected" type="button" aria-pressed="true">Выбрана</button>
+            <button class="button" type="button" disabled>Недоступна</button>
+            <button class="button" type="button" aria-busy="true">Вычисление…</button>
+          </div>
+          <p class="footer-note">Перейдите клавишей Tab: focus-visible показан контрастным кольцом.</p>
+        </article>
+
+        <article class="card">
+          <h2>Семантические сообщения</h2>
+          <div class="semantic-row">
+            <div class="state state--info" role="status">Подсказка: изменение будет применено после подтверждения.</div>
+            <div class="state state--success" role="status">Готово: параметры сохранены в текущей сессии.</div>
+            <div class="state state--warning" role="status">Внимание: операция может занять больше времени.</div>
+            <div class="state state--danger" role="alert">Ошибка: геометрия не прошла проверку.</div>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Подсказка и плотность панели</h2>
+          <div class="row"><button class="button" type="button" aria-describedby="demo-tooltip">Курсор или фокус</button><span class="tooltip" id="demo-tooltip" role="tooltip">Переместить объект · G</span></div>
+          <p class="footer-note">Минимальная высота интерактивного контрола: 32 px. Интервалы основаны на шкале 4 / 8 / 12 / 16 / 24 / 32 px.</p>
+        </article>
+
+        <article class="card">
+          <h2>Стеклянная поверхность и радиусы</h2>
+          <div class="glass-card"><strong>Inspector section</strong><p style="margin:var(--space-2) 0 0;font-size:var(--font-size-sm)">Панель с локальной прозрачностью. Текст использует сплошной цвет и остаётся читаемым.</p></div>
+          <p class="footer-note">Радиусы от 3 до 12 px; разделители — утверждённый stroke.</p>
+        </article>
+      </section>
+
+      <section class="timeline" aria-label="Пример временной шкалы">
+        <div class="dock-heading"><h2>Таймлайн</h2><span class="muted">00:00 — 00:04 · ключевые кадры</span></div>
+        <div class="track" aria-label="Дорожка анимации"><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span></div>
+        <div class="timeline-ruler" aria-hidden="true"><span>00:00</span><span>00:00.5</span><span>00:01</span><span>00:01.5</span><span>00:02</span><span>00:02.5</span><span>00:03</span><span>00:03.5</span><span>00:04</span></div>
+      </section>
+      <p class="footer-note">Автономная демонстрация TASK-005. Все стили страницы используют токены из <code>src/ui/styles/tokens.css</code>.</p>
+    </main>
+  </body>
+</html>

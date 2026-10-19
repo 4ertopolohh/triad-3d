@@ -1,0 +1,4220 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+docs/
+  architecture.md
+  data-contracts.md
+  implementation-plan.md
+  requirements.json
+  requirements.md
+  risks.md
+  sources.md
+  tasks.json
+  testing.md
+  ui-spec.md
+  use-cases.md
+docs-people/
+  TRIAD-3D_Master_Project_Specification_v1.0.docx
+src/
+  domain/
+    create-project.ts
+    index.ts
+    types.ts
+    validate-project.ts
+  ui/
+    styles/
+      tokens.css
+tests/
+  domain/
+    project.test.ts
+  fixtures/
+    projects.ts
+  visual/
+    design-tokens.html
+AGENTS.md
+package.json
+README.md
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="docs/architecture.md">
+# Architecture
+
+Decision: client-only modular SPA, domain graph / commands are source of truth; renderer is derived.
+
+## Components
+
+- `domain`: schema, validators, commands, history
+- `renderer`: Three.js adapter + GPU fallback + resource disposal
+- `geometry`: WASM CSG, BVH, procedural modifiers, workers
+- `materials`: PBR schema and texture generators
+- `animation`: deterministic t→pose tracks, layer/event extension
+- `assets`: in-memory bytes and hashes, import/archive
+- `exporters`: templates for TSX/ZIP, GLB and video later
+- `ui`: Russian desktop panels and tool states
+
+## Domain flow
+
+UI event → typed command → validate → worker evaluate (optional) → commit patch once → renderer/cache sync → reversible history. Any error/cancel → rollback.
+
+## Heavy operation states
+
+IDLE → VALIDATING → RUNNING → APPLYING → SUCCEEDED; error/cancel terminal states never mutate Project. Block editing; allow progress/cancel.
+
+## ADRs
+
+### ADR-001 Веб SPA без обязательного backend (ACCEPTED)
+Why: Личный desktop инструмент; статический деплой; локальная работа с файлами.
+Decision: React/Vite + client-only computational core; возможность отдельной службы лишь при подтверждённой необходимости.
+Consequences: Ограничение браузерной памяти/кодеков; без серверной обработки и аккаунтов.
+Alternatives: Electron/desktop shell, Django backend.
+
+### ADR-002 Независимая доменная модель (ACCEPTED)
+Why: Сложные rollback, import/export и модификаторы не должны зависеть от React-компонентов.
+Decision: Версионируемый document graph, commands, derived cache; UI рендерится поверх ядра.
+Consequences: Понадобятся явные adapters и type contracts.
+Alternatives: Хранить Three.Object3D как единственный источник истины.
+
+### ADR-003 CSG через Manifold/WASM (спайк) (PROPOSED)
+Why: Нужны устойчивые операции solid mesh Boolean без разрушения исходных параметров.
+Decision: Manifold для manifold inputs, fallback/report и geometric validation.
+Consequences: Сложные non-manifold mesh требуют отдельной обработки.
+Alternatives: three-bvh-csg, собственный CSG.
+
+### ADR-004 Renderer abstraction (PROPOSED)
+Why: WebGPU приоритетен, но несовместимости материалов/постобработки возможны.
+Decision: RendererAdapter с WebGPU experimental path, проверяемым WebGL2 fallback, feature flags.
+Consequences: Нельзя считать все эффекты идентичными в обоих backend.
+Alternatives: Жёстко привязать всё к WebGPU или WebGL.
+
+### ADR-005 RAM-only project lifecycle (ACCEPTED)
+Why: Пользователь запретил восстановление после закрытия вкладки.
+Decision: Document/cache/history — memory; только явный файл на диске.
+Consequences: Потеря несохранённых данных при refresh/crash.
+Alternatives: IndexedDB autosave.
+
+### ADR-006 Отдельные нативный проект и export (ACCEPTED)
+Why: glTF не передаёт произвольную бизнес-логику/interactive runtime; React экспорт требует код.
+Decision: TRIAD3D ZIP + TSX runtime package + GLB variants; матрица потерь.
+Consequences: Два кодовых пути необходимо синхронно тестировать.
+Alternatives: Считать GLB полным проектом.
+
+### ADR-007 Безопасный синтаксический импорт (ACCEPTED)
+Why: Произвольный TSX/HTML не может быть универсально конвертирован и небезопасен при исполнении.
+Decision: AST allowlist, partial import report; unknown code never executed.
+Consequences: Сложный исходный код будет частично импортирован или отклонён.
+Alternatives: Eval во iframe/sandbox c широкими правами.
+
+### ADR-008 Редактируемый стек модификаторов (ACCEPTED)
+Why: Нужна поздняя настройка отверстий и симметричных массивов.
+Decision: Modifier params + deterministic evaluate pipeline + cache invalidation.
+Consequences: Нужно управлять зависимостями и вычислительной сложностью.
+Alternatives: Bake each change destructively.
+
+### ADR-009 Animation tracks + interactions (ACCEPTED)
+Why: Взаимодействие с курсором не должно сбрасывать цикл вращения.
+Decision: Base deterministic timeline, затем layered interaction offsets/constraints, priority and blend.
+Consequences: Dynamic collisions могут изменить цикл; нужны диагностика и проверка.
+Alternatives: Один imperative requestAnimationFrame handler на объект.
+
+### ADR-010 Один Model + одна Scene (ACCEPTED)
+Why: Для личного сценария несколько корневых моделей и сцен усложняют UX.
+Decision: Корни model + scene, nested geometry groups, linked instances.
+Consequences: Некоторые production сценарии потребуют явных копий/новых файлов.
+Alternatives: Несколько независимых проектов в одном документе.
+
+### ADR-011 Блокировать редактирование на тяжёлых jobs (ACCEPTED)
+Why: Пользователь хочет выделять ресурсы текущей операции.
+Decision: Computation Worker + job state + modal overlay + rollback/cancel.
+Consequences: Запрет параллельного редактирования; в progress UI остаётся responsive.
+Alternatives: Параллельные edit jobs.
+
+### ADR-012 Профили качества и честная деградация (ACCEPTED)
+Why: Высокое качество preview и экспорт для обычного сайта конфликтуют по бюджету.
+Decision: Draft/Quality/Final для редактора, Max/Balanced/Lite для экспорта.
+Consequences: Визуальная эквивалентность не обещается для всех эффектов.
+Alternatives: Единый quality toggle для всего.
+</file>
+
+<file path="docs/data-contracts.md">
+# Data and contracts
+
+## Project invariants
+
+- Exactly one Model and one Scene.
+- Node has unique stable ID and parent cannot form cycle.
+- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
+- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
+- Session history in RAM only, no autosave on tab close.
+
+## Entities
+
+- `Project`: schemaVersion/modelId/sceneId/assets/animations
+- `Model`: rootNodeId/revision/child hierarchy
+- `Scene`: camera/background/HDRI/light/instances
+- `Node`: id/type/transform/parent/material/modifiers
+- `Modifier`: id/type/order/args/enabled
+- `Material`: PBR fields + slots
+- `Asset`: hash/mediaType/path/colorspace
+- `AnimationClip`: duration/loop/trackRefs
+- `Track`: nodeId/propertyPath/keyframes
+- `InteractionRule NEXT`: typed event/condition/action
+
+## Messages
+
+- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
+- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
+- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
+- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
+- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
+- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
+
+## Data sample
+
+```json
+{
+  "formatVersion": "1.0.0",
+  "projectId": "project-unique-id",
+  "model": {"id": "model-1", "rootNodeId": "root-1", "revision": 4},
+  "scene": {"id": "scene-1", "modelInstances": []},
+  "nodes": [
+    {"id": "root-1", "parentId": null, "kind": "group",
+     "name": "Модель", "children": ["torus-1"],
+     "transform": {"position": [0,0,0], "rotationQuat": [0,0,0,1], "scale": [1,1,1]},
+     "visible": true, "locked": false, "materialSlots": [], "modifierIds": []}
+  ],
+  "modifiers": [], "materials": [], "animations": [], "assets": []
+}
+```
+
+## Error codes
+
+FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+</file>
+
+<file path="docs/implementation-plan.md">
+# Codex implementation plan
+
+Complete dependencies in order. Estimates are planning targets, not commitments. Each task must result in working code and targeted checks.
+
+## 0. Discovery/Spikes
+
+### TASK-001 — Согласовать конечные типы document graph (MVP)
+- Depends on: —
+- Do: Определить Project/Model/Scene/Node/Modifier/Material/Timeline/Asset; запретить циклические ссылки и положить fixtures в репозиторий.
+- Artifact: domain types + fixtures
+- Check: tsc + schema fixtures
+- Estimate: 2–4 ч
+
+### TASK-002 — Spike WebGPU/WebGL2 и PBR (MVP)
+- Depends on: TASK-001
+- Do: Рендер хрома, стекла, нормалей и HDRI в обеих ветках; зафиксировать отличия, стабильный baseline и fallback.
+- Artifact: renderer-decision.md + prototype
+- Check: snapshot двух режимов
+- Estimate: 2–4 ч
+
+### TASK-003 — Spike CSG+Manifold WASM (MVP)
+- Depends on: TASK-001
+- Do: Проверить тор с отверстиями, пересечение и отмену, стоимость вычислений и UV/normals на результатах.
+- Artifact: CSG feasibility report
+- Check: геометрия без degenerate mesh
+- Estimate: 2–4 ч
+
+### TASK-004 — Spike TSX export harness (MVP)
+- Depends on: TASK-001
+- Do: Создать минимальный тестовый генератор компонента и проверку Vite/TS без настоящего редактора.
+- Artifact: harness project
+- Check: npm run build
+- Estimate: 2–4 ч
+
+### TASK-005 — Собрать интерфейсные и технические токены (MVP)
+- Depends on: —
+- Do: Перенести цветовые и типографические token names из Triad Studio с учётом прав на шрифты; спроектировать compact desktop spacing.
+- Artifact: design tokens
+- Check: visual QA
+- Estimate: 2–4 ч
+
+## 1. Foundation
+
+### TASK-006 — Создать Vite React TypeScript приложение (MVP)
+- Depends on: TASK-001;TASK-005
+- Do: Создать структуру packages/app/core/render/geo/anim/export/ui; ESLint, TS strict, CI build commands.
+- Artifact: monorepo/workspace skeleton
+- Check: npm ci + build
+- Estimate: 2–4 ч
+
+### TASK-007 — Внедрить команды и транзакции (MVP)
+- Depends on: TASK-006
+- Do: Typed commands execute/invert, failure rollback, error code; avoid mutation outside dispatcher.
+- Artifact: command bus
+- Check: atomicity unit tests
+- Estimate: 2–4 ч
+
+### TASK-008 — Реализовать in-memory store (MVP)
+- Depends on: TASK-007
+- Do: State slices document/selection/tool/view/job/history; selectors and derived cache invalidation.
+- Artifact: editor state
+- Check: store unit tests
+- Estimate: 2–4 ч
+
+### TASK-009 — Создать сериализацию проекта schema v1 (MVP)
+- Depends on: TASK-001;TASK-008
+- Do: JSON schema manifest, IDs, asset refs, version/migrations API, roundtrip fixture.
+- Artifact: serializer/deserializer
+- Check: golden roundtrip
+- Estimate: 2–4 ч
+
+### TASK-010 — Добавить файл .triad3d и архиватор (MVP)
+- Depends on: TASK-009
+- Do: Zip manifest/document/assets, checksums, safe path validation, explicit save/import buttons; отдельный базовый GLTFLoader adapter для импорта GLB без вреда source scene.
+- Artifact: file adapter
+- Check: corrupt archive tests
+- Estimate: 2–4 ч
+
+### TASK-011 — Реализовать Undo/Redo delta history (MVP)
+- Depends on: TASK-007;TASK-008
+- Do: Command reversible diffs, coalescing drag edits, memory snapshots/checkpoints in RAM.
+- Artifact: history store
+- Check: 100 ops replay
+- Estimate: 2–4 ч
+
+### TASK-012 — Собрать базовый layout и topbar (MVP)
+- Depends on: TASK-006;TASK-005
+- Do: Resizable left/right docks, viewport center, bottom timeline, modes, error/toast, desktop-only notice.
+- Artifact: UI shell
+- Check: E2E layout smoke
+- Estimate: 2–4 ч
+
+### TASK-013 — Предупреждение об unsaved состоянии (MVP)
+- Depends on: TASK-010;TASK-012
+- Do: Dirty flag, user-activated beforeunload, explicit save, no browser persistent storage.
+- Artifact: leave-warning
+- Check: reload cannot restore
+- Estimate: 2–4 ч
+
+## 2. Geometry
+
+### TASK-014 — Создать Three renderer adapter (MVP)
+- Depends on: TASK-002;TASK-012
+- Do: Scene sync from domain graph, renderer lifecycle, context loss recovery, dispose resources.
+- Artifact: renderer adapter
+- Check: context restart
+- Estimate: 2–4 ч
+
+### TASK-015 — Orbit controls, gizmos и picking (MVP)
+- Depends on: TASK-014
+- Do: Orbit camera, fit/reset, world/local transform widgets, ray picking, snap.
+- Artifact: viewport interactions
+- Check: E2E select/move
+- Estimate: 2–4 ч
+
+### TASK-016 — Библиотека геометрических примитивов (MVP)
+- Depends on: TASK-001;TASK-014
+- Do: Parametric typed primitive factory, segmentation and bounds validation, lazy mesh evaluate.
+- Artifact: primitive factory
+- Check: unit geometry tests
+- Estimate: 2–4 ч
+
+### TASK-017 — Дерево модели и группировка (MVP)
+- Depends on: TASK-012;TASK-016
+- Do: Hierarchy DnD, selection multi, visibility/lock, protected roots, ID consistency.
+- Artifact: object tree
+- Check: cycle prevention tests
+- Estimate: 2–4 ч
+
+### TASK-018 — Инспектор transform/primitive (MVP)
+- Depends on: TASK-015;TASK-017
+- Do: Numeric fields, mixed values, validation, reset, undo coalescing.
+- Artifact: inspector
+- Check: UI unit tests
+- Estimate: 2–4 ч
+
+### TASK-019 — Интегрировать BVH и surface picking (MVP)
+- Depends on: TASK-015;TASK-016
+- Do: Accelerated raycast for triangle surfaces, hit data local coords, worker build for heavy models.
+- Artifact: surface query API
+- Check: raycast validation
+- Estimate: 2–4 ч
+
+### TASK-020 — Интегрировать CSG WASM worker (MVP)
+- Depends on: TASK-003;TASK-019
+- Do: Typed worker protocol, manifold input/output conversion, geometry checks, cancellation boundaries.
+- Artifact: CSG service
+- Check: boolean fixtures
+- Estimate: 2–4 ч
+
+### TASK-021 — Добавить modifier graph evaluator (MVP)
+- Depends on: TASK-020;TASK-009
+- Do: Ordered modifiers and cached intermediate geometry with dependency invalidation and error fallback.
+- Artifact: modifier service
+- Check: toggle reorder tests
+- Estimate: 2–4 ч
+
+### TASK-022 — Boolean UI отверстия/объединения (MVP)
+- Depends on: TASK-020;TASK-021
+- Do: Cutter selection, preview and apply, parameter edit, error explain.
+- Artifact: boolean tools
+- Check: torus hole E2E
+- Estimate: 2–4 ч
+
+### TASK-023 — Mirror and radial/linear arrays (MVP)
+- Depends on: TASK-021
+- Do: Deterministic repeats with seed/pivot/angle, optional instancing; editable params.
+- Artifact: array/mirror modifiers
+- Check: symmetry tests
+- Estimate: 2–4 ч
+
+### TASK-024 — Basic vertex/edge/face editing (MVP)
+- Depends on: TASK-016;TASK-019
+- Do: Subselection, translate/extrude, validity checks, undo semantic operations.
+- Artifact: mesh editor
+- Check: topology fixtures
+- Estimate: 2–4 ч
+
+### TASK-025 — Базовые bend/twist/taper/bevel (MVP)
+- Depends on: TASK-021
+- Do: Typed modifiers, stable normals, deterministic updates, performance thresholds.
+- Artifact: deform modifiers
+- Check: geometry tests
+- Estimate: 2–4 ч
+
+### TASK-026 — Surface material/paint brush (MVP)
+- Depends on: TASK-019;TASK-018
+- Do: Brush cursor preview, radius/intensity/fill, symmetry stencil, one stroke transaction.
+- Artifact: brush UI and engine
+- Check: brush E2E
+- Estimate: 2–4 ч
+
+### TASK-027 — Управление тяжёлыми jobs (MVP)
+- Depends on: TASK-020;TASK-012
+- Do: Modal UI lock, job queue one at time, progress messages, cancel/rollback/crash recovery.
+- Artifact: job controller
+- Check: cancel test
+- Estimate: 2–4 ч
+
+### TASK-028 — Валидация сетки и диагностические ошибки (MVP)
+- Depends on: TASK-020;TASK-024
+- Do: Manifold/degenerate checks, error code hints with precise cause and safe undo.
+- Artifact: mesh diagnostics
+- Check: invalid input tests
+- Estimate: 2–4 ч
+
+## 3. Materials
+
+### TASK-029 — Сервис материалных сущностей (MVP)
+- Depends on: TASK-001;TASK-014
+- Do: PBR typed schema, material slots, ID refs, fallback materials, GPU dispose.
+- Artifact: material service
+- Check: serialization unit
+- Estimate: 2–4 ч
+
+### TASK-030 — Реалистичные preset preview cards (MVP)
+- Depends on: TASK-029;TASK-012
+- Do: Metal/glass/stone/abstract preview sphere with standard HDRI; preset classification and filtering.
+- Artifact: preset library
+- Check: visual golden
+- Estimate: 2–4 ч
+
+### TASK-031 — Drag-drop и Inspector материалов (MVP)
+- Depends on: TASK-029;TASK-018
+- Do: Material assignment from catalog, basic+advanced sliders, shared/unique slots, undo.
+- Artifact: material UI
+- Check: E2E assignment
+- Estimate: 2–4 ч
+
+### TASK-032 — Ассеты: import images/HDR/EXR (MVP)
+- Depends on: TASK-010;TASK-029
+- Do: Asset ingest, MIME signature, size cap, URLs lifetime, color space, resource refcounts.
+- Artifact: asset adapter
+- Check: bad asset rejection
+- Estimate: 2–4 ч
+
+### TASK-033 — Текстурные mapping UV/box/triplanar (MVP)
+- Depends on: TASK-031;TASK-016
+- Do: UV handling, mapping selector, supported fallback and warning for missing UV.
+- Artifact: mapping service
+- Check: texture visual QA
+- Estimate: 2–4 ч
+
+### TASK-034 — Процедурный noise/scratches (MVP)
+- Depends on: TASK-029;TASK-032
+- Do: Seeded generators for grain/metal scratches/stone patterns; optional bake for export.
+- Artifact: procedural maps
+- Check: seed repeat test
+- Estimate: 2–4 ч
+
+### TASK-035 — Свет, HDRI и tone mapping (MVP)
+- Depends on: TASK-031;TASK-014
+- Do: Environment picker, light transform/intensity, exposure, metal/glass golden scene.
+- Artifact: lighting tools
+- Check: golden render compare
+- Estimate: 2–4 ч
+
+### TASK-036 — Draft/Quality/Final preview (MVP)
+- Depends on: TASK-002;TASK-035
+- Do: Feature capability matrix, render profile switch and graceful fallback.
+- Artifact: render profiles
+- Check: switch consistency
+- Estimate: 2–4 ч
+
+## 4. Animation
+
+### TASK-037 — Типизированная timeline domain model (MVP)
+- Depends on: TASK-001;TASK-008
+- Do: Tracks, channels, keys, easing, fps/time/duration, loop metadata.
+- Artifact: timeline types
+- Check: schema roundtrip
+- Estimate: 2–4 ч
+
+### TASK-038 — Animation evaluator t→pose (MVP)
+- Depends on: TASK-037
+- Do: Deterministic absolute time evaluation for transforms, pivot and interpolation.
+- Artifact: anim engine
+- Check: property/key tests
+- Estimate: 2–4 ч
+
+### TASK-039 — Таймлайн UI и tracks (MVP)
+- Depends on: TASK-037;TASK-012
+- Do: Playback, scrub, add keys, drag, ruler, loop region, collapse.
+- Artifact: timeline UI
+- Check: E2E keys
+- Estimate: 2–4 ч
+
+### TASK-040 — Две точки и keyframe запись (MVP)
+- Depends on: TASK-039;TASK-015
+- Do: Link gizmo edits to current frame, set start/end keys, separate camera input.
+- Artifact: record key UI
+- Check: two-point smoke
+- Estimate: 2–4 ч
+
+### TASK-041 — Bezier graph и slow playback (MVP)
+- Depends on: TASK-039;TASK-038
+- Do: Curve handles, easing presets, playback rate 0.1–2, timeline duration independence.
+- Artifact: curve editor
+- Check: curve shape tests
+- Estimate: 2–4 ч
+
+### TASK-042 — Presets spin/orbit/move/reveal (MVP)
+- Depends on: TASK-038;TASK-039
+- Do: Preset factory maps config to tracks; pivot rotation and parameter panel.
+- Artifact: animation presets
+- Check: preset golden
+- Estimate: 2–4 ч
+
+### TASK-043 — Loop continuity analyzer (MVP)
+- Depends on: TASK-038;TASK-041
+- Do: Compare first/last pose and velocity/tangent; fix or warn with exact differences.
+- Artifact: loop assistant
+- Check: t0 vs tT tests
+- Estimate: 2–4 ч
+
+## 5. MVP export
+
+### TASK-044 — Создать runtime TSX generator (MVP)
+- Depends on: TASK-004;TASK-031;TASK-038
+- Do: From domain graph generate TSX and typed Props, no editor dependency; controlled resources.
+- Artifact: TSX generator
+- Check: clean harness build
+- Estimate: 2–4 ч
+
+### TASK-045 — ZIP с ресурсами и README (MVP)
+- Depends on: TASK-044;TASK-032
+- Do: Package TSX/assets/npm deps/readme/licenses, relative paths and deterministic names.
+- Artifact: ZIP artifact
+- Check: unzip build smoke
+- Estimate: 2–4 ч
+
+### TASK-046 — Экспортный мастер и три профиля (MVP)
+- Depends on: TASK-045;TASK-036
+- Do: Max/Balanced/Lite profiles, preview, stats/compat warning, no source mutation.
+- Artifact: export dialog
+- Check: profile smoke
+- Estimate: 2–4 ч
+
+### TASK-047 — Генератор и инспектор props (MVP)
+- Depends on: TASK-044;TASK-046
+- Do: User selects exposable params size/color/speed etc, validation and default values.
+- Artifact: props UI
+- Check: prop controls exported
+- Estimate: 2–4 ч
+
+### TASK-048 — Проверка save/reopen/export сценария (MVP)
+- Depends on: TASK-010;TASK-047
+- Do: End-to-end ring+chrome+spin→save→reload/import→TSX in harness.
+- Artifact: E2E MVP acceptance
+- Check: complete flow
+- Estimate: 2–4 ч
+
+### TASK-049 — Static GitHub Pages build (MVP)
+- Depends on: TASK-006;TASK-048
+- Do: Base path, no server assumptions, asset URL handling, smoke deploy.
+- Artifact: Pages config
+- Check: deployed preview test
+- Estimate: 2–4 ч
+
+## 6. Extended
+
+### TASK-050 — Синхронизация model instances (NEXT)
+- Depends on: TASK-017;TASK-021
+- Do: Revision snapshots, explicit Sync, shared data and optional overrides.
+- Artifact: instance subsystem
+- Check: sync E2E
+- Estimate: 2–4 ч
+
+### TASK-051 — Layered interaction animation (NEXT)
+- Depends on: TASK-038;TASK-043
+- Do: Additive/override layers, priorities, cursor influence and smooth release.
+- Artifact: animation mixer
+- Check: spin+magnet test
+- Estimate: 2–4 ч
+
+### TASK-052 — Typed interaction rule DSL (NEXT)
+- Depends on: TASK-051
+- Do: Event/Condition/Action schemas and evaluator with safe predicates, no dynamic code.
+- Artifact: rules engine
+- Check: DSL tests
+- Estimate: 2–4 ч
+
+### TASK-053 — Rapier collision service (NEXT)
+- Depends on: TASK-051
+- Do: Dynamic/static/kinematic actors with documented limitations, mass/restitution, collision event mapping.
+- Artifact: physics adapter
+- Check: bounce fixtures
+- Estimate: 2–4 ч
+
+### TASK-054 — Code source AST importer (NEXT)
+- Depends on: TASK-001;TASK-010
+- Do: Allowlist TSX/JSX/HTML AST, diagnostic mapping, no eval and no network.
+- Artifact: source importer
+- Check: security regression
+- Estimate: 2–4 ч
+
+### TASK-055 — Процедурные stamps/детали (NEXT)
+- Depends on: TASK-023;TASK-026
+- Do: Brush stamp holes/spikes with non-destructive mirror arrays, seed and undo.
+- Artifact: advanced brushes
+- Check: golden complex model
+- Estimate: 2–4 ч
+
+### TASK-056 — GLB/GLTF exporter + loss report (NEXT)
+- Depends on: TASK-044;TASK-038
+- Do: GLTFExporter with supported clips/materials, report unsupported interactions and shaders.
+- Artifact: GLB export
+- Check: roundtrip test
+- Estimate: 2–4 ч
+
+### TASK-057 — Видео WebM и опциональный MP4 (NEXT)
+- Depends on: TASK-038;TASK-036
+- Do: Frame renderer fixed step, WebCodecs/MediaRecorder feature matrix, FFmpeg WASM fallback spike.
+- Artifact: video export
+- Check: duration/frame smoke
+- Estimate: 2–4 ч
+
+### TASK-058 — Библиотеки пресетов и packs (NEXT)
+- Depends on: TASK-010;TASK-029
+- Do: Import/export versioned packs and assets with zip safety/duplicate resolution.
+- Artifact: preset pack tools
+- Check: pack roundtrip
+- Estimate: 2–4 ч
+
+### TASK-059 — Final path tracing эксперимент (NEXT)
+- Depends on: TASK-002;TASK-036
+- Do: Evaluate path tracer capability on golden scenes, capture limitations and fallback.
+- Artifact: final render optional
+- Check: visual comparative QA
+- Estimate: 2–4 ч
+
+### TASK-060 — Texture & geometry optimization (NEXT)
+- Depends on: TASK-032;TASK-046
+- Do: Meshopt simplify/weld/compress and image conversion in-browser with measured quality losses.
+- Artifact: optimizer
+- Check: size stats + visual comparison
+- Estimate: 2–4 ч
+
+## 7. Release
+
+### TASK-061 — Прогнать визуальные golden сценарии (MVP)
+- Depends on: TASK-036;TASK-048
+- Do: Metal, glass, stone, HDRI at fixed camera/time; capture engine/browser/version.
+- Artifact: golden QA report
+- Check: approved screenshots
+- Estimate: 2–4 ч
+
+### TASK-062 — Проверить security/privacy and RAM-only (MVP)
+- Depends on: TASK-054;TASK-056
+- Do: Malformed assets, ZIP-slip, memory lifecycle, no persistence after refresh, beforeunload.
+- Artifact: security checklist
+- Check: negative E2E
+- Estimate: 2–4 ч
+
+### TASK-063 — Профилирование сложных сцен (MVP)
+- Depends on: TASK-027;TASK-060
+- Do: Measure geometry compute, render and memory on known Windows+GPU, record limitations without invented fps targets.
+- Artifact: performance baseline
+- Check: profile review
+- Estimate: 2–4 ч
+
+### TASK-064 — Документация и совместимость релиза (MVP)
+- Depends on: TASK-061;TASK-062;TASK-063
+- Do: Update README, supported formats, version matrix, operation caveats and exports install guide.
+- Artifact: release docs
+- Check: fresh-clone run
+- Estimate: 2–4 ч
+</file>
+
+<file path="docs/requirements.json">
+{
+  "functional": [
+    {
+      "id": "FR-001",
+      "group": "Проект и рабочая сессия",
+      "title": "Создать проект",
+      "stage": "MVP",
+      "behavior": "Команда «Новый проект» создаёт документ с одним корневым Model и одной Scene, системной камерой и нейтральным окружением.",
+      "fallback": "Если есть несохранённые изменения, показать предупреждение до сброса.",
+      "acceptance": "Корректно открывается пустой редактируемый проект."
+    },
+    {
+      "id": "FR-002",
+      "group": "Проект и рабочая сессия",
+      "title": "Два режима редактирования",
+      "stage": "MVP",
+      "behavior": "Переключение «Модель / Сцена» сохраняет selection и общую модель данных; режим Модель меняет геометрию, режим Сцена — окружение и экземпляры.",
+      "fallback": "При недоступном объекте показать состояние без потери изменений.",
+      "acceptance": "Переключение не дублирует геометрию и сохраняет изменения."
+    },
+    {
+      "id": "FR-003",
+      "group": "Проект и рабочая сессия",
+      "title": "Одно основание модели и одна сцена",
+      "stage": "MVP",
+      "behavior": "Каждый проект содержит одну основную редактируемую модель и ровно одну сцену с её экземплярами и вспомогательными объектами.",
+      "fallback": "Запретить создание второй независимой корневой модели в том же проекте; позволить составные подгруппы.",
+      "acceptance": "Дерево проекта соблюдает инвариант 1 Model / 1 Scene."
+    },
+    {
+      "id": "FR-004",
+      "group": "Проект и рабочая сессия",
+      "title": "Выбор и трансформации",
+      "stage": "MVP",
+      "behavior": "Click/raycast выбирает объект; gizmo задаёт перенос, вращение и масштаб численно или мышью в local/world координатах.",
+      "fallback": "Скрытые/заблокированные узлы не редактируются; неверные числа не применяются.",
+      "acceptance": "Численные и визуальные изменения совпадают."
+    },
+    {
+      "id": "FR-005",
+      "group": "Проект и рабочая сессия",
+      "title": "Иерархия и группировка",
+      "stage": "MVP",
+      "behavior": "Дерево поддерживает parent/child, группы, именование, раскрытие, перенос узлов и сохранение локальных преобразований.",
+      "fallback": "Запрещены циклические зависимости и удаление корня модели.",
+      "acceptance": "Перегруппировка не вызывает непреднамеренных скачков позиции."
+    },
+    {
+      "id": "FR-006",
+      "group": "Проект и рабочая сессия",
+      "title": "Множественное выделение",
+      "stage": "MVP",
+      "behavior": "Shift/Ctrl выделяют группу объектов, общие свойства применяются пакетной командой к выбранному набору.",
+      "fallback": "Несовместимое свойство отображается как смешанное; команда транзакционна.",
+      "acceptance": "Все целевые узлы получают изменение либо откат."
+    },
+    {
+      "id": "FR-007",
+      "group": "Проект и рабочая сессия",
+      "title": "Видимость и блокировка",
+      "stage": "MVP",
+      "behavior": "На узле доступны flags visible и locked, переключаемые из дерева и инспектора.",
+      "fallback": "Блокировка наследуется на потомков для редактирования.",
+      "acceptance": "Скрытые и заблокированные объекты не изменяются инструментами."
+    },
+    {
+      "id": "FR-008",
+      "group": "Проект и рабочая сессия",
+      "title": "Сессионное состояние",
+      "stage": "MVP",
+      "behavior": "В памяти вкладки живут документ, временные снимки, undo/redo и dirty-state; persistent browser storage выключен.",
+      "fallback": "Закрытие/refresh уничтожают несохранённое; перед unload включать best-effort предупреждение.",
+      "acceptance": "После обновления нет восстановленного проекта."
+    },
+    {
+      "id": "FR-009",
+      "group": "Проект и рабочая сессия",
+      "title": "Undo/Redo и версии сеанса",
+      "stage": "MVP",
+      "behavior": "Команды образуют обратимые транзакции; хранить дельты и ограничивать память умной компактификацией, при этом не вводить малый произвольный предел количества шагов.",
+      "fallback": "Отмена сбойной операции не меняет историю; контрольные точки только на время вкладки.",
+      "acceptance": "100 последовательных операций корректно отменяются и воспроизводятся."
+    },
+    {
+      "id": "FR-010",
+      "group": "Проект и рабочая сессия",
+      "title": "Операция «Сохранить проект»",
+      "stage": "MVP",
+      "behavior": "Явное сохранение производит самодостаточный TRIAD3D-архив с данными и ресурсами через файловый диалог/загрузку.",
+      "fallback": "Не писать файлы автоматически на диск; ошибки сериализации объяснять.",
+      "acceptance": "Перезапущенный редактор открывает сохранённый файл без сети."
+    },
+    {
+      "id": "FR-011",
+      "group": "Проект и рабочая сессия",
+      "title": "Загрузка проекта",
+      "stage": "MVP",
+      "behavior": "Системный диалог загружает поддерживаемые форматы проекта, проверяет manifest и мигрирует версии данных в памяти.",
+      "fallback": "Неподдерживаемую версию не открывать молча, показывать причину и сохранять текущий проект.",
+      "acceptance": "Round-trip модели, материалов, анимаций и ресурсов без потерь."
+    },
+    {
+      "id": "FR-012",
+      "group": "Геометрия и модификаторы",
+      "title": "Библиотека примитивов",
+      "stage": "MVP",
+      "behavior": "Добавление cube/sphere/torus/cylinder/cone/plane и базовых форм с управляемым размером и сегментами.",
+      "fallback": "Невалидные размеры и чрезмерное число сегментов предупреждаются.",
+      "acceptance": "Созданный примитив отображается и меняется параметрически."
+    },
+    {
+      "id": "FR-013",
+      "group": "Геометрия и модификаторы",
+      "title": "Редактирование граней и вершин",
+      "stage": "MVP",
+      "behavior": "Режимы vertex/edge/face поддерживают выделение и базовые перенос/масштаб/выдавливание с защитой корректности сетки.",
+      "fallback": "Не поддерживать произвольные действия, если они приводят к разрушению топологии; показывать причину.",
+      "acceptance": "Пользователь меняет локальную геометрию без кода."
+    },
+    {
+      "id": "FR-014",
+      "group": "Геометрия и модификаторы",
+      "title": "Булево вычитание отверстий",
+      "stage": "MVP",
+      "behavior": "Boolean subtract обрабатывает замкнутые тела через вычислительный сервис; исходный cutter и параметры остаются в стеке.",
+      "fallback": "При неманифолдных входах отклонять команду и сохранять исходную сетку.",
+      "acceptance": "Отверстия остаются настраиваемыми после сохранения."
+    },
+    {
+      "id": "FR-015",
+      "group": "Геометрия и модификаторы",
+      "title": "Булево объединение/пересечение",
+      "stage": "MVP",
+      "behavior": "Union/intersect объединяют и пересекают допустимые solid meshes как недеструктивную операцию.",
+      "fallback": "Предупреждать при пустом результате или непригодной сетке.",
+      "acceptance": "Результат воспроизводим при повторной оценке."
+    },
+    {
+      "id": "FR-016",
+      "group": "Геометрия и модификаторы",
+      "title": "Процедурные массивы",
+      "stage": "MVP",
+      "behavior": "Linear/radial array создаёт повторения по шагу, оси, углу, количеству и offset, сохраняя исходную деталь.",
+      "fallback": "Не создавать нулевые шаги или бесконечные цепочки зависимостей.",
+      "acceptance": "Изменение одной детали обновляет экземпляры."
+    },
+    {
+      "id": "FR-017",
+      "group": "Геометрия и модификаторы",
+      "title": "Симметрия и зеркалирование",
+      "stage": "MVP",
+      "behavior": "Mirror по одной/нескольким локальным плоскостям с контролем pivot и объединения шва.",
+      "fallback": "При невозможности сшивания выдавать предупреждение, не менять исходник.",
+      "acceptance": "Симметричные отверстия синхронно обновляются."
+    },
+    {
+      "id": "FR-018",
+      "group": "Геометрия и модификаторы",
+      "title": "Базовые деформации",
+      "stage": "MVP",
+      "behavior": "Bend/twist/taper/bevel по параметрам с предсказуемым порядком применения.",
+      "fallback": "Слишком агрессивная деформация не портит исходную сетку.",
+      "acceptance": "Настройка модификатора меняет вычисленный результат."
+    },
+    {
+      "id": "FR-019",
+      "group": "Геометрия и модификаторы",
+      "title": "Стек модификаторов",
+      "stage": "MVP",
+      "behavior": "У каждого mesh-узла ordered modifier stack с параметрами, enabled, version и action reorder/remove.",
+      "fallback": "Изменение не должно ломать связи последующих модификаторов; ошибка — rollback.",
+      "acceptance": "Отключение модификатора восстанавливает предыдущий результат."
+    },
+    {
+      "id": "FR-020",
+      "group": "Геометрия и модификаторы",
+      "title": "Переиспользуемые составные объекты",
+      "stage": "MVP",
+      "behavior": "Группу можно представить единым управляемым объектом, сохранив вложенное дерево и внутренние идентификаторы.",
+      "fallback": "Flatten не должен выполняться скрытно.",
+      "acceptance": "После раскрытия внутренние детали доступны без потерь."
+    },
+    {
+      "id": "FR-021",
+      "group": "Геометрия и модификаторы",
+      "title": "Кисти по поверхности",
+      "stage": "MVP",
+      "behavior": "Видимые кисти Paint/Material/Displace с radius, strength, shape, fill и symmetry используют hit-point по BVH.",
+      "fallback": "Объект без нужного UV/топологии получает подсказку о доступном режиме.",
+      "acceptance": "Превью под курсором совпадает с фактическим действием."
+    },
+    {
+      "id": "FR-022",
+      "group": "Геометрия и модификаторы",
+      "title": "Кисть процедурных деталей",
+      "stage": "NEXT",
+      "behavior": "Brush stamps добавляют отверстия, шипы, углубления и повторения вдоль поверхности и симметрии через редактируемые генераторы.",
+      "fallback": "Ограничения самопересечения и дорогого re-meshing фиксируются явно.",
+      "acceptance": "Параметры любого stamp редактируются после нанесения."
+    },
+    {
+      "id": "FR-023",
+      "group": "Геометрия и модификаторы",
+      "title": "Расширенные генераторы форм",
+      "stage": "NEXT",
+      "behavior": "Генераторы решёток, панелей, механических вырезов и художественных скульптур имеют seed и регулируемые параметры.",
+      "fallback": "Каждый генератор имеет границы применимости и инструмент предпросмотра.",
+      "acceptance": "Из одинаковых параметров и seed выходит одинаковая модель."
+    },
+    {
+      "id": "FR-024",
+      "group": "Геометрия и модификаторы",
+      "title": "Точные численные параметры",
+      "stage": "MVP",
+      "behavior": "Координаты и размеры хранятся в условных 3D единицах, UI поддерживает float-ввод и ограничение точности.",
+      "fallback": "NaN/Infinity отвергаются; масштаб с отрицательным детерминантом требует нормализации.",
+      "acceptance": "Повторный ввод числа обеспечивает стабильную геометрию."
+    },
+    {
+      "id": "FR-025",
+      "group": "Геометрия и модификаторы",
+      "title": "Контроль качества сетки",
+      "stage": "MVP",
+      "behavior": "Проверки замкнутости, нормалей, degenerate faces и self-intersection применяются там, где требуется операцией.",
+      "fallback": "При угрозе повреждения отменять только операцию и сохранять сообщение.",
+      "acceptance": "Ошибочная CSG не меняет текущий документ."
+    },
+    {
+      "id": "FR-026",
+      "group": "Геометрия и модификаторы",
+      "title": "Оптимизация геометрии",
+      "stage": "NEXT",
+      "behavior": "Доступны weld, simplify, instancing/batching и снижение детализации как отдельные копии для экспорта.",
+      "fallback": "Предупреждать о потере деталей; оригинал не модифицируется.",
+      "acceptance": "Сравнение размера до/после доступно пользователю."
+    },
+    {
+      "id": "FR-027",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "PBR-материалы",
+      "stage": "MVP",
+      "behavior": "Поддержка baseColor, metalness, roughness, emissive, transparency/transmission, ior, clearcoat, normal/bump и envIntensity согласно рендереру.",
+      "fallback": "Неподдерживаемые свойства в конкретном режиме помечаются.",
+      "acceptance": "Chrome, glass, stone выглядят различимо при заданном окружении."
+    },
+    {
+      "id": "FR-028",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Галерея материалов",
+      "stage": "MVP",
+      "behavior": "Категории metal/glass/plastic/stone/abstract с превью на эталонной сфере и поиском.",
+      "fallback": "Ресурсы отсутствующего пресета загружаются по запросу с прогрессом.",
+      "acceptance": "Пресет назначается выбранному объекту одним действием."
+    },
+    {
+      "id": "FR-029",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Drag & drop материала",
+      "stage": "MVP",
+      "behavior": "Перетаскивание из галереи на модель назначает materialId выделенному material slot/mesh.",
+      "fallback": "Drop на невалидную область не меняет материал.",
+      "acceptance": "Смена материала записывается в Undo."
+    },
+    {
+      "id": "FR-030",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Настройка свойств материала",
+      "stage": "MVP",
+      "behavior": "Слайдеры и точные поля с разумными ограничениями, grouped basic/advanced.",
+      "fallback": "Неверные значения подсвечиваются; reset property восстанавливает пресет.",
+      "acceptance": "Изменение preview и результата синхронизировано."
+    },
+    {
+      "id": "FR-031",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Загрузка изображений и карт",
+      "stage": "MVP",
+      "behavior": "Импорт PNG/JPEG/WebP/HDR/EXR по проверенным декодерам с assets manifest, hash, size, colorspace.",
+      "fallback": "Неизвестные MIME, битые и очень крупные файлы отклоняются.",
+      "acceptance": "Карта материала переносится при сохранении проекта."
+    },
+    {
+      "id": "FR-032",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "UV и проекции",
+      "stage": "MVP",
+      "behavior": "Для примитивов генерировать UV; для кистей применять planar/box/triplanar mapping там, где допустимо.",
+      "fallback": "При отсутствии UV предложить проекционный mapping или предупредить.",
+      "acceptance": "Текстура остаётся привязанной к поверхности после reopen."
+    },
+    {
+      "id": "FR-033",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Процедурные текстуры",
+      "stage": "MVP",
+      "behavior": "Noise, grain, scratches, brushed metal, marble, stone relief управляются seed/scale/intensity/direction и могут быть baking в карты.",
+      "fallback": "Параметры хранятся без зависимости от внешней сети.",
+      "acceptance": "Один preset воспроизводит одинаковую фактуру."
+    },
+    {
+      "id": "FR-034",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Рельеф и микродетали",
+      "stage": "MVP",
+      "behavior": "Normal/bump/roughness maps меняют внешний вид поверхности с настраиваемой силой.",
+      "fallback": "UI различает визуальный рельеф и реально изменённую геометрию.",
+      "acceptance": "Рельеф виден при вращении света/модели."
+    },
+    {
+      "id": "FR-035",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Свет и HDRI",
+      "stage": "MVP",
+      "behavior": "Одна Scene содержит directional/point/area-like lights где поддерживаются и environment с управляемыми интенсивностью/поворотом.",
+      "fallback": "Отсутствующие ресурсы не блокируют работу, включается нейтральный свет.",
+      "acceptance": "Переключение HDRI видимо меняет отражения хрома."
+    },
+    {
+      "id": "FR-036",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Камера и фон",
+      "stage": "MVP",
+      "behavior": "Orbit/pan/zoom, перспективная камера сцены и настройка background/toneMapping/exposure.",
+      "fallback": "Не допускать NaN камеры, clipping и потери объёма из видимости без Reset view.",
+      "acceptance": "Пользователь возвращает сцену командой Fit/Reset."
+    },
+    {
+      "id": "FR-037",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Три уровня предпросмотра",
+      "stage": "MVP",
+      "behavior": "Draft/Quality/Final управляют ресурсом и эффектами без изменения исходного проекта.",
+      "fallback": "При недоступном WebGPU использовать проверенный fallback и список ограничений.",
+      "acceptance": "Переключение качества не меняет модель/материалные параметры."
+    },
+    {
+      "id": "FR-038",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Фотореалистичный финальный рендер",
+      "stage": "NEXT",
+      "behavior": "Неинтерактивный режим улучшенной визуализации с возможностью накопления сэмплов; сохранять метаданные рендер-профиля.",
+      "fallback": "Если path tracing недоступен, объяснить причину и оставить raster final.",
+      "acceptance": "Качество увеличивается при длительном рендере, отмена доступна."
+    },
+    {
+      "id": "FR-039",
+      "group": "Материалы, освещение и ресурсы",
+      "title": "Пользовательские ресурсы/пакеты",
+      "stage": "NEXT",
+      "behavior": "Импорт и экспорт наборов текстур, материалов, HDRI и пресетов из архивов с версиями и лицензиями.",
+      "fallback": "Конфликты имён разрешать через ID, не перезаписывать молча.",
+      "acceptance": "Несколько пресетов загружаются одним архивом."
+    },
+    {
+      "id": "FR-040",
+      "group": "Анимация и временная шкала",
+      "title": "Ключевые кадры",
+      "stage": "MVP",
+      "behavior": "Для узла задаются keyframes position/rotation/scale и поддерживаемые свойства на времени t (секунды).",
+      "fallback": "Дубликаты на одном канале/времени имеют определённое правило replace.",
+      "acceptance": "Анимация соответствует расставленным ключам."
+    },
+    {
+      "id": "FR-041",
+      "group": "Анимация и временная шкала",
+      "title": "Редактирование start/end точек",
+      "stage": "MVP",
+      "behavior": "Перемещение объекта в двух временах создаёт/изменяет ключи, пользователь выбирает interpolation из пресетов.",
+      "fallback": "При движении камеры нельзя случайно создать ключ модели.",
+      "acceptance": "Предпросмотр проходит через начальную и конечную точки."
+    },
+    {
+      "id": "FR-042",
+      "group": "Анимация и временная шкала",
+      "title": "Таймлайн",
+      "stage": "MVP",
+      "behavior": "Панель воспроизведения и tracks отдельных объектов с drag keyframe, snapping, zoom, mute/solo и loop markers.",
+      "fallback": "При скрытой панели playback остаётся доступным из toolbar.",
+      "acceptance": "Пользователь управляет длительностью и ключами без кода."
+    },
+    {
+      "id": "FR-043",
+      "group": "Анимация и временная шкала",
+      "title": "Кривые ускорения",
+      "stage": "MVP",
+      "behavior": "Graph editor управляет easing/Bezier handles для ключевых пар, предусмотрены линейная и плавная интерполяции.",
+      "fallback": "Некорректные контрольные точки нормализовать или отклонять.",
+      "acceptance": "Изменённая кривая меняет скорость без смены конечной точки."
+    },
+    {
+      "id": "FR-044",
+      "group": "Анимация и временная шкала",
+      "title": "Петля без скачка",
+      "stage": "MVP",
+      "behavior": "Для periodic channels проверять равенство начального/конечного состояния и согласованность касательных/скоростей, предоставлять align-loop action.",
+      "fallback": "Интерактивные возмущения не гарантируют бесшовность сами по себе.",
+      "acceptance": "Автоматический тест loop comparison в t=0 и t=T проходит."
+    },
+    {
+      "id": "FR-045",
+      "group": "Анимация и временная шкала",
+      "title": "Замедленное воспроизведение",
+      "stage": "MVP",
+      "behavior": "Playback rate 0.1×...1×...2× влияет на preview, но не на экспортируемые key times.",
+      "fallback": "Не допускать отрицательной скорости без обратного playback.",
+      "acceptance": "При 0.25× время playback идёт в четыре раза медленнее."
+    },
+    {
+      "id": "FR-046",
+      "group": "Анимация и временная шкала",
+      "title": "Пресеты движения",
+      "stage": "MVP",
+      "behavior": "Spin, orbit, translate, bounce-like easing, oscillation и reveal доступны с параметрами и импортом в animation stack.",
+      "fallback": "Preset не перезаписывает существующие каналы без явного действия.",
+      "acceptance": "Одному объекту можно назначить пресет в 2 клика."
+    },
+    {
+      "id": "FR-047",
+      "group": "Анимация и временная шкала",
+      "title": "Групповая анимация",
+      "stage": "MVP",
+      "behavior": "Трансформации родительской группы учитываются вместе с локальной анимацией дочерних объектов.",
+      "fallback": "Циклические родительские связи запрещены.",
+      "acceptance": "Вращение группы и движение детали визуально суммируются."
+    },
+    {
+      "id": "FR-048",
+      "group": "Анимация и временная шкала",
+      "title": "Совмещение каналов",
+      "stage": "NEXT",
+      "behavior": "Animation graph смешивает независимые каналы и поддерживает priority, additive vs override и blend weights.",
+      "fallback": "Конфликтующие эффекты имеют предсказуемое разрешение.",
+      "acceptance": "Вращение и магнит работают вместе без скачка."
+    },
+    {
+      "id": "FR-049",
+      "group": "Анимация и временная шкала",
+      "title": "Курсорное притяжение",
+      "stage": "NEXT",
+      "behavior": "Proximity event локализует ближайшие объекты и добавляет временное displacement с falloff/release.",
+      "fallback": "Удаление курсора плавно возвращает объект к базовому движению.",
+      "acceptance": "Возврат не сбрасывает фазу базовой анимации."
+    },
+    {
+      "id": "FR-050",
+      "group": "Анимация и временная шкала",
+      "title": "Конструктор событий",
+      "stage": "NEXT",
+      "behavior": "Event→Condition→Action с предварительно типизированными блоками pointer/click/time/proximity и безопасными параметрами.",
+      "fallback": "Произвольный JS не выполняется в DSL; циклы и недопустимые зависимости диагностируются.",
+      "acceptance": "Созданное правило сериализуется и работает после TSX-экспорта."
+    },
+    {
+      "id": "FR-051",
+      "group": "Анимация и временная шкала",
+      "title": "Пресеты интерактивности",
+      "stage": "NEXT",
+      "behavior": "Magnet, click-toggle, hover-reveal, orbit-follow, pulse предлагаются с параметрами и совместимыми событиями.",
+      "fallback": "Конфликт c physics/other rules диагностируется.",
+      "acceptance": "Пресет видим в инспекторе и полностью редактируется."
+    },
+    {
+      "id": "FR-052",
+      "group": "Анимация и временная шкала",
+      "title": "Коллизии и отталкивание",
+      "stage": "NEXT",
+      "behavior": "Для выбранных объектов доступны colliders, mass, restitution, enable; физический слой рассчитывает контакты.",
+      "fallback": "Не обещать непересечения при всяком kinematic движении; нужные случаи решать отдельным constraint/avoidance.",
+      "acceptance": "Два поддерживаемых dynamic тела корректно отскакивают."
+    },
+    {
+      "id": "FR-053",
+      "group": "Анимация и временная шкала",
+      "title": "Стабильные точки вращения",
+      "stage": "MVP",
+      "behavior": "Pivot задаёт ось orbit/spin отдельно от геометрического центра, сохраняется в файле и TSX.",
+      "fallback": "Изменение pivot не должно разрушать текущую позицию без явного apply.",
+      "acceptance": "Фигура вращается вокруг выбранного pivot."
+    },
+    {
+      "id": "FR-054",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Экземпляры основной модели",
+      "stage": "NEXT",
+      "behavior": "В Scene добавляются linked instances одной Model; экземпляры используют общую геометрию и дефолтные материалы.",
+      "fallback": "Копии получают собственные overrides только при включении соответствующего режима.",
+      "acceptance": "Добавление 20 копий не клонирует все исходные данные."
+    },
+    {
+      "id": "FR-055",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Контроль распространения изменений",
+      "stage": "NEXT",
+      "behavior": "Linked update по умолчанию не применяет новый model revision к уже размещённым копиям, пока пользователь не подтвердит apply/sync.",
+      "fallback": "Показать какие copies устарели; preview перед apply.",
+      "acceptance": "Изменение исходной модели не меняет копии без подтверждения."
+    },
+    {
+      "id": "FR-056",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Overrides экземпляров",
+      "stage": "NEXT",
+      "behavior": "Per-instance material/animation overrides включаются явным действием, остальные свойства наследуются.",
+      "fallback": "Reset overrides возвращает общий материал и анимацию.",
+      "acceptance": "Изменение материала одной копии не затрагивает другие."
+    },
+    {
+      "id": "FR-057",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Панель объектов",
+      "stage": "MVP",
+      "behavior": "Слева дерево, поиск, фильтры, групповые операции, hide/lock, drag reorder.",
+      "fallback": "На больших деревьях использовать виртуализацию.",
+      "acceptance": "Выбор из дерева синхронен с viewport."
+    },
+    {
+      "id": "FR-058",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Инспектор свойств",
+      "stage": "MVP",
+      "behavior": "Справа контекстные basic группы и раскрываемый advanced со смешанными значениями для multi-select.",
+      "fallback": "Недоступное поле объясняет причину отключения.",
+      "acceptance": "Редактирование не теряет фокус без необходимости."
+    },
+    {
+      "id": "FR-059",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Контекстные подсказки",
+      "stage": "MVP",
+      "behavior": "На hover инструмент показывает назначение, значения и короткую демонстрацию сложного действия без передачи файлов на сервер.",
+      "fallback": "Анимация подсказки останавливается при prefers-reduced-motion.",
+      "acceptance": "Новичок может выполнить основной сценарий без документации."
+    },
+    {
+      "id": "FR-060",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Горячие клавиши",
+      "stage": "MVP",
+      "behavior": "Ctrl+Z/Y, Ctrl+S (экспорт файла), F fit, Delete, Esc, G/R/S при свободных полях; help shortcut palette.",
+      "fallback": "В поле ввода горячие клавиши не должны нарушать набор текста.",
+      "acceptance": "Клавиатура выполняет операции, соответствующие UI."
+    },
+    {
+      "id": "FR-061",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Только ПК",
+      "stage": "MVP",
+      "behavior": "Editor поддерживает desktop mouse+keyboard; на неподдерживаемых узких viewport выдаётся корректное сообщение, не сломанный UI.",
+      "fallback": "Не заявлять полную мобильную поддержку редактора.",
+      "acceptance": "При ширине менее порога выводится информативный экран."
+    },
+    {
+      "id": "FR-062",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Ошибки с восстановлением",
+      "stage": "MVP",
+      "behavior": "Сбой отдельного Worker/CSG/material compilation изолируется и не ломает текущий документ.",
+      "fallback": "Каждая операция возвращает понятный error code и rollback.",
+      "acceptance": "После ошибки возможна следующая корректная операция."
+    },
+    {
+      "id": "FR-063",
+      "group": "Сцена, экземпляры и пользовательский опыт",
+      "title": "Прогресс тяжёлой операции",
+      "stage": "MVP",
+      "behavior": "Долгий вычислительный job блокирует редактирование, показывает action, progress если доступен, cancel если поддерживается.",
+      "fallback": "При невозможности процентов выводить неопределённый прогресс.",
+      "acceptance": "После success/failure/cancel UI разблокирован."
+    },
+    {
+      "id": "FR-064",
+      "group": "Импорт и экспорт",
+      "title": "Импорт GLB/GLTF",
+      "stage": "MVP",
+      "behavior": "GLTFLoader поддерживает геометрию, материалы и совместимые clip-анимации; импорт создаёт адаптированный узел модели.",
+      "fallback": "Unsupported extensions/invalid assets маркировать и не портить исходный документ.",
+      "acceptance": "Тестовый GLB успешно добавлен в редактор."
+    },
+    {
+      "id": "FR-065",
+      "group": "Импорт и экспорт",
+      "title": "Импорт OBJ и других форматов",
+      "stage": "NEXT",
+      "behavior": "Через отдельные адаптеры импортировать поддерживаемые форматы с документированной потерей материалов/анимаций.",
+      "fallback": "Показывать матрицу совместимости перед применением.",
+      "acceptance": "OBJ читается с предсказуемыми ограничениями."
+    },
+    {
+      "id": "FR-066",
+      "group": "Импорт и экспорт",
+      "title": "Анализ TSX/JSX/HTML без исполнения",
+      "stage": "NEXT",
+      "behavior": "AST parser читает поддерживаемые декларативные конструкции Three.js/R3F и извлекает статическую сцену; режим dry-run показывает результат.",
+      "fallback": "Не выполнять arbitrary JS, eval, user imports/network; частичный импорт с подробным отчётом.",
+      "acceptance": "Неподдерживаемые элементы перечислены, доверие не требуется."
+    },
+    {
+      "id": "FR-067",
+      "group": "Импорт и экспорт",
+      "title": "Импорт частично поддерживаемого кода",
+      "stage": "NEXT",
+      "behavior": "Формировать supported/unsupported/warning записи с range, type, cause, skip/replace actions.",
+      "fallback": "Не утверждать 100% конверсию; сохранять оригинал только как вложение по явному согласию.",
+      "acceptance": "Пользователь видит что потеряно до принятия."
+    },
+    {
+      "id": "FR-068",
+      "group": "Импорт и экспорт",
+      "title": "Экспорт React TSX",
+      "stage": "MVP",
+      "behavior": "Генератор создаёт компонент, валидируемые props, ресурсы и runtime модуль анимации с нужными deps и примером использования.",
+      "fallback": "Не выдавать библиотечно зависимую сцену за self-contained один файл.",
+      "acceptance": "Сгенерированный компонент собирается в проверочном Vite React проекте."
+    },
+    {
+      "id": "FR-069",
+      "group": "Импорт и экспорт",
+      "title": "Экспорт одним копируемым фрагментом",
+      "stage": "MVP",
+      "behavior": "Для простого asset-free результата показать TSX-код в копируемом блоке, для ресурсов — ZIP и инструкции.",
+      "fallback": "Если ресурсов/вспомогательных файлов много, честно объяснить предел одного фрагмента.",
+      "acceptance": "Копируемый вариант собирается при указанных deps."
+    },
+    {
+      "id": "FR-070",
+      "group": "Импорт и экспорт",
+      "title": "Экспорт ZIP",
+      "stage": "MVP",
+      "behavior": "Пакет содержит TSX, assets, types, README, зависимости и лицензии ресурсов при наличии.",
+      "fallback": "Paths относительны; duplicate filenames disambiguate.",
+      "acceptance": "Распакованный пакет интегрируется в чистый React/Vite проект."
+    },
+    {
+      "id": "FR-071",
+      "group": "Импорт и экспорт",
+      "title": "Props-редактирование экспорта",
+      "stage": "MVP",
+      "behavior": "Выбранные автором параметры surface/display/time/interaction вынести в typed props с default values.",
+      "fallback": "Не экспортировать runtime-secrets и неподдерживаемые значения.",
+      "acceptance": "Props влияют на соответствующие свойства после сборки."
+    },
+    {
+      "id": "FR-072",
+      "group": "Импорт и экспорт",
+      "title": "Экспорт GLB/GLTF",
+      "stage": "NEXT",
+      "behavior": "Геометрия и совместимые glTF PBR материалы и clip-анимации экспортируются стандартным форматом с матрицей потерь.",
+      "fallback": "Rules, arbitrary shaders и interaction logic не сохраняются как runtime semantics.",
+      "acceptance": "GLB открывается независимым загрузчиком без ошибок."
+    },
+    {
+      "id": "FR-073",
+      "group": "Импорт и экспорт",
+      "title": "Профили качества",
+      "stage": "MVP",
+      "behavior": "Выбор Max/Balanced/Lite при экспорте создаёт отдельный артефакт, не изменяя редактируемый оригинал.",
+      "fallback": "Сильное ухудшение качества предупреждается с preview и сравнением статистики.",
+      "acceptance": "Оригинальный исходник сохраняется без изменений."
+    },
+    {
+      "id": "FR-074",
+      "group": "Импорт и экспорт",
+      "title": "Предупреждения о тяжёлых эффектах",
+      "stage": "MVP",
+      "behavior": "Дорогие эффекты и GPU требования выводятся в export preview; предлагаются compatible alternatives.",
+      "fallback": "Предупреждение не запрещает оригинал, если он технически реализуем.",
+      "acceptance": "Можно сознательно экспортировать Max без auto-downscale."
+    },
+    {
+      "id": "FR-075",
+      "group": "Импорт и экспорт",
+      "title": "Видеорендер",
+      "stage": "NEXT",
+      "behavior": "Поддержка WebM и условно MP4 при доступном browser encoder/WASM, фиксированный шаг по timeline для циклических кадров.",
+      "fallback": "Если codec/browser не поддерживаются, показать альтернативу/инструкцию.",
+      "acceptance": "Экспорт 10 секунд даёт корректную длительность и fps."
+    },
+    {
+      "id": "FR-076",
+      "group": "Импорт и экспорт",
+      "title": "Диагностика совместимости веба",
+      "stage": "NEXT",
+      "behavior": "Показывать количество draw calls, triangles, compressed/uncompressed texture memory estimates, browser features.",
+      "fallback": "Статистика является оценкой, не гарантирует fps.",
+      "acceptance": "Отчёт доступен до экспорта."
+    }
+  ],
+  "nonfunctional": [
+    {
+      "id": "NFR-001",
+      "title": "Данные только в RAM вкладки",
+      "stage": "MVP",
+      "behavior": "Не использовать localStorage, IndexedDB, ServiceWorker Cache API для хранения документа или истории; все persistence — только явный пользовательский file export.",
+      "check": "E2E очистка и reload без восстановления."
+    },
+    {
+      "id": "NFR-002",
+      "title": "Безопасная загрузка файлов",
+      "stage": "MVP",
+      "behavior": "Валидация MIME/extension/signature и фактического содержимого, ограничения размера/числа объектов/глубины, отказ от eval и исполнения сценариев в загруженных данных.",
+      "check": "Фазз/negative tests парсеров."
+    },
+    {
+      "id": "NFR-003",
+      "title": "Атомарность операций",
+      "stage": "MVP",
+      "behavior": "Все document mutations через транзакционные команды; ошибки CSG/worker приводят к rollback.",
+      "check": "Инвариант hash документа после отказа."
+    },
+    {
+      "id": "NFR-004",
+      "title": "Предсказуемость анимаций",
+      "stage": "MVP",
+      "behavior": "Одинаковое время и seed при отсутствии внешних воздействий дают одинаковую позу; interpolation/tangent проверяемы.",
+      "check": "Deterministic property tests."
+    },
+    {
+      "id": "NFR-005",
+      "title": "Ограничение памяти",
+      "stage": "MVP",
+      "behavior": "Предупреждение до исчерпания памяти, LRU вычисленной геометрии/texture cache, отсутствие систематических утечек при циклах open/close.",
+      "check": "Heap/GPU профилирование по тестовым сценам."
+    },
+    {
+      "id": "NFR-006",
+      "title": "Управляемые блокировки",
+      "stage": "MVP",
+      "behavior": "В тяжёлой операции редактирование заблокировано, но интерфейс показывает прогресс/Cancel, event loop не должен окончательно зависать.",
+      "check": "E2E job state transition."
+    },
+    {
+      "id": "NFR-007",
+      "title": "Визуальный эталон",
+      "stage": "MVP",
+      "behavior": "Golden scenes содержат metal/glass/stone, HDRI, shadows и фиксированные условия освещения.",
+      "check": "Порог визуального различия документируется для среды CI."
+    },
+    {
+      "id": "NFR-008",
+      "title": "Стабильный экспорт",
+      "stage": "MVP",
+      "behavior": "TSX-пакет должен собираться в чистом React/Vite проекте с указанными зависимостями; GLB roundtrip для поддерживаемых сцен.",
+      "check": "Build harness + smoke render."
+    },
+    {
+      "id": "NFR-009",
+      "title": "Прозрачная деградация",
+      "stage": "MVP",
+      "behavior": "WebGPU/WebGL2 feature detection, явный status, предупреждения о неподдерживаемых эффектах; отсутствие молчаливого пропуска critical features.",
+      "check": "Запуск с forced WebGL fallback."
+    },
+    {
+      "id": "NFR-010",
+      "title": "Доступность ПК",
+      "stage": "MVP",
+      "behavior": "Keyboard navigation панелей, focus visible, contrast, reduced motion для UX chrome, доступные подписи контролов.",
+      "check": "Аудит keyboard/automated a11y."
+    },
+    {
+      "id": "NFR-011",
+      "title": "Согласованность экспорта",
+      "stage": "MVP",
+      "behavior": "Отчёт о несовместимости материалов/свойств, side-by-side preview для профилей экспорта.",
+      "check": "Comparator тестовых случаев."
+    },
+    {
+      "id": "NFR-012",
+      "title": "Качество обслуживания",
+      "stage": "MVP",
+      "behavior": "Ошибки показывают понятный текст на русском и error code; пользователь может отменить и продолжить работу.",
+      "check": "Negative scenario tests."
+    },
+    {
+      "id": "NFR-013",
+      "title": "Локальная разработка",
+      "stage": "MVP",
+      "behavior": "Windows 11, Node/npm и браузер без секретных ключей; один npm install + npm run dev из корня.",
+      "check": "Fresh clone smoke test."
+    },
+    {
+      "id": "NFR-014",
+      "title": "Статический деплой",
+      "stage": "MVP",
+      "behavior": "Vite static build функционирует на GitHub Pages по корректному base URL; внешние файлы доступны при CORS и лицензии.",
+      "check": "Deploy preview smoke."
+    },
+    {
+      "id": "NFR-015",
+      "title": "Тесты по риску",
+      "stage": "MVP",
+      "behavior": "Types/build и критические unit+integration+E2E; avoid redundant whole suite after each small change.",
+      "check": "CI workflow task gates."
+    },
+    {
+      "id": "NFR-016",
+      "title": "Безопасные пресеты",
+      "stage": "NEXT",
+      "behavior": "Сторонние preset packs — данные, не скрипты. Проверка пути архива (zip slip), размера и external URLs.",
+      "check": "Malicious payload smoke."
+    },
+    {
+      "id": "NFR-017",
+      "title": "Целевые показатели без выдумок",
+      "stage": "MVP",
+      "behavior": "До профилирования не обещать конкретные FPS/число полигонов; фиксировать test hardware и сценарии, получать измеримые бюджеты после prototyping.",
+      "check": "Performance baseline report."
+    },
+    {
+      "id": "NFR-018",
+      "title": "Лицензии",
+      "stage": "MVP",
+      "behavior": "Отдельно документировать права на внешние HDRI/texture packs и шрифты Actay/AKONY. Не включать сторонние файлы без подтверждения лицензии.",
+      "check": "License audit release."
+    }
+  ]
+}
+</file>
+
+<file path="docs/requirements.md">
+# Requirements
+
+Stages: `MVP` required for first useful release; `NEXT` deferred.
+
+## Проект и рабочая сессия
+
+### FR-001 — Создать проект [MVP]
+- Behavior: Команда «Новый проект» создаёт документ с одним корневым Model и одной Scene, системной камерой и нейтральным окружением.
+- Failure: Если есть несохранённые изменения, показать предупреждение до сброса.
+- Acceptance: Корректно открывается пустой редактируемый проект.
+
+### FR-002 — Два режима редактирования [MVP]
+- Behavior: Переключение «Модель / Сцена» сохраняет selection и общую модель данных; режим Модель меняет геометрию, режим Сцена — окружение и экземпляры.
+- Failure: При недоступном объекте показать состояние без потери изменений.
+- Acceptance: Переключение не дублирует геометрию и сохраняет изменения.
+
+### FR-003 — Одно основание модели и одна сцена [MVP]
+- Behavior: Каждый проект содержит одну основную редактируемую модель и ровно одну сцену с её экземплярами и вспомогательными объектами.
+- Failure: Запретить создание второй независимой корневой модели в том же проекте; позволить составные подгруппы.
+- Acceptance: Дерево проекта соблюдает инвариант 1 Model / 1 Scene.
+
+### FR-004 — Выбор и трансформации [MVP]
+- Behavior: Click/raycast выбирает объект; gizmo задаёт перенос, вращение и масштаб численно или мышью в local/world координатах.
+- Failure: Скрытые/заблокированные узлы не редактируются; неверные числа не применяются.
+- Acceptance: Численные и визуальные изменения совпадают.
+
+### FR-005 — Иерархия и группировка [MVP]
+- Behavior: Дерево поддерживает parent/child, группы, именование, раскрытие, перенос узлов и сохранение локальных преобразований.
+- Failure: Запрещены циклические зависимости и удаление корня модели.
+- Acceptance: Перегруппировка не вызывает непреднамеренных скачков позиции.
+
+### FR-006 — Множественное выделение [MVP]
+- Behavior: Shift/Ctrl выделяют группу объектов, общие свойства применяются пакетной командой к выбранному набору.
+- Failure: Несовместимое свойство отображается как смешанное; команда транзакционна.
+- Acceptance: Все целевые узлы получают изменение либо откат.
+
+### FR-007 — Видимость и блокировка [MVP]
+- Behavior: На узле доступны flags visible и locked, переключаемые из дерева и инспектора.
+- Failure: Блокировка наследуется на потомков для редактирования.
+- Acceptance: Скрытые и заблокированные объекты не изменяются инструментами.
+
+### FR-008 — Сессионное состояние [MVP]
+- Behavior: В памяти вкладки живут документ, временные снимки, undo/redo и dirty-state; persistent browser storage выключен.
+- Failure: Закрытие/refresh уничтожают несохранённое; перед unload включать best-effort предупреждение.
+- Acceptance: После обновления нет восстановленного проекта.
+
+### FR-009 — Undo/Redo и версии сеанса [MVP]
+- Behavior: Команды образуют обратимые транзакции; хранить дельты и ограничивать память умной компактификацией, при этом не вводить малый произвольный предел количества шагов.
+- Failure: Отмена сбойной операции не меняет историю; контрольные точки только на время вкладки.
+- Acceptance: 100 последовательных операций корректно отменяются и воспроизводятся.
+
+### FR-010 — Операция «Сохранить проект» [MVP]
+- Behavior: Явное сохранение производит самодостаточный TRIAD3D-архив с данными и ресурсами через файловый диалог/загрузку.
+- Failure: Не писать файлы автоматически на диск; ошибки сериализации объяснять.
+- Acceptance: Перезапущенный редактор открывает сохранённый файл без сети.
+
+### FR-011 — Загрузка проекта [MVP]
+- Behavior: Системный диалог загружает поддерживаемые форматы проекта, проверяет manifest и мигрирует версии данных в памяти.
+- Failure: Неподдерживаемую версию не открывать молча, показывать причину и сохранять текущий проект.
+- Acceptance: Round-trip модели, материалов, анимаций и ресурсов без потерь.
+
+## Геометрия и модификаторы
+
+### FR-012 — Библиотека примитивов [MVP]
+- Behavior: Добавление cube/sphere/torus/cylinder/cone/plane и базовых форм с управляемым размером и сегментами.
+- Failure: Невалидные размеры и чрезмерное число сегментов предупреждаются.
+- Acceptance: Созданный примитив отображается и меняется параметрически.
+
+### FR-013 — Редактирование граней и вершин [MVP]
+- Behavior: Режимы vertex/edge/face поддерживают выделение и базовые перенос/масштаб/выдавливание с защитой корректности сетки.
+- Failure: Не поддерживать произвольные действия, если они приводят к разрушению топологии; показывать причину.
+- Acceptance: Пользователь меняет локальную геометрию без кода.
+
+### FR-014 — Булево вычитание отверстий [MVP]
+- Behavior: Boolean subtract обрабатывает замкнутые тела через вычислительный сервис; исходный cutter и параметры остаются в стеке.
+- Failure: При неманифолдных входах отклонять команду и сохранять исходную сетку.
+- Acceptance: Отверстия остаются настраиваемыми после сохранения.
+
+### FR-015 — Булево объединение/пересечение [MVP]
+- Behavior: Union/intersect объединяют и пересекают допустимые solid meshes как недеструктивную операцию.
+- Failure: Предупреждать при пустом результате или непригодной сетке.
+- Acceptance: Результат воспроизводим при повторной оценке.
+
+### FR-016 — Процедурные массивы [MVP]
+- Behavior: Linear/radial array создаёт повторения по шагу, оси, углу, количеству и offset, сохраняя исходную деталь.
+- Failure: Не создавать нулевые шаги или бесконечные цепочки зависимостей.
+- Acceptance: Изменение одной детали обновляет экземпляры.
+
+### FR-017 — Симметрия и зеркалирование [MVP]
+- Behavior: Mirror по одной/нескольким локальным плоскостям с контролем pivot и объединения шва.
+- Failure: При невозможности сшивания выдавать предупреждение, не менять исходник.
+- Acceptance: Симметричные отверстия синхронно обновляются.
+
+### FR-018 — Базовые деформации [MVP]
+- Behavior: Bend/twist/taper/bevel по параметрам с предсказуемым порядком применения.
+- Failure: Слишком агрессивная деформация не портит исходную сетку.
+- Acceptance: Настройка модификатора меняет вычисленный результат.
+
+### FR-019 — Стек модификаторов [MVP]
+- Behavior: У каждого mesh-узла ordered modifier stack с параметрами, enabled, version и action reorder/remove.
+- Failure: Изменение не должно ломать связи последующих модификаторов; ошибка — rollback.
+- Acceptance: Отключение модификатора восстанавливает предыдущий результат.
+
+### FR-020 — Переиспользуемые составные объекты [MVP]
+- Behavior: Группу можно представить единым управляемым объектом, сохранив вложенное дерево и внутренние идентификаторы.
+- Failure: Flatten не должен выполняться скрытно.
+- Acceptance: После раскрытия внутренние детали доступны без потерь.
+
+### FR-021 — Кисти по поверхности [MVP]
+- Behavior: Видимые кисти Paint/Material/Displace с radius, strength, shape, fill и symmetry используют hit-point по BVH.
+- Failure: Объект без нужного UV/топологии получает подсказку о доступном режиме.
+- Acceptance: Превью под курсором совпадает с фактическим действием.
+
+### FR-022 — Кисть процедурных деталей [NEXT]
+- Behavior: Brush stamps добавляют отверстия, шипы, углубления и повторения вдоль поверхности и симметрии через редактируемые генераторы.
+- Failure: Ограничения самопересечения и дорогого re-meshing фиксируются явно.
+- Acceptance: Параметры любого stamp редактируются после нанесения.
+
+### FR-023 — Расширенные генераторы форм [NEXT]
+- Behavior: Генераторы решёток, панелей, механических вырезов и художественных скульптур имеют seed и регулируемые параметры.
+- Failure: Каждый генератор имеет границы применимости и инструмент предпросмотра.
+- Acceptance: Из одинаковых параметров и seed выходит одинаковая модель.
+
+### FR-024 — Точные численные параметры [MVP]
+- Behavior: Координаты и размеры хранятся в условных 3D единицах, UI поддерживает float-ввод и ограничение точности.
+- Failure: NaN/Infinity отвергаются; масштаб с отрицательным детерминантом требует нормализации.
+- Acceptance: Повторный ввод числа обеспечивает стабильную геометрию.
+
+### FR-025 — Контроль качества сетки [MVP]
+- Behavior: Проверки замкнутости, нормалей, degenerate faces и self-intersection применяются там, где требуется операцией.
+- Failure: При угрозе повреждения отменять только операцию и сохранять сообщение.
+- Acceptance: Ошибочная CSG не меняет текущий документ.
+
+### FR-026 — Оптимизация геометрии [NEXT]
+- Behavior: Доступны weld, simplify, instancing/batching и снижение детализации как отдельные копии для экспорта.
+- Failure: Предупреждать о потере деталей; оригинал не модифицируется.
+- Acceptance: Сравнение размера до/после доступно пользователю.
+
+## Материалы, освещение и ресурсы
+
+### FR-027 — PBR-материалы [MVP]
+- Behavior: Поддержка baseColor, metalness, roughness, emissive, transparency/transmission, ior, clearcoat, normal/bump и envIntensity согласно рендереру.
+- Failure: Неподдерживаемые свойства в конкретном режиме помечаются.
+- Acceptance: Chrome, glass, stone выглядят различимо при заданном окружении.
+
+### FR-028 — Галерея материалов [MVP]
+- Behavior: Категории metal/glass/plastic/stone/abstract с превью на эталонной сфере и поиском.
+- Failure: Ресурсы отсутствующего пресета загружаются по запросу с прогрессом.
+- Acceptance: Пресет назначается выбранному объекту одним действием.
+
+### FR-029 — Drag & drop материала [MVP]
+- Behavior: Перетаскивание из галереи на модель назначает materialId выделенному material slot/mesh.
+- Failure: Drop на невалидную область не меняет материал.
+- Acceptance: Смена материала записывается в Undo.
+
+### FR-030 — Настройка свойств материала [MVP]
+- Behavior: Слайдеры и точные поля с разумными ограничениями, grouped basic/advanced.
+- Failure: Неверные значения подсвечиваются; reset property восстанавливает пресет.
+- Acceptance: Изменение preview и результата синхронизировано.
+
+### FR-031 — Загрузка изображений и карт [MVP]
+- Behavior: Импорт PNG/JPEG/WebP/HDR/EXR по проверенным декодерам с assets manifest, hash, size, colorspace.
+- Failure: Неизвестные MIME, битые и очень крупные файлы отклоняются.
+- Acceptance: Карта материала переносится при сохранении проекта.
+
+### FR-032 — UV и проекции [MVP]
+- Behavior: Для примитивов генерировать UV; для кистей применять planar/box/triplanar mapping там, где допустимо.
+- Failure: При отсутствии UV предложить проекционный mapping или предупредить.
+- Acceptance: Текстура остаётся привязанной к поверхности после reopen.
+
+### FR-033 — Процедурные текстуры [MVP]
+- Behavior: Noise, grain, scratches, brushed metal, marble, stone relief управляются seed/scale/intensity/direction и могут быть baking в карты.
+- Failure: Параметры хранятся без зависимости от внешней сети.
+- Acceptance: Один preset воспроизводит одинаковую фактуру.
+
+### FR-034 — Рельеф и микродетали [MVP]
+- Behavior: Normal/bump/roughness maps меняют внешний вид поверхности с настраиваемой силой.
+- Failure: UI различает визуальный рельеф и реально изменённую геометрию.
+- Acceptance: Рельеф виден при вращении света/модели.
+
+### FR-035 — Свет и HDRI [MVP]
+- Behavior: Одна Scene содержит directional/point/area-like lights где поддерживаются и environment с управляемыми интенсивностью/поворотом.
+- Failure: Отсутствующие ресурсы не блокируют работу, включается нейтральный свет.
+- Acceptance: Переключение HDRI видимо меняет отражения хрома.
+
+### FR-036 — Камера и фон [MVP]
+- Behavior: Orbit/pan/zoom, перспективная камера сцены и настройка background/toneMapping/exposure.
+- Failure: Не допускать NaN камеры, clipping и потери объёма из видимости без Reset view.
+- Acceptance: Пользователь возвращает сцену командой Fit/Reset.
+
+### FR-037 — Три уровня предпросмотра [MVP]
+- Behavior: Draft/Quality/Final управляют ресурсом и эффектами без изменения исходного проекта.
+- Failure: При недоступном WebGPU использовать проверенный fallback и список ограничений.
+- Acceptance: Переключение качества не меняет модель/материалные параметры.
+
+### FR-038 — Фотореалистичный финальный рендер [NEXT]
+- Behavior: Неинтерактивный режим улучшенной визуализации с возможностью накопления сэмплов; сохранять метаданные рендер-профиля.
+- Failure: Если path tracing недоступен, объяснить причину и оставить raster final.
+- Acceptance: Качество увеличивается при длительном рендере, отмена доступна.
+
+### FR-039 — Пользовательские ресурсы/пакеты [NEXT]
+- Behavior: Импорт и экспорт наборов текстур, материалов, HDRI и пресетов из архивов с версиями и лицензиями.
+- Failure: Конфликты имён разрешать через ID, не перезаписывать молча.
+- Acceptance: Несколько пресетов загружаются одним архивом.
+
+## Анимация и временная шкала
+
+### FR-040 — Ключевые кадры [MVP]
+- Behavior: Для узла задаются keyframes position/rotation/scale и поддерживаемые свойства на времени t (секунды).
+- Failure: Дубликаты на одном канале/времени имеют определённое правило replace.
+- Acceptance: Анимация соответствует расставленным ключам.
+
+### FR-041 — Редактирование start/end точек [MVP]
+- Behavior: Перемещение объекта в двух временах создаёт/изменяет ключи, пользователь выбирает interpolation из пресетов.
+- Failure: При движении камеры нельзя случайно создать ключ модели.
+- Acceptance: Предпросмотр проходит через начальную и конечную точки.
+
+### FR-042 — Таймлайн [MVP]
+- Behavior: Панель воспроизведения и tracks отдельных объектов с drag keyframe, snapping, zoom, mute/solo и loop markers.
+- Failure: При скрытой панели playback остаётся доступным из toolbar.
+- Acceptance: Пользователь управляет длительностью и ключами без кода.
+
+### FR-043 — Кривые ускорения [MVP]
+- Behavior: Graph editor управляет easing/Bezier handles для ключевых пар, предусмотрены линейная и плавная интерполяции.
+- Failure: Некорректные контрольные точки нормализовать или отклонять.
+- Acceptance: Изменённая кривая меняет скорость без смены конечной точки.
+
+### FR-044 — Петля без скачка [MVP]
+- Behavior: Для periodic channels проверять равенство начального/конечного состояния и согласованность касательных/скоростей, предоставлять align-loop action.
+- Failure: Интерактивные возмущения не гарантируют бесшовность сами по себе.
+- Acceptance: Автоматический тест loop comparison в t=0 и t=T проходит.
+
+### FR-045 — Замедленное воспроизведение [MVP]
+- Behavior: Playback rate 0.1×...1×...2× влияет на preview, но не на экспортируемые key times.
+- Failure: Не допускать отрицательной скорости без обратного playback.
+- Acceptance: При 0.25× время playback идёт в четыре раза медленнее.
+
+### FR-046 — Пресеты движения [MVP]
+- Behavior: Spin, orbit, translate, bounce-like easing, oscillation и reveal доступны с параметрами и импортом в animation stack.
+- Failure: Preset не перезаписывает существующие каналы без явного действия.
+- Acceptance: Одному объекту можно назначить пресет в 2 клика.
+
+### FR-047 — Групповая анимация [MVP]
+- Behavior: Трансформации родительской группы учитываются вместе с локальной анимацией дочерних объектов.
+- Failure: Циклические родительские связи запрещены.
+- Acceptance: Вращение группы и движение детали визуально суммируются.
+
+### FR-048 — Совмещение каналов [NEXT]
+- Behavior: Animation graph смешивает независимые каналы и поддерживает priority, additive vs override и blend weights.
+- Failure: Конфликтующие эффекты имеют предсказуемое разрешение.
+- Acceptance: Вращение и магнит работают вместе без скачка.
+
+### FR-049 — Курсорное притяжение [NEXT]
+- Behavior: Proximity event локализует ближайшие объекты и добавляет временное displacement с falloff/release.
+- Failure: Удаление курсора плавно возвращает объект к базовому движению.
+- Acceptance: Возврат не сбрасывает фазу базовой анимации.
+
+### FR-050 — Конструктор событий [NEXT]
+- Behavior: Event→Condition→Action с предварительно типизированными блоками pointer/click/time/proximity и безопасными параметрами.
+- Failure: Произвольный JS не выполняется в DSL; циклы и недопустимые зависимости диагностируются.
+- Acceptance: Созданное правило сериализуется и работает после TSX-экспорта.
+
+### FR-051 — Пресеты интерактивности [NEXT]
+- Behavior: Magnet, click-toggle, hover-reveal, orbit-follow, pulse предлагаются с параметрами и совместимыми событиями.
+- Failure: Конфликт c physics/other rules диагностируется.
+- Acceptance: Пресет видим в инспекторе и полностью редактируется.
+
+### FR-052 — Коллизии и отталкивание [NEXT]
+- Behavior: Для выбранных объектов доступны colliders, mass, restitution, enable; физический слой рассчитывает контакты.
+- Failure: Не обещать непересечения при всяком kinematic движении; нужные случаи решать отдельным constraint/avoidance.
+- Acceptance: Два поддерживаемых dynamic тела корректно отскакивают.
+
+### FR-053 — Стабильные точки вращения [MVP]
+- Behavior: Pivot задаёт ось orbit/spin отдельно от геометрического центра, сохраняется в файле и TSX.
+- Failure: Изменение pivot не должно разрушать текущую позицию без явного apply.
+- Acceptance: Фигура вращается вокруг выбранного pivot.
+
+## Сцена, экземпляры и пользовательский опыт
+
+### FR-054 — Экземпляры основной модели [NEXT]
+- Behavior: В Scene добавляются linked instances одной Model; экземпляры используют общую геометрию и дефолтные материалы.
+- Failure: Копии получают собственные overrides только при включении соответствующего режима.
+- Acceptance: Добавление 20 копий не клонирует все исходные данные.
+
+### FR-055 — Контроль распространения изменений [NEXT]
+- Behavior: Linked update по умолчанию не применяет новый model revision к уже размещённым копиям, пока пользователь не подтвердит apply/sync.
+- Failure: Показать какие copies устарели; preview перед apply.
+- Acceptance: Изменение исходной модели не меняет копии без подтверждения.
+
+### FR-056 — Overrides экземпляров [NEXT]
+- Behavior: Per-instance material/animation overrides включаются явным действием, остальные свойства наследуются.
+- Failure: Reset overrides возвращает общий материал и анимацию.
+- Acceptance: Изменение материала одной копии не затрагивает другие.
+
+### FR-057 — Панель объектов [MVP]
+- Behavior: Слева дерево, поиск, фильтры, групповые операции, hide/lock, drag reorder.
+- Failure: На больших деревьях использовать виртуализацию.
+- Acceptance: Выбор из дерева синхронен с viewport.
+
+### FR-058 — Инспектор свойств [MVP]
+- Behavior: Справа контекстные basic группы и раскрываемый advanced со смешанными значениями для multi-select.
+- Failure: Недоступное поле объясняет причину отключения.
+- Acceptance: Редактирование не теряет фокус без необходимости.
+
+### FR-059 — Контекстные подсказки [MVP]
+- Behavior: На hover инструмент показывает назначение, значения и короткую демонстрацию сложного действия без передачи файлов на сервер.
+- Failure: Анимация подсказки останавливается при prefers-reduced-motion.
+- Acceptance: Новичок может выполнить основной сценарий без документации.
+
+### FR-060 — Горячие клавиши [MVP]
+- Behavior: Ctrl+Z/Y, Ctrl+S (экспорт файла), F fit, Delete, Esc, G/R/S при свободных полях; help shortcut palette.
+- Failure: В поле ввода горячие клавиши не должны нарушать набор текста.
+- Acceptance: Клавиатура выполняет операции, соответствующие UI.
+
+### FR-061 — Только ПК [MVP]
+- Behavior: Editor поддерживает desktop mouse+keyboard; на неподдерживаемых узких viewport выдаётся корректное сообщение, не сломанный UI.
+- Failure: Не заявлять полную мобильную поддержку редактора.
+- Acceptance: При ширине менее порога выводится информативный экран.
+
+### FR-062 — Ошибки с восстановлением [MVP]
+- Behavior: Сбой отдельного Worker/CSG/material compilation изолируется и не ломает текущий документ.
+- Failure: Каждая операция возвращает понятный error code и rollback.
+- Acceptance: После ошибки возможна следующая корректная операция.
+
+### FR-063 — Прогресс тяжёлой операции [MVP]
+- Behavior: Долгий вычислительный job блокирует редактирование, показывает action, progress если доступен, cancel если поддерживается.
+- Failure: При невозможности процентов выводить неопределённый прогресс.
+- Acceptance: После success/failure/cancel UI разблокирован.
+
+## Импорт и экспорт
+
+### FR-064 — Импорт GLB/GLTF [MVP]
+- Behavior: GLTFLoader поддерживает геометрию, материалы и совместимые clip-анимации; импорт создаёт адаптированный узел модели.
+- Failure: Unsupported extensions/invalid assets маркировать и не портить исходный документ.
+- Acceptance: Тестовый GLB успешно добавлен в редактор.
+
+### FR-065 — Импорт OBJ и других форматов [NEXT]
+- Behavior: Через отдельные адаптеры импортировать поддерживаемые форматы с документированной потерей материалов/анимаций.
+- Failure: Показывать матрицу совместимости перед применением.
+- Acceptance: OBJ читается с предсказуемыми ограничениями.
+
+### FR-066 — Анализ TSX/JSX/HTML без исполнения [NEXT]
+- Behavior: AST parser читает поддерживаемые декларативные конструкции Three.js/R3F и извлекает статическую сцену; режим dry-run показывает результат.
+- Failure: Не выполнять arbitrary JS, eval, user imports/network; частичный импорт с подробным отчётом.
+- Acceptance: Неподдерживаемые элементы перечислены, доверие не требуется.
+
+### FR-067 — Импорт частично поддерживаемого кода [NEXT]
+- Behavior: Формировать supported/unsupported/warning записи с range, type, cause, skip/replace actions.
+- Failure: Не утверждать 100% конверсию; сохранять оригинал только как вложение по явному согласию.
+- Acceptance: Пользователь видит что потеряно до принятия.
+
+### FR-068 — Экспорт React TSX [MVP]
+- Behavior: Генератор создаёт компонент, валидируемые props, ресурсы и runtime модуль анимации с нужными deps и примером использования.
+- Failure: Не выдавать библиотечно зависимую сцену за self-contained один файл.
+- Acceptance: Сгенерированный компонент собирается в проверочном Vite React проекте.
+
+### FR-069 — Экспорт одним копируемым фрагментом [MVP]
+- Behavior: Для простого asset-free результата показать TSX-код в копируемом блоке, для ресурсов — ZIP и инструкции.
+- Failure: Если ресурсов/вспомогательных файлов много, честно объяснить предел одного фрагмента.
+- Acceptance: Копируемый вариант собирается при указанных deps.
+
+### FR-070 — Экспорт ZIP [MVP]
+- Behavior: Пакет содержит TSX, assets, types, README, зависимости и лицензии ресурсов при наличии.
+- Failure: Paths относительны; duplicate filenames disambiguate.
+- Acceptance: Распакованный пакет интегрируется в чистый React/Vite проект.
+
+### FR-071 — Props-редактирование экспорта [MVP]
+- Behavior: Выбранные автором параметры surface/display/time/interaction вынести в typed props с default values.
+- Failure: Не экспортировать runtime-secrets и неподдерживаемые значения.
+- Acceptance: Props влияют на соответствующие свойства после сборки.
+
+### FR-072 — Экспорт GLB/GLTF [NEXT]
+- Behavior: Геометрия и совместимые glTF PBR материалы и clip-анимации экспортируются стандартным форматом с матрицей потерь.
+- Failure: Rules, arbitrary shaders и interaction logic не сохраняются как runtime semantics.
+- Acceptance: GLB открывается независимым загрузчиком без ошибок.
+
+### FR-073 — Профили качества [MVP]
+- Behavior: Выбор Max/Balanced/Lite при экспорте создаёт отдельный артефакт, не изменяя редактируемый оригинал.
+- Failure: Сильное ухудшение качества предупреждается с preview и сравнением статистики.
+- Acceptance: Оригинальный исходник сохраняется без изменений.
+
+### FR-074 — Предупреждения о тяжёлых эффектах [MVP]
+- Behavior: Дорогие эффекты и GPU требования выводятся в export preview; предлагаются compatible alternatives.
+- Failure: Предупреждение не запрещает оригинал, если он технически реализуем.
+- Acceptance: Можно сознательно экспортировать Max без auto-downscale.
+
+### FR-075 — Видеорендер [NEXT]
+- Behavior: Поддержка WebM и условно MP4 при доступном browser encoder/WASM, фиксированный шаг по timeline для циклических кадров.
+- Failure: Если codec/browser не поддерживаются, показать альтернативу/инструкцию.
+- Acceptance: Экспорт 10 секунд даёт корректную длительность и fps.
+
+### FR-076 — Диагностика совместимости веба [NEXT]
+- Behavior: Показывать количество draw calls, triangles, compressed/uncompressed texture memory estimates, browser features.
+- Failure: Статистика является оценкой, не гарантирует fps.
+- Acceptance: Отчёт доступен до экспорта.
+
+## Non-functional requirements
+
+### NFR-001 — Данные только в RAM вкладки [MVP]
+- Rule: Не использовать localStorage, IndexedDB, ServiceWorker Cache API для хранения документа или истории; все persistence — только явный пользовательский file export.
+- Check: E2E очистка и reload без восстановления.
+
+### NFR-002 — Безопасная загрузка файлов [MVP]
+- Rule: Валидация MIME/extension/signature и фактического содержимого, ограничения размера/числа объектов/глубины, отказ от eval и исполнения сценариев в загруженных данных.
+- Check: Фазз/negative tests парсеров.
+
+### NFR-003 — Атомарность операций [MVP]
+- Rule: Все document mutations через транзакционные команды; ошибки CSG/worker приводят к rollback.
+- Check: Инвариант hash документа после отказа.
+
+### NFR-004 — Предсказуемость анимаций [MVP]
+- Rule: Одинаковое время и seed при отсутствии внешних воздействий дают одинаковую позу; interpolation/tangent проверяемы.
+- Check: Deterministic property tests.
+
+### NFR-005 — Ограничение памяти [MVP]
+- Rule: Предупреждение до исчерпания памяти, LRU вычисленной геометрии/texture cache, отсутствие систематических утечек при циклах open/close.
+- Check: Heap/GPU профилирование по тестовым сценам.
+
+### NFR-006 — Управляемые блокировки [MVP]
+- Rule: В тяжёлой операции редактирование заблокировано, но интерфейс показывает прогресс/Cancel, event loop не должен окончательно зависать.
+- Check: E2E job state transition.
+
+### NFR-007 — Визуальный эталон [MVP]
+- Rule: Golden scenes содержат metal/glass/stone, HDRI, shadows и фиксированные условия освещения.
+- Check: Порог визуального различия документируется для среды CI.
+
+### NFR-008 — Стабильный экспорт [MVP]
+- Rule: TSX-пакет должен собираться в чистом React/Vite проекте с указанными зависимостями; GLB roundtrip для поддерживаемых сцен.
+- Check: Build harness + smoke render.
+
+### NFR-009 — Прозрачная деградация [MVP]
+- Rule: WebGPU/WebGL2 feature detection, явный status, предупреждения о неподдерживаемых эффектах; отсутствие молчаливого пропуска critical features.
+- Check: Запуск с forced WebGL fallback.
+
+### NFR-010 — Доступность ПК [MVP]
+- Rule: Keyboard navigation панелей, focus visible, contrast, reduced motion для UX chrome, доступные подписи контролов.
+- Check: Аудит keyboard/automated a11y.
+
+### NFR-011 — Согласованность экспорта [MVP]
+- Rule: Отчёт о несовместимости материалов/свойств, side-by-side preview для профилей экспорта.
+- Check: Comparator тестовых случаев.
+
+### NFR-012 — Качество обслуживания [MVP]
+- Rule: Ошибки показывают понятный текст на русском и error code; пользователь может отменить и продолжить работу.
+- Check: Negative scenario tests.
+
+### NFR-013 — Локальная разработка [MVP]
+- Rule: Windows 11, Node/npm и браузер без секретных ключей; один npm install + npm run dev из корня.
+- Check: Fresh clone smoke test.
+
+### NFR-014 — Статический деплой [MVP]
+- Rule: Vite static build функционирует на GitHub Pages по корректному base URL; внешние файлы доступны при CORS и лицензии.
+- Check: Deploy preview smoke.
+
+### NFR-015 — Тесты по риску [MVP]
+- Rule: Types/build и критические unit+integration+E2E; avoid redundant whole suite after each small change.
+- Check: CI workflow task gates.
+
+### NFR-016 — Безопасные пресеты [NEXT]
+- Rule: Сторонние preset packs — данные, не скрипты. Проверка пути архива (zip slip), размера и external URLs.
+- Check: Malicious payload smoke.
+
+### NFR-017 — Целевые показатели без выдумок [MVP]
+- Rule: До профилирования не обещать конкретные FPS/число полигонов; фиксировать test hardware и сценарии, получать измеримые бюджеты после prototyping.
+- Check: Performance baseline report.
+
+### NFR-018 — Лицензии [MVP]
+- Rule: Отдельно документировать права на внешние HDRI/texture packs и шрифты Actay/AKONY. Не включать сторонние файлы без подтверждения лицензии.
+- Check: License audit release.
+</file>
+
+<file path="docs/risks.md">
+# Risk register
+
+## R-01 [HIGH] CSG on arbitrary non-manifold models fails or loses attributes
+Mitigation: Prevalidate mesh, manifold-only operations, localized fallback/reject, stable modifier stack.
+Tasks: TASK-003, 020
+
+## R-02 [HIGH] WebGPU renderer incompatible with shader/postprocessing export
+Mitigation: Feature capability matrix, WebGL fallback, golden tests, no promise of equivalence.
+Tasks: TASK-002, 036
+
+## R-03 [CRITICAL] Import TSX/HTML interpreted as executable source
+Mitigation: No eval, AST allowlist, file size/CPU constraints; diagnostic partial import.
+Tasks: TASK-054
+
+## R-04 [HIGH] Chrome/glass visually vary with HDRI and target site renderer
+Mitigation: Golden environments + export preview + disclose dependencies and quality limits.
+Tasks: TASK-035, 046
+
+## R-05 [HIGH] Browser GPU/RAM exhausts on thousands of meshes
+Mitigation: Workers, instancing, lazy evaluation, memory profiling, limits with user warning.
+Tasks: TASK-027, 063
+
+## R-06 [ACCEPTED] Unsaved work irrecoverable after closing tab
+Mitigation: User expressly accepts; explicit Save project, dirty marker, beforeunload best-effort.
+Tasks: TASK-013
+
+## R-07 [HIGH] Loop not truly seamless with physics/user input
+Mitigation: Deterministic base layers, end pose/tangent check, separate external interaction.
+Tasks: TASK-043, 051
+
+## R-08 [HIGH] GlTF loses custom interactive logic
+Mitigation: Separate TSX runtime vs GLB; exact compatibility report; no silent loss.
+Tasks: TASK-044, 056
+
+## R-09 [MEDIUM] Browser-only optimization lacks native Sharp/encoder features
+Mitigation: Check browser pipelines, offer WASM/Canvas/WebCodecs, compare outputs.
+Tasks: TASK-060
+
+## R-10 [MEDIUM] Unlicensed fonts/materials packaged into app/export
+Mitigation: Audit licenses, do not copy proprietary fonts without verified rights.
+Tasks: TASK-005, 064
+
+## R-11 [HIGH] Scope of advanced modeling overloads MVP
+Mitigation: Stage gates and hard MVP boundary; avoid claiming advanced features complete.
+Tasks: TASK-048
+
+## R-12 [MEDIUM] Source change propagates unexpectedly to copied models
+Mitigation: Opt-in revision sync, per-instance override and diff preview.
+Tasks: TASK-050
+</file>
+
+<file path="docs/sources.md">
+# Technical sources
+
+Checked 2026-10-19. Treat as external capability evidence, not proof of precise library-version compatibility.
+
+- **S-01** Three.js WebGPURenderer — migration, fallback, feature caveats: https://threejs.org/manual/pages/webgpurenderer
+- **S-02** Three.js GLTFExporter — data types and extensions: https://threejs.org/docs/pages/GLTFExporter.html
+- **S-03** Three.js MeshPhysicalMaterial — PBR and transmission: https://threejs.org/docs/pages/MeshPhysicalMaterial.html
+- **S-04** Khronos glTF 2.0 — animations do not specify runtime behavior: https://github.com/KhronosGroup/glTF/blob/main/specification/2.0/Specification.adoc
+- **S-05** Manifold 3D — manifold meshes and CSG: https://github.com/elalish/manifold
+- **S-06** three-mesh-bvh — raycast and spatial queries: https://github.com/gkjohnson/three-mesh-bvh
+- **S-07** Rapier — rigid body types, colliders and kinematic caveats: https://rapier.rs/docs/user_guides/javascript/rigid_bodies/
+- **S-08** glTF Transform — simplify and meshopt: https://gltf-transform.dev/modules/functions/functions/simplify
+- **S-09** glTF Transform — textureCompress browser limitations: https://gltf-transform.dev/modules/functions/functions/textureCompress
+- **S-10** MDN — beforeunload restrictions: https://developer.mozilla.org/en-US/docs/Web/API/Window/beforeunload_event
+- **S-11** MDN — showSaveFilePicker limited compatibility: https://developer.mozilla.org/en-US/docs/Web/API/Window/showSaveFilePicker
+- **S-12** three-gpu-pathtracer — path tracing implementation: https://github.com/gkjohnson/three-gpu-pathtracer
+- **S-13** Triad Studio source README (connected GitHub): https://github.com/4ertopolohh/triad-studio-project/blob/main/README.md
+- **S-14** Triad Studio SCSS variables and palette: https://github.com/4ertopolohh/triad-studio-project/blob/main/frontend/src/styles/_variables.scss
+- **S-15** Triad Studio font configuration: https://github.com/4ertopolohh/triad-studio-project/blob/main/frontend/src/styles/_fonts.scss
+- **S-16** TRIAD-3D repository (empty on 2026-10-19): https://github.com/4ertopolohh/triad-3d
+</file>
+
+<file path="docs/tasks.json">
+[
+  {
+    "id": "TASK-001",
+    "stage": "0. Discovery/Spikes",
+    "title": "Согласовать конечные типы document graph",
+    "deps": "—",
+    "actions": "Определить Project/Model/Scene/Node/Modifier/Material/Timeline/Asset; запретить циклические ссылки и положить fixtures в репозиторий.",
+    "out": "domain types + fixtures",
+    "check": "tsc + schema fixtures",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-002",
+    "stage": "0. Discovery/Spikes",
+    "title": "Spike WebGPU/WebGL2 и PBR",
+    "deps": "TASK-001",
+    "actions": "Рендер хрома, стекла, нормалей и HDRI в обеих ветках; зафиксировать отличия, стабильный baseline и fallback.",
+    "out": "renderer-decision.md + prototype",
+    "check": "snapshot двух режимов",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-003",
+    "stage": "0. Discovery/Spikes",
+    "title": "Spike CSG+Manifold WASM",
+    "deps": "TASK-001",
+    "actions": "Проверить тор с отверстиями, пересечение и отмену, стоимость вычислений и UV/normals на результатах.",
+    "out": "CSG feasibility report",
+    "check": "геометрия без degenerate mesh",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-004",
+    "stage": "0. Discovery/Spikes",
+    "title": "Spike TSX export harness",
+    "deps": "TASK-001",
+    "actions": "Создать минимальный тестовый генератор компонента и проверку Vite/TS без настоящего редактора.",
+    "out": "harness project",
+    "check": "npm run build",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-005",
+    "stage": "0. Discovery/Spikes",
+    "title": "Собрать интерфейсные и технические токены",
+    "deps": "—",
+    "actions": "Перенести цветовые и типографические token names из Triad Studio с учётом прав на шрифты; спроектировать compact desktop spacing.",
+    "out": "design tokens",
+    "check": "visual QA",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-006",
+    "stage": "1. Foundation",
+    "title": "Создать Vite React TypeScript приложение",
+    "deps": "TASK-001;TASK-005",
+    "actions": "Создать структуру packages/app/core/render/geo/anim/export/ui; ESLint, TS strict, CI build commands.",
+    "out": "monorepo/workspace skeleton",
+    "check": "npm ci + build",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-007",
+    "stage": "1. Foundation",
+    "title": "Внедрить команды и транзакции",
+    "deps": "TASK-006",
+    "actions": "Typed commands execute/invert, failure rollback, error code; avoid mutation outside dispatcher.",
+    "out": "command bus",
+    "check": "atomicity unit tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-008",
+    "stage": "1. Foundation",
+    "title": "Реализовать in-memory store",
+    "deps": "TASK-007",
+    "actions": "State slices document/selection/tool/view/job/history; selectors and derived cache invalidation.",
+    "out": "editor state",
+    "check": "store unit tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-009",
+    "stage": "1. Foundation",
+    "title": "Создать сериализацию проекта schema v1",
+    "deps": "TASK-001;TASK-008",
+    "actions": "JSON schema manifest, IDs, asset refs, version/migrations API, roundtrip fixture.",
+    "out": "serializer/deserializer",
+    "check": "golden roundtrip",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-010",
+    "stage": "1. Foundation",
+    "title": "Добавить файл .triad3d и архиватор",
+    "deps": "TASK-009",
+    "actions": "Zip manifest/document/assets, checksums, safe path validation, explicit save/import buttons; отдельный базовый GLTFLoader adapter для импорта GLB без вреда source scene.",
+    "out": "file adapter",
+    "check": "corrupt archive tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-011",
+    "stage": "1. Foundation",
+    "title": "Реализовать Undo/Redo delta history",
+    "deps": "TASK-007;TASK-008",
+    "actions": "Command reversible diffs, coalescing drag edits, memory snapshots/checkpoints in RAM.",
+    "out": "history store",
+    "check": "100 ops replay",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-012",
+    "stage": "1. Foundation",
+    "title": "Собрать базовый layout и topbar",
+    "deps": "TASK-006;TASK-005",
+    "actions": "Resizable left/right docks, viewport center, bottom timeline, modes, error/toast, desktop-only notice.",
+    "out": "UI shell",
+    "check": "E2E layout smoke",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-013",
+    "stage": "1. Foundation",
+    "title": "Предупреждение об unsaved состоянии",
+    "deps": "TASK-010;TASK-012",
+    "actions": "Dirty flag, user-activated beforeunload, explicit save, no browser persistent storage.",
+    "out": "leave-warning",
+    "check": "reload cannot restore",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-014",
+    "stage": "2. Geometry",
+    "title": "Создать Three renderer adapter",
+    "deps": "TASK-002;TASK-012",
+    "actions": "Scene sync from domain graph, renderer lifecycle, context loss recovery, dispose resources.",
+    "out": "renderer adapter",
+    "check": "context restart",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-015",
+    "stage": "2. Geometry",
+    "title": "Orbit controls, gizmos и picking",
+    "deps": "TASK-014",
+    "actions": "Orbit camera, fit/reset, world/local transform widgets, ray picking, snap.",
+    "out": "viewport interactions",
+    "check": "E2E select/move",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-016",
+    "stage": "2. Geometry",
+    "title": "Библиотека геометрических примитивов",
+    "deps": "TASK-001;TASK-014",
+    "actions": "Parametric typed primitive factory, segmentation and bounds validation, lazy mesh evaluate.",
+    "out": "primitive factory",
+    "check": "unit geometry tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-017",
+    "stage": "2. Geometry",
+    "title": "Дерево модели и группировка",
+    "deps": "TASK-012;TASK-016",
+    "actions": "Hierarchy DnD, selection multi, visibility/lock, protected roots, ID consistency.",
+    "out": "object tree",
+    "check": "cycle prevention tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-018",
+    "stage": "2. Geometry",
+    "title": "Инспектор transform/primitive",
+    "deps": "TASK-015;TASK-017",
+    "actions": "Numeric fields, mixed values, validation, reset, undo coalescing.",
+    "out": "inspector",
+    "check": "UI unit tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-019",
+    "stage": "2. Geometry",
+    "title": "Интегрировать BVH и surface picking",
+    "deps": "TASK-015;TASK-016",
+    "actions": "Accelerated raycast for triangle surfaces, hit data local coords, worker build for heavy models.",
+    "out": "surface query API",
+    "check": "raycast validation",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-020",
+    "stage": "2. Geometry",
+    "title": "Интегрировать CSG WASM worker",
+    "deps": "TASK-003;TASK-019",
+    "actions": "Typed worker protocol, manifold input/output conversion, geometry checks, cancellation boundaries.",
+    "out": "CSG service",
+    "check": "boolean fixtures",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-021",
+    "stage": "2. Geometry",
+    "title": "Добавить modifier graph evaluator",
+    "deps": "TASK-020;TASK-009",
+    "actions": "Ordered modifiers and cached intermediate geometry with dependency invalidation and error fallback.",
+    "out": "modifier service",
+    "check": "toggle reorder tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-022",
+    "stage": "2. Geometry",
+    "title": "Boolean UI отверстия/объединения",
+    "deps": "TASK-020;TASK-021",
+    "actions": "Cutter selection, preview and apply, parameter edit, error explain.",
+    "out": "boolean tools",
+    "check": "torus hole E2E",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-023",
+    "stage": "2. Geometry",
+    "title": "Mirror and radial/linear arrays",
+    "deps": "TASK-021",
+    "actions": "Deterministic repeats with seed/pivot/angle, optional instancing; editable params.",
+    "out": "array/mirror modifiers",
+    "check": "symmetry tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-024",
+    "stage": "2. Geometry",
+    "title": "Basic vertex/edge/face editing",
+    "deps": "TASK-016;TASK-019",
+    "actions": "Subselection, translate/extrude, validity checks, undo semantic operations.",
+    "out": "mesh editor",
+    "check": "topology fixtures",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-025",
+    "stage": "2. Geometry",
+    "title": "Базовые bend/twist/taper/bevel",
+    "deps": "TASK-021",
+    "actions": "Typed modifiers, stable normals, deterministic updates, performance thresholds.",
+    "out": "deform modifiers",
+    "check": "geometry tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-026",
+    "stage": "2. Geometry",
+    "title": "Surface material/paint brush",
+    "deps": "TASK-019;TASK-018",
+    "actions": "Brush cursor preview, radius/intensity/fill, symmetry stencil, one stroke transaction.",
+    "out": "brush UI and engine",
+    "check": "brush E2E",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-027",
+    "stage": "2. Geometry",
+    "title": "Управление тяжёлыми jobs",
+    "deps": "TASK-020;TASK-012",
+    "actions": "Modal UI lock, job queue one at time, progress messages, cancel/rollback/crash recovery.",
+    "out": "job controller",
+    "check": "cancel test",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-028",
+    "stage": "2. Geometry",
+    "title": "Валидация сетки и диагностические ошибки",
+    "deps": "TASK-020;TASK-024",
+    "actions": "Manifold/degenerate checks, error code hints with precise cause and safe undo.",
+    "out": "mesh diagnostics",
+    "check": "invalid input tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-029",
+    "stage": "3. Materials",
+    "title": "Сервис материалных сущностей",
+    "deps": "TASK-001;TASK-014",
+    "actions": "PBR typed schema, material slots, ID refs, fallback materials, GPU dispose.",
+    "out": "material service",
+    "check": "serialization unit",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-030",
+    "stage": "3. Materials",
+    "title": "Реалистичные preset preview cards",
+    "deps": "TASK-029;TASK-012",
+    "actions": "Metal/glass/stone/abstract preview sphere with standard HDRI; preset classification and filtering.",
+    "out": "preset library",
+    "check": "visual golden",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-031",
+    "stage": "3. Materials",
+    "title": "Drag-drop и Inspector материалов",
+    "deps": "TASK-029;TASK-018",
+    "actions": "Material assignment from catalog, basic+advanced sliders, shared/unique slots, undo.",
+    "out": "material UI",
+    "check": "E2E assignment",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-032",
+    "stage": "3. Materials",
+    "title": "Ассеты: import images/HDR/EXR",
+    "deps": "TASK-010;TASK-029",
+    "actions": "Asset ingest, MIME signature, size cap, URLs lifetime, color space, resource refcounts.",
+    "out": "asset adapter",
+    "check": "bad asset rejection",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-033",
+    "stage": "3. Materials",
+    "title": "Текстурные mapping UV/box/triplanar",
+    "deps": "TASK-031;TASK-016",
+    "actions": "UV handling, mapping selector, supported fallback and warning for missing UV.",
+    "out": "mapping service",
+    "check": "texture visual QA",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-034",
+    "stage": "3. Materials",
+    "title": "Процедурный noise/scratches",
+    "deps": "TASK-029;TASK-032",
+    "actions": "Seeded generators for grain/metal scratches/stone patterns; optional bake for export.",
+    "out": "procedural maps",
+    "check": "seed repeat test",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-035",
+    "stage": "3. Materials",
+    "title": "Свет, HDRI и tone mapping",
+    "deps": "TASK-031;TASK-014",
+    "actions": "Environment picker, light transform/intensity, exposure, metal/glass golden scene.",
+    "out": "lighting tools",
+    "check": "golden render compare",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-036",
+    "stage": "3. Materials",
+    "title": "Draft/Quality/Final preview",
+    "deps": "TASK-002;TASK-035",
+    "actions": "Feature capability matrix, render profile switch and graceful fallback.",
+    "out": "render profiles",
+    "check": "switch consistency",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-037",
+    "stage": "4. Animation",
+    "title": "Типизированная timeline domain model",
+    "deps": "TASK-001;TASK-008",
+    "actions": "Tracks, channels, keys, easing, fps/time/duration, loop metadata.",
+    "out": "timeline types",
+    "check": "schema roundtrip",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-038",
+    "stage": "4. Animation",
+    "title": "Animation evaluator t→pose",
+    "deps": "TASK-037",
+    "actions": "Deterministic absolute time evaluation for transforms, pivot and interpolation.",
+    "out": "anim engine",
+    "check": "property/key tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-039",
+    "stage": "4. Animation",
+    "title": "Таймлайн UI и tracks",
+    "deps": "TASK-037;TASK-012",
+    "actions": "Playback, scrub, add keys, drag, ruler, loop region, collapse.",
+    "out": "timeline UI",
+    "check": "E2E keys",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-040",
+    "stage": "4. Animation",
+    "title": "Две точки и keyframe запись",
+    "deps": "TASK-039;TASK-015",
+    "actions": "Link gizmo edits to current frame, set start/end keys, separate camera input.",
+    "out": "record key UI",
+    "check": "two-point smoke",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-041",
+    "stage": "4. Animation",
+    "title": "Bezier graph и slow playback",
+    "deps": "TASK-039;TASK-038",
+    "actions": "Curve handles, easing presets, playback rate 0.1–2, timeline duration independence.",
+    "out": "curve editor",
+    "check": "curve shape tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-042",
+    "stage": "4. Animation",
+    "title": "Presets spin/orbit/move/reveal",
+    "deps": "TASK-038;TASK-039",
+    "actions": "Preset factory maps config to tracks; pivot rotation and parameter panel.",
+    "out": "animation presets",
+    "check": "preset golden",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-043",
+    "stage": "4. Animation",
+    "title": "Loop continuity analyzer",
+    "deps": "TASK-038;TASK-041",
+    "actions": "Compare first/last pose and velocity/tangent; fix or warn with exact differences.",
+    "out": "loop assistant",
+    "check": "t0 vs tT tests",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-044",
+    "stage": "5. MVP export",
+    "title": "Создать runtime TSX generator",
+    "deps": "TASK-004;TASK-031;TASK-038",
+    "actions": "From domain graph generate TSX and typed Props, no editor dependency; controlled resources.",
+    "out": "TSX generator",
+    "check": "clean harness build",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-045",
+    "stage": "5. MVP export",
+    "title": "ZIP с ресурсами и README",
+    "deps": "TASK-044;TASK-032",
+    "actions": "Package TSX/assets/npm deps/readme/licenses, relative paths and deterministic names.",
+    "out": "ZIP artifact",
+    "check": "unzip build smoke",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-046",
+    "stage": "5. MVP export",
+    "title": "Экспортный мастер и три профиля",
+    "deps": "TASK-045;TASK-036",
+    "actions": "Max/Balanced/Lite profiles, preview, stats/compat warning, no source mutation.",
+    "out": "export dialog",
+    "check": "profile smoke",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-047",
+    "stage": "5. MVP export",
+    "title": "Генератор и инспектор props",
+    "deps": "TASK-044;TASK-046",
+    "actions": "User selects exposable params size/color/speed etc, validation and default values.",
+    "out": "props UI",
+    "check": "prop controls exported",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-048",
+    "stage": "5. MVP export",
+    "title": "Проверка save/reopen/export сценария",
+    "deps": "TASK-010;TASK-047",
+    "actions": "End-to-end ring+chrome+spin→save→reload/import→TSX in harness.",
+    "out": "E2E MVP acceptance",
+    "check": "complete flow",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-049",
+    "stage": "5. MVP export",
+    "title": "Static GitHub Pages build",
+    "deps": "TASK-006;TASK-048",
+    "actions": "Base path, no server assumptions, asset URL handling, smoke deploy.",
+    "out": "Pages config",
+    "check": "deployed preview test",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-050",
+    "stage": "6. Extended",
+    "title": "Синхронизация model instances",
+    "deps": "TASK-017;TASK-021",
+    "actions": "Revision snapshots, explicit Sync, shared data and optional overrides.",
+    "out": "instance subsystem",
+    "check": "sync E2E",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-051",
+    "stage": "6. Extended",
+    "title": "Layered interaction animation",
+    "deps": "TASK-038;TASK-043",
+    "actions": "Additive/override layers, priorities, cursor influence and smooth release.",
+    "out": "animation mixer",
+    "check": "spin+magnet test",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-052",
+    "stage": "6. Extended",
+    "title": "Typed interaction rule DSL",
+    "deps": "TASK-051",
+    "actions": "Event/Condition/Action schemas and evaluator with safe predicates, no dynamic code.",
+    "out": "rules engine",
+    "check": "DSL tests",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-053",
+    "stage": "6. Extended",
+    "title": "Rapier collision service",
+    "deps": "TASK-051",
+    "actions": "Dynamic/static/kinematic actors with documented limitations, mass/restitution, collision event mapping.",
+    "out": "physics adapter",
+    "check": "bounce fixtures",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-054",
+    "stage": "6. Extended",
+    "title": "Code source AST importer",
+    "deps": "TASK-001;TASK-010",
+    "actions": "Allowlist TSX/JSX/HTML AST, diagnostic mapping, no eval and no network.",
+    "out": "source importer",
+    "check": "security regression",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-055",
+    "stage": "6. Extended",
+    "title": "Процедурные stamps/детали",
+    "deps": "TASK-023;TASK-026",
+    "actions": "Brush stamp holes/spikes with non-destructive mirror arrays, seed and undo.",
+    "out": "advanced brushes",
+    "check": "golden complex model",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-056",
+    "stage": "6. Extended",
+    "title": "GLB/GLTF exporter + loss report",
+    "deps": "TASK-044;TASK-038",
+    "actions": "GLTFExporter with supported clips/materials, report unsupported interactions and shaders.",
+    "out": "GLB export",
+    "check": "roundtrip test",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-057",
+    "stage": "6. Extended",
+    "title": "Видео WebM и опциональный MP4",
+    "deps": "TASK-038;TASK-036",
+    "actions": "Frame renderer fixed step, WebCodecs/MediaRecorder feature matrix, FFmpeg WASM fallback spike.",
+    "out": "video export",
+    "check": "duration/frame smoke",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-058",
+    "stage": "6. Extended",
+    "title": "Библиотеки пресетов и packs",
+    "deps": "TASK-010;TASK-029",
+    "actions": "Import/export versioned packs and assets with zip safety/duplicate resolution.",
+    "out": "preset pack tools",
+    "check": "pack roundtrip",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-059",
+    "stage": "6. Extended",
+    "title": "Final path tracing эксперимент",
+    "deps": "TASK-002;TASK-036",
+    "actions": "Evaluate path tracer capability on golden scenes, capture limitations and fallback.",
+    "out": "final render optional",
+    "check": "visual comparative QA",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-060",
+    "stage": "6. Extended",
+    "title": "Texture & geometry optimization",
+    "deps": "TASK-032;TASK-046",
+    "actions": "Meshopt simplify/weld/compress and image conversion in-browser with measured quality losses.",
+    "out": "optimizer",
+    "check": "size stats + visual comparison",
+    "scope": "NEXT",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-061",
+    "stage": "7. Release",
+    "title": "Прогнать визуальные golden сценарии",
+    "deps": "TASK-036;TASK-048",
+    "actions": "Metal, glass, stone, HDRI at fixed camera/time; capture engine/browser/version.",
+    "out": "golden QA report",
+    "check": "approved screenshots",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-062",
+    "stage": "7. Release",
+    "title": "Проверить security/privacy and RAM-only",
+    "deps": "TASK-054;TASK-056",
+    "actions": "Malformed assets, ZIP-slip, memory lifecycle, no persistence after refresh, beforeunload.",
+    "out": "security checklist",
+    "check": "negative E2E",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-063",
+    "stage": "7. Release",
+    "title": "Профилирование сложных сцен",
+    "deps": "TASK-027;TASK-060",
+    "actions": "Measure geometry compute, render and memory on known Windows+GPU, record limitations without invented fps targets.",
+    "out": "performance baseline",
+    "check": "profile review",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  },
+  {
+    "id": "TASK-064",
+    "stage": "7. Release",
+    "title": "Документация и совместимость релиза",
+    "deps": "TASK-061;TASK-062;TASK-063",
+    "actions": "Update README, supported formats, version matrix, operation caveats and exports install guide.",
+    "out": "release docs",
+    "check": "fresh-clone run",
+    "scope": "MVP",
+    "effort": "2–4 ч"
+  }
+]
+</file>
+
+<file path="docs/testing.md">
+# Testing and acceptance
+
+Targeted TypeScript/build+unit per task; full E2E and golden rendering at milestones. Do not chase arbitrary coverage counts or promise FPS before benchmark.
+
+## TST-001 — Unit
+Scenario: Создание Project с одним Model и одной Scene
+Covers: FR-001..FR-003
+Owner task: TASK-001
+
+## TST-002 — Unit
+Scenario: Parenting и запрет циклических отношений
+Covers: FR-005
+Owner task: TASK-017
+
+## TST-003 — Unit
+Scenario: Batch selection, hide/lock, undo
+Covers: FR-006..FR-009
+Owner task: TASK-011
+
+## TST-004 — Integration
+Scenario: Сериализация/десериализация self-contained проекта
+Covers: FR-010..FR-011
+Owner task: TASK-010
+
+## TST-005 — Negative
+Scenario: Битый manifest / неверный формат файла
+Covers: FR-011;NFR-002
+Owner task: TASK-010
+
+## TST-006 — Unit
+Scenario: Primitive parameter bounds и валидность сетки
+Covers: FR-012
+Owner task: TASK-016
+
+## TST-007 — Geometry
+Scenario: Boolean subtract torus, holes и manifoldness
+Covers: FR-014
+Owner task: TASK-020
+
+## TST-008 — Geometry
+Scenario: Boolean union/intersect + rollback
+Covers: FR-015;NFR-003
+Owner task: TASK-022
+
+## TST-009 — Unit
+Scenario: Mirror/radial array parameter update
+Covers: FR-016..FR-017
+Owner task: TASK-023
+
+## TST-010 — Geometry
+Scenario: Stack reorder, disable modifier и deps invalidate
+Covers: FR-019
+Owner task: TASK-021
+
+## TST-011 — E2E
+Scenario: Brush preview → stroke → undo
+Covers: FR-021
+Owner task: TASK-026
+
+## TST-012 — Negative
+Scenario: Non-manifold CSG rollback unchanged state
+Covers: FR-025;NFR-003
+Owner task: TASK-028
+
+## TST-013 — Visual
+Scenario: Chrome/Glass/Stone golden scene
+Covers: FR-027..FR-035
+Owner task: TASK-035
+
+## TST-014 — Asset
+Scenario: PNG/HDR/EXR import, color spaces, file limits
+Covers: FR-031
+Owner task: TASK-032
+
+## TST-015 — Unit
+Scenario: Seeded procedural texture reproducibility
+Covers: FR-033
+Owner task: TASK-034
+
+## TST-016 — Renderer
+Scenario: WebGPU selected vs WebGL2 fallback and unsupported hints
+Covers: FR-037;NFR-009
+Owner task: TASK-036
+
+## TST-017 — Animation
+Scenario: t→pose deterministic keys and interpolation
+Covers: FR-040..FR-043
+Owner task: TASK-038
+
+## TST-018 — Animation
+Scenario: Loop t=0 vs t=T position and tangent
+Covers: FR-044
+Owner task: TASK-043
+
+## TST-019 — E2E
+Scenario: Timeline playback rate and graph easing
+Covers: FR-042..FR-045
+Owner task: TASK-041
+
+## TST-020 — Animation
+Scenario: Spin on group + child translation
+Covers: FR-047
+Owner task: TASK-042
+
+## TST-021 — Extended
+Scenario: Proximity magnet release does not reset phase
+Covers: FR-048..FR-049
+Owner task: TASK-051
+
+## TST-022 — Extended
+Scenario: Rule DSL forbids executable scripts
+Covers: FR-050
+Owner task: TASK-052
+
+## TST-023 — Extended
+Scenario: Collision dynamic bounce + kinematic limitation warning
+Covers: FR-052
+Owner task: TASK-053
+
+## TST-024 — E2E
+Scenario: Workbench resize, tooltips, keyboard-only nav
+Covers: FR-057..FR-061
+Owner task: TASK-012
+
+## TST-025 — E2E
+Scenario: Cancel long job preserves document and unlocks UI
+Covers: FR-062..FR-063
+Owner task: TASK-027
+
+## TST-026 — Integration
+Scenario: GLB import, invalid extension diagnostics
+Covers: FR-064
+Owner task: TASK-010
+
+## TST-027 — Security
+Scenario: Static TSX import no eval on malicious source
+Covers: FR-066..FR-067
+Owner task: TASK-054
+
+## TST-028 — Export
+Scenario: TSX from ring+chrome+animation compiles in clean Vite
+Covers: FR-068..FR-071
+Owner task: TASK-048
+
+## TST-029 — Export
+Scenario: Quality profiles non-destructive and warnings
+Covers: FR-073..FR-074
+Owner task: TASK-046
+
+## TST-030 — Extended
+Scenario: GLB export reload no unknown semantics claims
+Covers: FR-072
+Owner task: TASK-056
+
+## TST-031 — Extended
+Scenario: WebM duration exact, optional MP4 feature detection
+Covers: FR-075
+Owner task: TASK-057
+
+## TST-032 — E2E
+Scenario: Manual save, close tab, reload no data, reopen file
+Covers: FR-008..FR-011;NFR-001
+Owner task: TASK-013
+
+## TST-033 — Performance
+Scenario: 100/1000/5000 objects: memory and operation timings
+Covers: NFR-005;NFR-017
+Owner task: TASK-063
+
+## TST-034 — Security
+Scenario: ZIP slip, fake image MIME, compressed bomb reject
+Covers: NFR-002;NFR-016
+Owner task: TASK-062
+
+## TST-035 — Deployment
+Scenario: Fresh clone build and Pages base smoke
+Covers: NFR-013..NFR-014
+Owner task: TASK-049
+</file>
+
+<file path="docs/ui-spec.md">
+# UI screens and modules
+
+Desktop only; no mobile authoring. Base reference: Triad Studio Actay/AKONY + #F2F2F2 / #303030 / #7497DC; licensing verify.
+
+## UI-01 Главное рабочее пространство
+Location: /
+Layout: Топбар: проект, режим, Undo/Redo, save/export; левый dock: дерево/пресеты; центр: viewport; справа Inspector; снизу collapsible timeline.
+Actions: New, import, select, transform, start jobs, export.
+States: empty / dirty / busy / loading / feature fallback / error
+Interaction/accessibility: Режим desktop, resize docks, escape dialogs, keyboard focus, shortcuts.
+
+## UI-02 Редактор модели
+Location: внутри /
+Layout: Toolbar: select/move/rotate/scale, vertex/face, boolean, array, mirror, brushes; world grid, gizmo, snapping.
+Actions: Создать примитив, менять mesh, stack modifiers, preview brush.
+States: invalid mesh / unsupported topology / pending calculation
+Interaction/accessibility: Hover help; action disabled with reason; no destructive silent actions.
+
+## UI-03 Редактор сцены
+Location: внутри /
+Layout: Scene tree, model instance(s), lights, cameras, background/HDRI; own viewport.
+Actions: Перенос копий, настройка окружения, подготовка финального кадра.
+States: missing environment / stale instance revision
+Interaction/accessibility: Linked instance & overrides visible, explicit sync action.
+
+## UI-04 Дерево объектов
+Location: dock left
+Layout: Вкладки «Объекты», «Библиотека»; контекстные операции, hide/lock, drag/reparent.
+Actions: Select, multi-select, group/ungroup, rename, hide/lock.
+States: zero objects / huge hierarchy / mixed lock flags
+Interaction/accessibility: Virtualize long lists, preserve IDs, prohibit cycles.
+
+## UI-05 Инспектор параметров
+Location: dock right
+Layout: Basic sections per selection, advanced in accordion; numeric inputs, reset, material slots, links to modifiers.
+Actions: Edit transforms, materials, geometry, animation, brush settings.
+States: no selection / mixed values / invalid number
+Interaction/accessibility: Immediate preview except explicitly expensive actions; debounce safe.
+
+## UI-06 Библиотека материалов и деталей
+Location: dock left tab
+Layout: Search, categories, thumbnails, three-dimensional material preview, drag-to-apply, favorites in memory.
+Actions: Выбрать preset, inspect properties, import pack, save pack.
+States: assets loading / download failure / unsupported texture
+Interaction/accessibility: Fonts/theme align reference; asset licensing disclosure.
+
+## UI-07 Редактор модификаторов
+Location: inspector tab
+Layout: Ordered operation stack with enabled/drag reorder, parameters, preview, warnings.
+Actions: Добавить, изменить, отключить, перетащить, удалить modifier.
+States: CSG failure / non-manifold mesh / expensive recompute
+Interaction/accessibility: Atomic apply, batch compute with cancellation boundary.
+
+## UI-08 Кисти и поверхность
+Location: viewport overlay
+Layout: Toolbar brush type/shape, radius, intensity, fill, symmetry; on-surface cursor decal and optional gizmo.
+Actions: Stroke begin/continue/commit/cancel, stamp preview.
+States: no hit / no UV / locked object / too large region
+Interaction/accessibility: One stroke = one undo command; preview disappears on cancel.
+
+## UI-09 Таймлайн и Graph Editor
+Location: dock bottom
+Layout: Tracks/keys, playback, loop region, easing editor, slow-motion rates, time ruler.
+Actions: Set keyframes, drag/stretch, edit tangent/curve, preview.
+States: empty animation / channel conflicts / non-seamless loop
+Interaction/accessibility: Separate animation time from wall clock; keyboard seek.
+
+## UI-10 Конструктор интерактивности
+Location: panel/modal
+Layout: Preset gallery and typed Event → Condition → Action blocks with priority and blend mode.
+Actions: Create rules, pick targets, preview cursor interactions.
+States: dependency cycle / incompatible action / unsupported export
+Interaction/accessibility: No code eval; only approved typed nodes. NEXT.
+
+## UI-11 Диалоги импорта
+Location: modal
+Layout: Drop/file picker, validation, compatibility report, preview tree of recognized items.
+Actions: Import TRIAD3D, GLB, future code import, confirm partial mapping.
+States: corrupt/unsupported/oversized/untrusted
+Interaction/accessibility: User confirms before replacing current document.
+
+## UI-12 Экспорт и предпросмотр
+Location: modal
+Layout: Format selector TSX/ZIP/GLB/video; quality profile; props; dependencies; warnings; export preview.
+Actions: Copy TSX or download ZIP; compare optimization stats.
+States: code compile failure / unsupported property / canceled export
+Interaction/accessibility: Never mutate source project; show exact omission list.
+
+## UI-13 Долгая операция
+Location: modal overlay
+Layout: Modal lock, action name, spinner/bar, steps, Cancel if supported.
+Actions: Wait, cancel, inspect result; block edit throughout.
+States: unknown progress / worker terminated / out of memory
+Interaction/accessibility: Restore previous valid state and unlock in finally.
+
+## UI-14 Подсказки и справка
+Location: popover
+Layout: Tooltip on hover; complex controls include short inline silent motion demonstration; shortcut reference.
+Actions: Open help, replay demonstration, quick explanation.
+States: reduced motion / no preview resource
+Interaction/accessibility: Russian copy, easy dismiss, no blocking on use.
+
+
+## Action matrix
+
+- UI-01 **Новый проект** — Щелчок в topbar; DIRTY — confirm; result: Создать один Model и Scene; сбросить временный selection.; refs: FR-001;FR-003
+- UI-01 **Модель / Сцена** — Выбор вкладки, не busy; result: Переключить редактор, сохранив domain graph.; refs: FR-002
+- UI-01 **Сохранить проект** — Ctrl+S или topbar, проект загружен; result: Сформировать .triad3d и предложить ручную загрузку на диск.; refs: FR-010
+- UI-01 **Отменить / Повторить** — Активна история, не busy; result: Применить обратимую команду без изменения уже сохранённого файла.; refs: FR-009
+- UI-01 **Экспорт** — Команда Export, документ валиден; result: Открыть UI-12; не очищать DIRTY.; refs: FR-068;FR-073
+- UI-02 **Добавить фигуру** — Выбор primitive; result: Создать параметрический Node и поместить в дерево.; refs: FR-012
+- UI-02 **Переместить / Вращать / Масштабировать** — Узел выделен и не locked; result: Gizmo и numeric fields создают Command; undo один drag.; refs: FR-004
+- UI-02 **Редактировать вершины/грани** — Подходящая геометрия и mesh mode; result: Войти в sub-selection, применить допустимую топологическую операцию.; refs: FR-013
+- UI-02 **Создать отверстие** — Выбран замкнутый mesh и cutter; result: Добавить Boolean modifier, validate, compute, commit.; refs: FR-014
+- UI-02 **Симметрия / Массив** — Существующий объект; result: Добавить Mirror/Array modifier, параметры в UI-07.; refs: FR-016;FR-017
+- UI-04 **Скрыть / Заблокировать** — Выбран узел; result: Обновить visible/locked flag без удаления.; refs: FR-007
+- UI-04 **Группировать / Разгруппировать** — Несколько выбранных узлов; result: Создать/убрать parent с сохранением мировой позиции.; refs: FR-005
+- UI-05 **Сбросить свойство** — Редактируемое свойство; result: Вернуть preset/default через Command.; refs: FR-030
+- UI-06 **Применить материал** — Выбран mesh/slot, preset загружен; result: Сменить materialId, показать видимое изменение.; refs: FR-029
+- UI-06 **Загрузить текстуру** — Файл выбран; result: Decode+validate+asset add; error не меняет document.; refs: FR-031
+- UI-07 **Отключить модификатор** — Modifier существует; result: enabled=false и recalculation через cache invalidation.; refs: FR-019
+- UI-07 **Поменять порядок** — ≥2 modifiers; не busy; result: Reorder и проверка топологии; rollback при ошибке.; refs: FR-019
+- UI-08 **Кисть: радиус / сила / форма** — Активна кисть; result: Изменить preview курсора, не менять модель до stroke.; refs: FR-021
+- UI-08 **Заливка / Симметрия** — Меш поддерживается; result: Операция кисти применяет shape/area/symmetry mask.; refs: FR-021
+- UI-09 **Добавить ключевой кадр** — Трек/время/объект выбраны; result: Записать значение в absolute t.; refs: FR-040
+- UI-09 **Играть / Пауза** — Анимация существует; result: Playback по deterministic timeline evaluator.; refs: FR-042
+- UI-09 **Сгладить цикл** — Есть loop region; result: Align end pose/tangents либо предупреждение.; refs: FR-044
+- UI-09 **Кривая плавности** — Выбран keyframe interval; result: Правка Bezier и обновление preview.; refs: FR-043
+- UI-10 **Добавить условие/действие** — NEXT; typed event graph; result: Создать allowlisted rule без исполнения кода.; refs: FR-050
+- UI-11 **Открыть файл** — File picker или drag-drop; result: Проверить сигнатуру/схему, показать dry-run report.; refs: FR-011;FR-064
+- UI-11 **Применить импорт** — Успешная валидация и confirm если DIRTY; result: Commit импортированную модель/проект транзакционно.; refs: FR-011
+- UI-12 **Режим качества** — Export settings доступны; result: Построить отдельный derived export preview без изменения исходника.; refs: FR-073
+- UI-12 **Скопировать TSX** — Компонент без неупакованных внешних ассетов; result: Поместить код в clipboard и показать зависимости.; refs: FR-069
+- UI-12 **Скачать ZIP** — Export pipeline успешен; result: Создать TSX/assets/README с относительными путями.; refs: FR-070
+- UI-13 **Отмена вычисления** — Job supports abort; result: Отменить на safe boundary, rollback и разблокировка.; refs: FR-063
+- UI-14 **Демо подсказки** — Hover/focus на сложном инструменте; result: Показать краткую анимацию и инструкцию на русском.; refs: FR-059
+</file>
+
+<file path="docs/use-cases.md">
+# User journeys
+
+## UC-01 Собрать механическое кольцо
+Preconditions: Открыт пустой проект
+Steps: Добавить torus → настроить размеры → добавить cutter → применить Boolean subtract → создать radial array → назначить материал → сохранить.
+Alternatives: CSG ошибочна: rollback и текст ошибки; чрезмерное число копий: подтверждение/отмена.
+Refs: FR-012..FR-025, FR-027, FR-010
+
+## UC-02 Создать хром со следами обработки
+Preconditions: Выбран mesh, есть HDRI
+Steps: Галерея «Металлы» → «Хром» → metalness/roughness → процедурные scratches → intensity scale → предпросмотр Final → сохранение.
+Alternatives: Нет HDRI: нейтральное окружение и подсказка; карта повреждена: отменить только карту.
+Refs: FR-027..FR-037
+
+## UC-03 Анимировать деталь по двум точкам
+Preconditions: Доступна модель
+Steps: Установить старт key → переместить playhead к концу → перетащить деталь → установить end key → выбрать easing → установить loop → preview.
+Alternatives: Концы несовместимы: «Сгладить цикл» или предупреждение; track locked: блокировать.
+Refs: FR-040..FR-048
+
+## UC-04 Скомбинировать spin и магнит
+Preconditions: Есть базовая циклическая анимация
+Steps: Добавить interaction «Magnet proximity» → настроить радиус/falloff/priority → отвести курсор → убедиться, что базовая фаза не потеряна.
+Alternatives: Конфликт каналов: показать priority/blend вариант.
+Refs: FR-049..FR-052 NEXT
+
+## UC-05 Сцена с копиями модели
+Preconditions: Есть исходная модель
+Steps: Scene → добавить linked instances → настроить свет/камеры → изменить исходную модель → просмотреть diff → Sync по кнопке.
+Alternatives: Отдельная копия override материала: сохранить override при sync.
+Refs: FR-056..FR-058 NEXT
+
+## UC-06 Перенести модель на сайт
+Preconditions: Есть модель, материалы и анимация
+Steps: Export → React TSX → quality balanced → props → preview → ZIP → чистый React/Vite проект → build → просмотр.
+Alternatives: Не поддержан эффект: явно указать; переключение Quality не меняет исходник.
+Refs: FR-069..FR-075
+
+## UC-07 Ручное сохранение и возобновление
+Preconditions: Открыт проект
+Steps: Save project → получить *.triad3d → закрыть вкладку → открыть сайт → Import Project → выбрать архив → продолжить.
+Alternatives: Повреждён manifest: не портить текущую сессию.
+Refs: FR-008..FR-011
+
+## UC-08 Импортировать исходник TSX
+Preconditions: Открыт редактор
+Steps: Import code → AST analysis → report supported/unsupported → принять частичный импорт.
+Alternatives: Никаких dynamic imports/eval/network; неизвестное не исполнять.
+Refs: FR-066..FR-067 NEXT
+
+## UC-09 Отменить тяжёлый пересчёт
+Preconditions: Есть сложная модель
+Steps: Применить boolean/array → busy overlay → Cancel → проверка исходного состояния → продолжить редактирование.
+Alternatives: Worker crash: rollback, clean temp geometry.
+Refs: FR-065, NFR-003..NFR-006
+</file>
+
+<file path="src/domain/create-project.ts">
+import type { EntityId, Project } from "./types";
+
+export type IdFactory = () => EntityId;
+
+export function createProject(idFactory: IdFactory = () => crypto.randomUUID()): Project {
+  const projectId = idFactory();
+  const modelId = idFactory();
+  const sceneId = idFactory();
+  const rootId = idFactory();
+  const lightId = idFactory();
+
+  return {
+    schemaVersion: "1.0.0",
+    id: projectId,
+    name: "Новый проект",
+    model: { id: modelId, rootNodeId: rootId, revision: 0 },
+    scene: {
+      id: sceneId,
+      camera: {
+        projection: "perspective",
+        position: [4, 3, 5],
+        target: [0, 0, 0],
+        fovDegrees: 45,
+        near: 0.1,
+        far: 1000,
+      },
+      background: { color: [0.12, 0.12, 0.12], intensity: 1 },
+      lights: [{
+        id: lightId,
+        kind: "ambient",
+        color: [1, 1, 1],
+        intensity: 0.8,
+        position: [0, 0, 0],
+        target: [0, 0, 0],
+      }],
+      instances: [],
+    },
+    nodes: [{
+      id: rootId,
+      kind: "group",
+      name: "Модель",
+      parentId: null,
+      children: [],
+      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+      visible: true,
+      locked: false,
+      materialSlots: [],
+      modifierIds: [],
+    }],
+    modifiers: [],
+    materials: [],
+    assets: [],
+    animations: [],
+    tracks: [],
+    keyframes: [],
+  };
+}
+</file>
+
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+</file>
+
+<file path="src/domain/types.ts">
+export type EntityId = string;
+export type Vec3 = readonly [number, number, number];
+export type Quaternion = readonly [number, number, number, number];
+export type ColorRgb = readonly [number, number, number];
+
+export interface Transform {
+  position: Vec3;
+  rotationQuat: Quaternion;
+  scale: Vec3;
+}
+
+export interface Project {
+  schemaVersion: string;
+  id: EntityId;
+  name: string;
+  model: Model;
+  scene: Scene;
+  nodes: Node[];
+  modifiers: Modifier[];
+  materials: Material[];
+  assets: Asset[];
+  animations: AnimationClip[];
+  tracks: Track[];
+  keyframes: Keyframe[];
+}
+
+export interface Model {
+  id: EntityId;
+  rootNodeId: EntityId;
+  revision: number;
+}
+
+export interface Scene {
+  id: EntityId;
+  camera: CameraState;
+  background: SceneBackground;
+  lights: Light[];
+  instances: Instance[];
+}
+
+export interface CameraState {
+  projection: "perspective";
+  position: Vec3;
+  target: Vec3;
+  fovDegrees: number;
+  near: number;
+  far: number;
+}
+
+export interface SceneBackground {
+  color: ColorRgb;
+  environmentAssetId?: EntityId;
+  intensity: number;
+}
+
+export interface Light {
+  id: EntityId;
+  kind: "ambient" | "directional" | "point" | "spot";
+  color: ColorRgb;
+  intensity: number;
+  position: Vec3;
+  target: Vec3;
+}
+
+export interface Instance {
+  id: EntityId;
+  modelId: EntityId;
+  transform: Transform;
+  visible: boolean;
+}
+
+export interface GroupNode {
+  id: EntityId;
+  kind: "group";
+  name: string;
+  parentId: EntityId | null;
+  children: EntityId[];
+  transform: Transform;
+  visible: boolean;
+  locked: boolean;
+  materialSlots: MaterialSlot[];
+  modifierIds: EntityId[];
+}
+
+export interface MeshNode extends Omit<GroupNode, "kind"> {
+  kind: "mesh";
+  meshSource: MeshSource;
+}
+
+export type Node = GroupNode | MeshNode;
+
+export interface MaterialSlot {
+  name: string;
+  materialId: EntityId;
+}
+
+export type MeshSource =
+  | { kind: "primitive"; primitive: "cube" | "sphere" | "torus" | "cylinder" | "cone" | "plane"; parameters: Record<string, number> }
+  | { kind: "asset"; assetId: EntityId };
+
+export interface Modifier {
+  id: EntityId;
+  nodeId: EntityId;
+  kind: "boolean" | "mirror" | "array" | "bend" | "twist" | "taper" | "bevel";
+  order: number;
+  enabled: boolean;
+  version: number;
+  parameters: Record<string, number | string | boolean | readonly number[]>;
+}
+
+export interface Material {
+  id: EntityId;
+  name: string;
+  baseColor: ColorRgb;
+  metalness: number;
+  roughness: number;
+  emissive: ColorRgb;
+  opacity: number;
+  transmission: number;
+  ior: number;
+  clearcoat: number;
+  envIntensity: number;
+  textureAssetIds: EntityId[];
+}
+
+export interface Asset {
+  id: EntityId;
+  hash: string;
+  mediaType: string;
+  path: string;
+  colorSpace: "srgb" | "linear" | "none";
+}
+
+export interface AnimationClip {
+  id: EntityId;
+  name: string;
+  durationSeconds: number;
+  loop: boolean;
+  trackIds: EntityId[];
+}
+
+export type TrackProperty = "transform.position" | "transform.rotationQuat" | "transform.scale";
+export type KeyframeValue = number | Vec3 | Quaternion;
+
+export interface Track {
+  id: EntityId;
+  nodeId: EntityId;
+  property: TrackProperty;
+  keyframeIds: EntityId[];
+}
+
+export interface Keyframe {
+  id: EntityId;
+  timeSeconds: number;
+  value: KeyframeValue;
+  interpolation: "step" | "linear" | "bezier";
+}
+</file>
+
+<file path="src/domain/validate-project.ts">
+import type { EntityId, Keyframe, Light, Node, Project, Track } from "./types";
+
+export type ValidationCode =
+  | "DUPLICATE_ID"
+  | "MISSING_REFERENCE"
+  | "INVALID_HIERARCHY"
+  | "HIERARCHY_CYCLE"
+  | "INVALID_NUMBER"
+  | "INVALID_STRUCTURE";
+
+export interface ValidationIssue {
+  code: ValidationCode;
+  path: string;
+  message: string;
+}
+
+export function validateProject(project: Project): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const entities = new Map<EntityId, string>();
+  const register = (id: EntityId, path: string): void => {
+    const previous = entities.get(id);
+    if (previous !== undefined) {
+      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
+    } else {
+      entities.set(id, path);
+    }
+  };
+  const finite = (value: number, path: string): void => {
+    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
+  };
+  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
+    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
+  };
+
+  register(project.id, "id");
+  register(project.model.id, "model.id");
+  finite(project.model.revision, "model.revision");
+  register(project.scene.id, "scene.id");
+  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
+  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
+  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
+  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
+  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
+  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
+  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
+  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
+
+  const nodeIds = new Set(project.nodes.map((node) => node.id));
+  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
+  const materialIds = new Set(project.materials.map((material) => material.id));
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const trackIds = new Set(project.tracks.map((track) => track.id));
+  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
+
+  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
+  if (root === undefined) {
+    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
+  } else if (root.parentId !== null) {
+    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
+  }
+
+  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  for (const node of project.nodes) {
+    if (node.id !== project.model.rootNodeId && node.parentId === null) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
+    }
+    const childSet = new Set<EntityId>();
+    for (const childId of node.children) {
+      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
+      childSet.add(childId);
+      const child = nodesById.get(childId);
+      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
+      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
+    }
+    if (node.parentId !== null) {
+      const parent = nodesById.get(node.parentId);
+      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
+      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
+    }
+    checkTransform(node, finite, `nodes.${node.id}.transform`);
+    if (node.kind === "mesh") {
+      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
+      else for (const [name, value] of Object.entries(node.meshSource.parameters)) finite(value, `nodes.${node.id}.meshSource.parameters.${name}`);
+    }
+    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
+      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
+      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
+    }
+    const orderedModifiers = node.modifierIds
+      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
+      .filter((modifier) => modifier !== undefined);
+    for (let index = 1; index < orderedModifiers.length; index += 1) {
+      const previous = orderedModifiers[index - 1];
+      const current = orderedModifiers[index];
+      if (previous && current && previous.order >= current.order) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
+        break;
+      }
+    }
+  }
+
+  if (root !== undefined) {
+    const visited = new Set<EntityId>();
+    const active = new Set<EntityId>();
+    const visit = (node: Node): void => {
+      if (active.has(node.id)) {
+        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
+        return;
+      }
+      if (visited.has(node.id)) return;
+      active.add(node.id);
+      visited.add(node.id);
+      for (const childId of node.children) {
+        const child = nodesById.get(childId);
+        if (child) visit(child);
+      }
+      active.delete(node.id);
+    };
+    visit(root);
+    for (const node of project.nodes) {
+      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
+    }
+  }
+
+  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
+  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
+  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
+  finite(project.scene.camera.near, "scene.camera.near");
+  finite(project.scene.camera.far, "scene.camera.far");
+  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
+  finite(project.scene.background.intensity, "scene.background.intensity");
+  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
+  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
+  project.scene.instances.forEach((instance, index) => {
+    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
+    checkTransform(instance, finite, `scene.instances[${index}].transform`);
+  });
+
+  for (const modifier of project.modifiers) {
+    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
+    finite(modifier.order, `modifiers.${modifier.id}.order`);
+    finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
+    }
+    for (const [name, value] of Object.entries(modifier.parameters)) {
+      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
+      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+  }
+  for (const material of project.materials) {
+    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
+      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
+    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
+    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
+    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+  }
+  for (const clip of project.animations) {
+    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
+    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
+  }
+  for (const track of project.tracks) {
+    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
+    const usedKeys = new Set<EntityId>();
+    for (const keyframeId of track.keyframeIds) {
+      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
+      usedKeys.add(keyframeId);
+      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
+    }
+  }
+  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
+  return issues;
+}
+
+function checkTransform(
+  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
+  finite: (value: number, path: string) => void,
+  path: string,
+): void {
+  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
+  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
+  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
+}
+
+function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
+  finite(light.intensity, `scene.lights[${index}].intensity`);
+  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
+  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
+  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
+}
+
+function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
+  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
+  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
+  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
+}
+</file>
+
+<file path="src/ui/styles/tokens.css">
+:root {
+  color-scheme: light;
+
+  /* Approved TRIAD-3D base palette. Keep these values unchanged. */
+  --color-surface-base: #f2f2f2;
+  --color-surface-background: #e5e5e5;
+  --color-text-primary: #303030;
+  --color-primary-accent: #7497dc;
+  --color-primary-accent-strong: #5c83d2;
+  --color-glass-surface: #e3e3e3;
+  --color-stroke: #c9c9c9;
+
+  /* Supporting neutral surfaces and text. */
+  --color-surface-raised: #fafafa;
+  --color-surface-sunken: #dcdcdc;
+  --color-text-secondary: #5d5d5d;
+  --color-text-muted: #707070;
+  --color-text-on-accent: #303030;
+
+  /* Semantic states are separate from the approved brand palette. */
+  --color-state-info: #315f9e;
+  --color-state-info-surface: #e8eff9;
+  --color-state-success: #27633f;
+  --color-state-success-surface: #e7f2e9;
+  --color-state-warning: #76520b;
+  --color-state-warning-surface: #fbf1d8;
+  --color-state-danger: #a1262d;
+  --color-state-danger-surface: #fae9e9;
+
+  --font-family-ui: "Segoe UI", "Segoe UI Variable", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-family-display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-family-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --font-size-xs: 0.6875rem;
+  --font-size-sm: 0.75rem;
+  --font-size-md: 0.8125rem;
+  --font-size-lg: 0.9375rem;
+  --font-size-xl: 1.125rem;
+  --font-size-display: 1.375rem;
+  --line-height-tight: 1.25;
+  --line-height-normal: 1.45;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  --border-width-hairline: 1px;
+  --border-width-strong: 2px;
+  --border-default: var(--border-width-hairline) solid var(--color-stroke);
+  --border-focus: var(--border-width-strong) solid var(--color-primary-accent-strong);
+  --focus-ring: 0 0 0 3px rgb(92 131 210 / 32%);
+  --focus-ring-offset: 2px;
+
+  --shadow-panel: 0 2px 8px rgb(35 42 55 / 8%), 0 1px 2px rgb(35 42 55 / 5%);
+  --shadow-popover: 0 12px 32px rgb(35 42 55 / 16%), 0 2px 8px rgb(35 42 55 / 8%);
+  --shadow-modal: 0 24px 64px rgb(24 30 40 / 24%), 0 4px 16px rgb(24 30 40 / 12%);
+
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-dock: 20;
+  --z-tooltip: 30;
+  --z-modal-backdrop: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+
+  /* Compact desktop control and workspace dimensions. */
+  --control-height-xs: 24px;
+  --control-height-sm: 28px;
+  --control-height-md: 32px;
+  --control-height-lg: 36px;
+  --control-icon-size: 16px;
+  --control-hit-target: 32px;
+  --toolbar-height: 48px;
+  --dock-width-min: 220px;
+  --dock-width-default: 280px;
+  --timeline-height: 176px;
+  --control-gap: var(--space-2);
+  --control-padding-inline: var(--space-3);
+  --panel-padding: var(--space-3);
+  --density-compact: 0.875;
+
+  --motion-fast: 120ms;
+  --motion-normal: 180ms;
+  --motion-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-normal: 0ms;
+  }
+}
+
+/* Shared baseline for future UI consumers; no font files or remote requests. */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: var(--font-family-ui);
+  color: var(--color-text-primary);
+  background: var(--color-surface-background);
+  font-size: 14px;
+  line-height: var(--line-height-normal);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+:where(button, input, select, textarea, a, [tabindex]):focus-visible {
+  outline: var(--border-focus);
+  outline-offset: var(--focus-ring-offset);
+  box-shadow: var(--focus-ring);
+}
+
+:where(button, input, select, textarea):disabled,
+:where([aria-disabled="true"]) {
+  cursor: not-allowed;
+}
+
+::selection {
+  color: var(--color-text-primary);
+  background: var(--color-primary-accent);
+}
+</file>
+
+<file path="tests/domain/project.test.ts">
+import { describe, expect, it } from "vitest";
+import { createProject } from "../../src/domain/create-project";
+import { validateProject } from "../../src/domain/validate-project";
+import {
+  createDuplicateIdProject,
+  createInvalidHierarchyProject,
+  createInvalidNumberProject,
+  createMaterialAnimationProject,
+  createMissingReferenceProject,
+  createNestedMeshProject,
+  emptyProject,
+} from "../fixtures/projects";
+
+describe("project document graph", () => {
+  it("creates a valid empty project with one model, scene, root and default camera/environment", () => {
+    expect(validateProject(emptyProject)).toEqual([]);
+    expect(emptyProject.nodes).toHaveLength(1);
+    expect(emptyProject.model.rootNodeId).toBe(emptyProject.nodes[0]?.id);
+    expect(emptyProject.scene.camera.projection).toBe("perspective");
+    expect(emptyProject.scene.lights).toHaveLength(1);
+    expect(emptyProject.scene.instances).toEqual([]);
+  });
+
+  it("generates distinct stable entity ids through the supplied id factory", () => {
+    let sequence = 0;
+    const project = createProject(() => `generated-${++sequence}`);
+    expect(project.id).toBe("generated-1");
+    expect(project.model.id).toBe("generated-2");
+    expect(validateProject(project)).toEqual([]);
+  });
+
+  it("accepts nested groups and a parameterized mesh source", () => {
+    const project = createNestedMeshProject();
+    expect(validateProject(project)).toEqual([]);
+    expect(project.nodes.some((node) => node.kind === "mesh" && node.meshSource.kind === "primitive")).toBe(true);
+  });
+
+  it("accepts material and animation references", () => {
+    const project = createMaterialAnimationProject();
+    expect(validateProject(project)).toEqual([]);
+  });
+
+  it("diagnoses a modifier list that disagrees with explicit stack order", () => {
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh");
+    if (!mesh) throw new Error("Fixture mesh missing");
+    mesh.modifierIds.push("modifier-a", "modifier-b");
+    project.modifiers.push(
+      { id: "modifier-a", nodeId: mesh.id, kind: "mirror", order: 2, enabled: true, version: 1, parameters: {} },
+      { id: "modifier-b", nodeId: mesh.id, kind: "bevel", order: 1, enabled: true, version: 1, parameters: {} },
+    );
+    expect(validateProject(project).some((issue) => issue.code === "INVALID_STRUCTURE")).toBe(true);
+  });
+
+  it("reports duplicate IDs", () => {
+    expect(validateProject(createDuplicateIdProject()).some((issue) => issue.code === "DUPLICATE_ID")).toBe(true);
+  });
+
+  it("reports inconsistent parent/children links and hierarchy cycles", () => {
+    const issues = validateProject(createInvalidHierarchyProject());
+    expect(issues.some((issue) => issue.code === "HIERARCHY_CYCLE")).toBe(true);
+    expect(issues.some((issue) => issue.code === "INVALID_HIERARCHY")).toBe(true);
+  });
+
+  it("reports non-finite transform values", () => {
+    expect(validateProject(createInvalidNumberProject()).some((issue) => issue.code === "INVALID_NUMBER")).toBe(true);
+  });
+
+  it("reports missing references", () => {
+    expect(validateProject(createMissingReferenceProject()).some((issue) => issue.code === "MISSING_REFERENCE")).toBe(true);
+  });
+});
+</file>
+
+<file path="tests/fixtures/projects.ts">
+import { createProject } from "../../src/domain/create-project";
+import type { Material, MeshNode, Project } from "../../src/domain/types";
+
+function projectWithIds(): Project {
+  let next = 0;
+  return createProject(() => `id-${++next}`);
+}
+
+export const emptyProject = projectWithIds();
+
+export function createNestedMeshProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  const groupId = "nested-group";
+  const meshId = "mesh-node";
+  const group = {
+    id: groupId,
+    kind: "group" as const,
+    name: "Вложенная группа",
+    parentId: root.id,
+    children: [meshId],
+    transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
+    visible: true,
+    locked: false,
+    materialSlots: [],
+    modifierIds: [],
+  };
+  const mesh: MeshNode = {
+    ...group,
+    id: meshId,
+    kind: "mesh",
+    name: "Куб",
+    parentId: groupId,
+    children: [],
+    meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
+  };
+  project.nodes.push(group, mesh);
+  root.children.push(groupId);
+  return project;
+}
+
+export function createMaterialAnimationProject(): Project {
+  const project = createNestedMeshProject();
+  const material: Material = {
+    id: "material-1",
+    name: "Хром",
+    baseColor: [0.8, 0.8, 0.8],
+    metalness: 1,
+    roughness: 0.18,
+    emissive: [0, 0, 0],
+    opacity: 1,
+    transmission: 0,
+    ior: 1.5,
+    clearcoat: 0,
+    envIntensity: 1,
+    textureAssetIds: [],
+  };
+  project.materials.push(material);
+  const mesh = project.nodes.find((node) => node.kind === "mesh");
+  if (!mesh) throw new Error("Fixture mesh missing");
+  mesh.materialSlots.push({ name: "Основной", materialId: material.id });
+  project.animations.push({ id: "clip-1", name: "Подъём", durationSeconds: 2, loop: false, trackIds: ["track-1"] });
+  project.tracks.push({ id: "track-1", nodeId: mesh.id, property: "transform.position", keyframeIds: ["key-1", "key-2"] });
+  project.keyframes.push(
+    { id: "key-1", timeSeconds: 0, value: [0, 0, 0], interpolation: "linear" },
+    { id: "key-2", timeSeconds: 2, value: [0, 1, 0], interpolation: "linear" },
+  );
+  return project;
+}
+
+export function createInvalidHierarchyProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const group = project.nodes.find((node) => node.id === "nested-group");
+  if (!root || !group) throw new Error("Fixture hierarchy missing");
+  root.parentId = group.id;
+  group.children.push(root.id);
+  return project;
+}
+
+export function createDuplicateIdProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const duplicate = project.nodes.find((node) => node.id === "mesh-node");
+  if (!root || !duplicate) throw new Error("Fixture nodes missing");
+  duplicate.id = root.id;
+  return project;
+}
+
+export function createInvalidNumberProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.transform.position = [Number.NaN, 0, 0];
+  return project;
+}
+
+export function createMissingReferenceProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.children.push("absent-node");
+  return project;
+}
+</file>
+
+<file path="tests/visual/design-tokens.html">
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>TRIAD-3D — проверка дизайн-токенов</title>
+    <link rel="stylesheet" href="../../src/ui/styles/tokens.css" />
+    <style>
+      body { margin: 0; min-width: 760px; background: var(--color-surface-background); }
+      .page { max-width: 1440px; margin: 0 auto; padding: var(--space-8); }
+      .page-header { display: flex; align-items: end; justify-content: space-between; margin-bottom: var(--space-6); }
+      .eyebrow { margin: 0 0 var(--space-1); color: var(--color-text-muted); font-size: var(--font-size-xs); font-weight: var(--font-weight-semibold); letter-spacing: .09em; text-transform: uppercase; }
+      h1, h2, h3, p { margin-top: 0; }
+      h1 { margin-bottom: 0; font-family: var(--font-family-display); font-size: var(--font-size-display); line-height: var(--line-height-tight); }
+      h2 { margin-bottom: var(--space-3); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+      h3 { margin-bottom: var(--space-2); font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+      .caption { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .workspace { overflow: hidden; border: var(--border-default); border-radius: var(--radius-lg); background: var(--color-surface-base); box-shadow: var(--shadow-panel); }
+      .topbar { display: flex; height: var(--toolbar-height); align-items: center; justify-content: space-between; padding: 0 var(--space-4); border-bottom: var(--border-default); background: var(--color-surface-base); }
+      .brand, .toolbar-group, .row { display: flex; align-items: center; gap: var(--space-2); }
+      .brand { gap: var(--space-3); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+      .brand-mark { display: grid; width: 26px; height: 26px; place-items: center; border-radius: var(--radius-sm); background: var(--color-primary-accent); font-size: var(--font-size-xs); }
+      .topbar-label { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .toolbar-separator { width: 1px; height: 20px; margin: 0 var(--space-2); background: var(--color-stroke); }
+      .button { display: inline-flex; min-height: var(--control-height-md); align-items: center; justify-content: center; gap: var(--space-2); padding: 0 var(--control-padding-inline); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); font-size: var(--font-size-sm); font-weight: var(--font-weight-medium); cursor: pointer; transition: background-color var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease); }
+      .button:hover:not(:disabled) { background: var(--color-surface-background); }
+      .button--primary { border-color: var(--color-primary-accent-strong); background: var(--color-primary-accent); color: var(--color-text-on-accent); font-weight: var(--font-weight-semibold); }
+      .button--primary:hover:not(:disabled) { background: #86a5e2; }
+      .button--selected { border-color: var(--color-primary-accent-strong); background: rgb(116 151 220 / 22%); }
+      .button:disabled { border-color: var(--color-stroke); background: var(--color-surface-background); color: var(--color-text-muted); opacity: .72; }
+      .icon-button { width: var(--control-hit-target); min-height: var(--control-hit-target); padding: 0; }
+      .workarea { display: grid; min-height: 500px; grid-template-columns: 248px minmax(260px, 1fr) 292px; }
+      .dock { padding: var(--panel-padding); background: var(--color-surface-base); }
+      .dock--left { border-right: var(--border-default); }
+      .dock--right { border-left: var(--border-default); }
+      .dock-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
+      .dock-heading h2 { margin: 0; }
+      .muted { color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .search { width: 100%; height: var(--control-height-sm); margin-bottom: var(--space-3); padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+      .tree { display: grid; gap: 2px; }
+      .tree-item { display: flex; min-height: var(--control-height-md); align-items: center; gap: var(--space-2); padding: 0 var(--space-2); border-radius: var(--radius-sm); color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+      .tree-item--selected { background: rgb(116 151 220 / 24%); color: var(--color-text-primary); font-weight: var(--font-weight-semibold); box-shadow: inset 2px 0 var(--color-primary-accent-strong); }
+      .tree-item__icon { width: 16px; text-align: center; color: var(--color-text-muted); }
+      .tree-item__meta { margin-left: auto; color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .section { margin-top: var(--space-6); }
+      .viewport { display: grid; min-width: 0; grid-template-rows: 1fr auto; background: radial-gradient(ellipse at 50% 42%, #f6f6f6 0%, #ececec 55%, #e6e6e6 100%); }
+      .viewport-stage { display: grid; min-height: 350px; place-items: center; background-image: linear-gradient(rgb(201 201 201 / 22%) 1px, transparent 1px), linear-gradient(90deg, rgb(201 201 201 / 22%) 1px, transparent 1px); background-position: center; background-size: 28px 28px; }
+      .object-preview { display: grid; width: 112px; height: 112px; place-items: center; border: 1px solid rgb(48 48 48 / 14%); border-radius: 28px; background: linear-gradient(145deg, #91afe7, #5c83d2); box-shadow: 16px 20px 30px rgb(48 48 48 / 18%), inset -8px -10px 18px rgb(39 71 130 / 22%), inset 8px 8px 18px rgb(255 255 255 / 52%); transform: rotate(-12deg) skewY(-3deg); }
+      .object-preview span { color: rgb(255 255 255 / 86%); font-family: var(--font-family-display); font-size: 30px; font-weight: var(--font-weight-semibold); transform: rotate(12deg); }
+      .viewport-caption { display: flex; justify-content: space-between; padding: var(--space-2) var(--space-3); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      .property-group { margin-bottom: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+      .property-group__title { display: flex; min-height: var(--control-height-md); align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+      .property-group__body { display: grid; gap: var(--space-3); padding: var(--space-3); }
+      .field-label { display: block; margin-bottom: var(--space-1); color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+      .field { display: flex; width: 100%; height: var(--control-height-md); align-items: center; padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+      .field--error { border-color: var(--color-state-danger); background: var(--color-state-danger-surface); }
+      .field-note { margin: var(--space-1) 0 0; color: var(--color-state-danger); font-size: var(--font-size-xs); }
+      .field-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-2); }
+      .swatches { display: grid; grid-template-columns: repeat(4, minmax(100px, 1fr)); gap: var(--space-2); }
+      .swatch { overflow: hidden; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); }
+      .swatch__color { height: 38px; border-bottom: var(--border-default); }
+      .swatch__label { padding: var(--space-2); font-size: var(--font-size-xs); }
+      .swatch__label strong, .swatch__label code { display: block; }
+      .swatch__label code { margin-top: 2px; color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: 10px; }
+      .token-board { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-top: var(--space-4); }
+      .card { padding: var(--space-4); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-base); box-shadow: var(--shadow-panel); }
+      .card > :last-child { margin-bottom: 0; }
+      .button-states { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+      .semantic-row { display: grid; gap: var(--space-2); }
+      .state { padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); font-size: var(--font-size-sm); }
+      .state--info { color: var(--color-state-info); background: var(--color-state-info-surface); }
+      .state--success { color: var(--color-state-success); background: var(--color-state-success-surface); }
+      .state--warning { color: var(--color-state-warning); background: var(--color-state-warning-surface); }
+      .state--danger { color: var(--color-state-danger); background: var(--color-state-danger-surface); }
+      .type-sample { display: flex; align-items: baseline; justify-content: space-between; padding: var(--space-2) 0; border-bottom: 1px solid var(--color-surface-background); }
+      .type-sample:last-child { border: 0; }
+      .type-sample span:last-child { color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: var(--font-size-xs); }
+      .glass-card { padding: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: rgb(227 227 227 / 76%); color: var(--color-text-primary); backdrop-filter: blur(8px); }
+      .tooltip { position: relative; display: inline-flex; z-index: var(--z-tooltip); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: #303030; color: #f2f2f2; box-shadow: var(--shadow-popover); font-size: var(--font-size-xs); }
+      .timeline { margin-top: var(--space-4); padding: var(--space-3); border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-base); }
+      .timeline-ruler { display: grid; grid-template-columns: repeat(9, 1fr); margin-top: var(--space-3); padding-top: var(--space-2); border-top: 1px solid var(--color-stroke); color: var(--color-text-muted); font-family: var(--font-family-mono); font-size: 10px; }
+      .track { position: relative; height: 24px; margin-top: var(--space-2); border-radius: var(--radius-xs); background: var(--color-surface-background); }
+      .track::before { position: absolute; top: 11px; right: 6%; left: 8%; height: 2px; background: var(--color-primary-accent-strong); content: ""; }
+      .key { position: absolute; top: 7px; width: 9px; height: 9px; border: 1px solid var(--color-primary-accent-strong); background: var(--color-primary-accent); transform: rotate(45deg); }
+      .key:nth-child(1) { left: 8%; } .key:nth-child(2) { left: 34%; } .key:nth-child(3) { left: 61%; } .key:nth-child(4) { left: 91%; }
+      .footer-note { margin-top: var(--space-4); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+      @media (max-width: 980px) { .page { padding: var(--space-4); } .workarea { grid-template-columns: 210px minmax(250px, 1fr) 260px; } .swatches { grid-template-columns: repeat(2, 1fr); } }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="page-header">
+        <div><p class="eyebrow">TRIAD-3D · UI foundation</p><h1>Проверка дизайн-токенов</h1></div>
+        <p class="caption">Компактный desktop · светлая тема · статический макет</p>
+      </header>
+
+      <section class="workspace" aria-label="Пример рабочего пространства редактора">
+        <div class="topbar">
+          <div class="brand"><span class="brand-mark" aria-hidden="true">T</span><span>TRIAD-3D</span><span class="topbar-label">· Новый проект</span></div>
+          <div class="toolbar-group" aria-label="Команды проекта">
+            <button class="button icon-button" type="button" aria-label="Отменить" title="Отменить">↶</button>
+            <button class="button icon-button" type="button" aria-label="Повторить" title="Повторить">↷</button>
+            <span class="toolbar-separator" aria-hidden="true"></span>
+            <button class="button" type="button">Сохранить</button>
+            <button class="button button--primary" type="button">Экспорт</button>
+          </div>
+        </div>
+        <div class="workarea">
+          <aside class="dock dock--left" aria-label="Дерево объектов">
+            <div class="dock-heading"><h2>Объекты</h2><span class="muted">3 узла</span></div>
+            <input class="search" type="search" aria-label="Поиск объектов" placeholder="Найти объект…" />
+            <div class="tree" role="tree" aria-label="Иерархия сцены">
+              <div class="tree-item" role="treeitem" tabindex="0"><span class="tree-item__icon" aria-hidden="true">⌄</span><span class="tree-item__icon" aria-hidden="true">▱</span><span>Модель</span></div>
+              <div class="tree-item tree-item--selected" role="treeitem" aria-selected="true" tabindex="0"><span class="tree-item__icon" aria-hidden="true">◈</span><span>Тор</span><span class="tree-item__meta">Выбран</span></div>
+              <div class="tree-item" role="treeitem" tabindex="0"><span class="tree-item__icon" aria-hidden="true">◉</span><span>Сцена</span></div>
+            </div>
+            <div class="section"><div class="dock-heading"><h2>Состояния дерева</h2></div>
+              <div class="tree-item tree-item--selected" aria-label="Выбранный элемент"><span class="tree-item__icon" aria-hidden="true">◈</span><span>Выбранный</span></div>
+              <div class="tree-item" aria-disabled="true"><span class="tree-item__icon" aria-hidden="true">▣</span><span>Заблокированный</span><span class="tree-item__meta">🔒</span></div>
+            </div>
+          </aside>
+
+          <section class="viewport" aria-label="Область просмотра">
+            <div class="viewport-stage"><div class="object-preview" aria-label="Декоративный пример выбранного объекта"><span>3D</span></div></div>
+            <div class="viewport-caption"><span>Перспектива · Материал: базовый</span><span>100%</span></div>
+          </section>
+
+          <aside class="dock dock--right" aria-label="Инспектор свойств">
+            <div class="dock-heading"><h2>Инспектор</h2><span class="muted">Тор</span></div>
+            <section class="property-group">
+              <div class="property-group__title"><span>Преобразование</span><span aria-hidden="true">⌃</span></div>
+              <div class="property-group__body">
+                <div><label class="field-label" for="position-x">Позиция</label><div class="field-row"><input class="field" id="position-x" value="0.00" aria-label="Позиция по X" /><input class="field" value="0.00" aria-label="Позиция по Y" /><input class="field" value="0.00" aria-label="Позиция по Z" /></div></div>
+                <div><label class="field-label" for="radius">Радиус</label><input class="field" id="radius" value="1.25" /></div>
+              </div>
+            </section>
+            <section class="property-group">
+              <div class="property-group__title"><span>Геометрия · пример ошибки</span><span aria-hidden="true">⌃</span></div>
+              <div class="property-group__body">
+                <div><label class="field-label" for="segments">Сегменты</label><input class="field field--error" id="segments" value="NaN" aria-invalid="true" aria-describedby="segments-error" /><p class="field-note" id="segments-error">Введите целое число от 3 до 256</p></div>
+                <button class="button" type="button" disabled>Пересчитать · недоступно</button>
+              </div>
+            </section>
+            <section class="property-group">
+              <div class="property-group__title"><span>Материал</span><span aria-hidden="true">⌄</span></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section class="token-board" aria-label="Примеры токенов и контролов">
+        <article class="card">
+          <h2>Основные поверхности и цвета</h2>
+          <div class="swatches">
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-surface-base)"></div><div class="swatch__label"><strong>Surface base</strong><code>#F2F2F2</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-surface-background)"></div><div class="swatch__label"><strong>Background</strong><code>#E5E5E5</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-primary-accent)"></div><div class="swatch__label"><strong>Accent</strong><code>#7497DC</code></div></div>
+            <div class="swatch"><div class="swatch__color" style="background:var(--color-primary-accent-strong)"></div><div class="swatch__label"><strong>Accent strong</strong><code>#5C83D2</code></div></div>
+          </div>
+          <div class="section"><h3>Полупрозрачная поверхность</h3><div class="glass-card">Текст сохраняет контраст на glass-поверхности. Прозрачность применяется к самой поверхности.</div></div>
+        </article>
+
+        <article class="card">
+          <h2>Типографика</h2>
+          <div class="type-sample"><span style="font-size:var(--font-size-display);font-weight:var(--font-weight-semibold)">Заголовок панели</span><span>22 px / 600</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-lg);font-weight:var(--font-weight-medium)">Название свойства</span><span>15 px / 500</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-md)">Подпись контрола</span><span>13 px / 400</span></div>
+          <div class="type-sample"><span style="font-size:var(--font-size-xs);color:var(--color-text-secondary)">Вспомогательный текст</span><span>11 px / 400</span></div>
+          <p class="footer-note">Системный стек Windows; внешние шрифты не загружаются.</p>
+        </article>
+
+        <article class="card">
+          <h2>Кнопки и фокус клавиатуры</h2>
+          <div class="button-states">
+            <button class="button" type="button">Обычная</button>
+            <button class="button button--primary" type="button">Основная</button>
+            <button class="button button--selected" type="button" aria-pressed="true">Выбрана</button>
+            <button class="button" type="button" disabled>Недоступна</button>
+            <button class="button" type="button" aria-busy="true">Вычисление…</button>
+          </div>
+          <p class="footer-note">Перейдите клавишей Tab: focus-visible показан контрастным кольцом.</p>
+        </article>
+
+        <article class="card">
+          <h2>Семантические сообщения</h2>
+          <div class="semantic-row">
+            <div class="state state--info" role="status">Подсказка: изменение будет применено после подтверждения.</div>
+            <div class="state state--success" role="status">Готово: параметры сохранены в текущей сессии.</div>
+            <div class="state state--warning" role="status">Внимание: операция может занять больше времени.</div>
+            <div class="state state--danger" role="alert">Ошибка: геометрия не прошла проверку.</div>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>Подсказка и плотность панели</h2>
+          <div class="row"><button class="button" type="button" aria-describedby="demo-tooltip">Курсор или фокус</button><span class="tooltip" id="demo-tooltip" role="tooltip">Переместить объект · G</span></div>
+          <p class="footer-note">Минимальная высота интерактивного контрола: 32 px. Интервалы основаны на шкале 4 / 8 / 12 / 16 / 24 / 32 px.</p>
+        </article>
+
+        <article class="card">
+          <h2>Стеклянная поверхность и радиусы</h2>
+          <div class="glass-card"><strong>Inspector section</strong><p style="margin:var(--space-2) 0 0;font-size:var(--font-size-sm)">Панель с локальной прозрачностью. Текст использует сплошной цвет и остаётся читаемым.</p></div>
+          <p class="footer-note">Радиусы от 3 до 12 px; разделители — утверждённый stroke.</p>
+        </article>
+      </section>
+
+      <section class="timeline" aria-label="Пример временной шкалы">
+        <div class="dock-heading"><h2>Таймлайн</h2><span class="muted">00:00 — 00:04 · ключевые кадры</span></div>
+        <div class="track" aria-label="Дорожка анимации"><span class="key"></span><span class="key"></span><span class="key"></span><span class="key"></span></div>
+        <div class="timeline-ruler" aria-hidden="true"><span>00:00</span><span>00:00.5</span><span>00:01</span><span>00:01.5</span><span>00:02</span><span>00:02.5</span><span>00:03</span><span>00:03.5</span><span>00:04</span></div>
+      </section>
+      <p class="footer-note">Автономная демонстрация TASK-005. Все стили страницы используют токены из <code>src/ui/styles/tokens.css</code>.</p>
+    </main>
+  </body>
+</html>
+</file>
+
+<file path="AGENTS.md">
+# TRIAD-3D — Codex instructions
+
+You are implementing TRIAD-3D based on the approved engineering specification, not improvising product functionality.
+
+## Workflow
+1. Read docs/architecture.md, docs/data-contracts.md and the chosen task from docs/implementation-plan.md.
+2. Check task dependencies and current repository state; do not assume the code exists.
+3. Execute a single coherent task or a tightly coupled set; avoid scope creep.
+4. Keep `domain` as source of truth, with commands/transactions for writes.
+5. Run build/typecheck and targeted tests relevant to the modified code; full suite at milestones.
+6. Report changed paths, concise behavior summary, tests, and known limitations; no long repetitive reports.
+
+## Hard constraints
+- One primary Model and one Scene per project; nested detail groups allowed.
+- In-memory-only session; no localStorage, IndexedDB or server persistence of document/history.
+- Explicit manual project save/reopen via versioned archive.
+- Never eval untrusted TSX/JSX/HTML; static allowlist with diagnostic partial import (NEXT).
+- All geometry modifications rollback on failure.
+- Editor UI Russian, desktop-first, reference Triad Studio visual tokens but respect font licenses.
+- TSX exporter must build in clean Vite/React harness; do not claim glTF preserves arbitrary runtime interactions.
+- Heavy jobs block editing but status and supported cancellation stay responsive.
+- All model modifications derive from user-approved domain state, not direct uncontrolled Three.Object3D mutation.
+
+## Autonomy
+You may create/edit files, install needed libraries, refactor local task implementation and correct errors. You must not silently change domain invariants, delete unrelated data, modify approved scope, ship unsupported features as complete, or alter security/privacy rules without approval.
+
+## Priority
+Geometry → Materials → Animation → TSX/ZIP export; NEXT only after MVP gate.
+</file>
+
+<file path="package.json">
+{
+  "name": "triad-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}
+</file>
+
+<file path="README.md">
+# TRIAD-3D — Codex Engineering Kit
+
+Specification version: 1.0 · 2026-10-19.
+
+This package is planning documentation; it does not contain an implemented editor.
+Full human-readable spec: TRIAD-3D_Master_Project_Specification_v1.0.docx (delivered separately).
+
+**Read order for Codex:** `AGENTS.md` → `docs/architecture.md` → `docs/data-contracts.md` → `docs/requirements.md` → `docs/implementation-plan.md` → `docs/testing.md`.
+
+Counts: 76 FR, 18 NFR, 64 tasks, 35 checks.
+
+Do not start implementation of NEXT features before MVP acceptance.
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}
+</file>
+
+</files>
