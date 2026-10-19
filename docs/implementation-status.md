@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
 ## TASK-006 — React/Vite foundation
 
 - Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.

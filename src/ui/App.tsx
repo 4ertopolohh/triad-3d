@@ -1,9 +1,17 @@
 import { createProject, validateProject } from "../domain";
+import { lazy, Suspense } from "react";
+
+const RendererSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/renderer/RendererSpike"))
+  : null;
 
 const project = createProject();
 const issues = validateProject(project);
 
 export function App() {
+  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
+    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
