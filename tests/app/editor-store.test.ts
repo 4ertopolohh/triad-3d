@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { applyProjectPatch } from "../../src/domain";
+import { applyProjectPatch, createProject } from "../../src/domain";
 import type { GroupNode, ProjectCommand } from "../../src/domain";
 import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
 import { createNestedMeshProject } from "../fixtures/projects";
@@ -221,6 +221,24 @@ describe("editor store", () => {
     expect(store.getAssetBytes().get("asset")).toEqual(new Uint8Array([1, 2]));
     expect(store.replaceProject({ project: next, assets: bytes }, oldIdentity)).toBe(false);
     expect(store.executeCommand(rename("After load"), 0)).toMatchObject({ ok: true, revision: 1 });
+  });
+
+  it("starts a clean new project without carrying old session data", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    expect(store.executeCommand(rename("Changed"), 0).ok).toBe(true);
+    store.setSelection(["mesh-node"]);
+    const stale = store.captureDocument();
+    const fresh = createProject();
+    expect(store.replaceProject({ project: fresh, assets: new AssetBytes() }, stale.identity)).toBe(true);
+    const state = store.getSnapshot();
+    expect(state.document.project.id).toBe(fresh.id);
+    expect(state.document.project.model.rootNodeId).toBe(state.document.project.nodes[0]?.id);
+    expect(state.document.project.scene.instances).toEqual([]);
+    expect(state.document.dirty).toBe(false);
+    expect(state.history.entries).toEqual([]);
+    expect(state.selection.ids).toEqual([]);
+    expect(store.getAssetBytes().ids()).toEqual([]);
+    expect(store.replaceProject({ project: stale.project, assets: stale.assets }, stale.identity)).toBe(false);
   });
 
   it("does not acknowledge a stale save or replace after an edit", () => {

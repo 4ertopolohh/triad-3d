@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-012 — Desktop workspace and topbar
+
+- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
+- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
+- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
+
 ## TASK-011 — Undo/Redo delta history
 
 - Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.

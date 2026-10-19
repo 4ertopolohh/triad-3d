@@ -3386,29 +3386,6 @@ export function useEditorStore(store: EditorStore): EditorState {
 }
 </file>
 
-<file path="src/assets/asset-bytes.ts">
-export class AssetBytes {
-  private readonly values = new Map<string, Uint8Array>();
-
-  constructor(entries: Iterable<readonly [string, Uint8Array]> = []) {
-    for (const [id, bytes] of entries) this.set(id, bytes);
-  }
-
-  get(id: string): Uint8Array | undefined {
-    const bytes = this.values.get(id);
-    return bytes?.slice();
-  }
-
-  set(id: string, bytes: Uint8Array): void {
-    this.values.set(id, bytes.slice());
-  }
-
-  ids(): string[] { return [...this.values.keys()]; }
-  clear(): void { this.values.clear(); }
-  clone(): AssetBytes { return new AssetBytes(this.values); }
-}
-</file>
-
 <file path="src/assets/native-project-archive.ts">
 import { BlobReader, BlobWriter, TextReader, Uint8ArrayReader, ZipReader, ZipWriter } from "@zip.js/zip.js";
 import { deserializeProjectDocument, serializeProjectDocument, validateNativeManifest, NATIVE_FORMAT_VERSION } from "../domain/project-serialization";
@@ -5278,175 +5255,6 @@ describe("Manifold CSG spike", () => {
 });
 </file>
 
-<file path="tests/domain/commands.test.ts">
-import { describe, expect, it } from "vitest";
-import { applyProjectPatch, createCommandBus } from "../../src/domain";
-import type { GroupNode, ProjectCommand } from "../../src/domain";
-import { validateProject } from "../../src/domain/validate-project";
-import { createNestedMeshProject } from "../fixtures/projects";
-
-const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand =>
-  ({ commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name } });
-const flags = (nodeId: string, values: { visible?: boolean; locked?: boolean }, commandId = "flags"): ProjectCommand =>
-  ({ commandId, type: "SET_NODE_FLAGS", targetIds: [nodeId], payload: { nodeId, ...values } });
-const transform = (position: readonly [number, number, number]): ProjectCommand =>
-  ({ commandId: "transform", type: "SET_NODE_TRANSFORM", targetIds: ["mesh-node"], payload: {
-    nodeId: "mesh-node", transform: { position, rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
-  } });
-function add(id: string, parentId = "nested-group"): ProjectCommand {
-  const node: GroupNode = { id, kind: "group", name: "Деталь", parentId, children: [],
-    transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
-    visible: true, locked: false, materialSlots: [], modifierIds: [] };
-  return { commandId: `add-${id}`, type: "ADD_NODE", targetIds: [parentId, id], payload: { parentId, node } };
-}
-
-describe("command bus", () => {
-  it("adds a leaf and keeps both hierarchy links and revisions consistent", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    const result = bus.executeCommand(add("new-leaf"), 0);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.changed).toBe(true);
-    expect(result.revision).toBe(1);
-    expect(result.project.model.revision).toBe(1);
-    expect(result.project.nodes.find((node) => node.id === "new-leaf")?.parentId).toBe("nested-group");
-    expect(result.project.nodes.find((node) => node.id === "nested-group")?.children).toContain("new-leaf");
-    expect(validateProject(result.project)).toEqual([]);
-    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
-  });
-
-  it("renames and transforms only the target and accepts a multi-command transaction once", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    const result = bus.executeTransaction([rename("Новая деталь"), transform([3, 2, 1])], 0, "batch-1");
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(result.id).toBe("batch-1");
-    expect(result.revision).toBe(1);
-    expect(result.project.model.revision).toBe(before.model.revision + 1);
-    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
-    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.transform.position).toEqual([3, 2, 1]);
-    expect(result.project.nodes.find((node) => node.id === "nested-group")).toEqual(before.nodes.find((node) => node.id === "nested-group"));
-    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
-  });
-
-  it("changes flags partially and can unlock or reveal its own node", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
-    expect(bus.executeCommand(rename("Forbidden"), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
-    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
-    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
-    expect(bus.executeCommand(rename("Forbidden"), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
-    expect(bus.executeCommand(flags("mesh-node", { visible: true }), 3).ok).toBe(true);
-    expect(bus.getSnapshot().nodes.find((node) => node.id === "mesh-node")).toMatchObject({ visible: true, locked: false });
-  });
-
-  it("requires recovery actions when a node is locked or hidden", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
-    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
-    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
-    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
-    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
-  });
-
-  it("rejects invalid references in a new leaf after final validation", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    const command = add("bad-ref");
-    if (command.type === "ADD_NODE") command.payload.node.materialSlots.push({ name: "Missing", materialId: "absent" });
-    expect(bus.executeCommand(command, 0)).toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
-    expect(bus.getSnapshot()).toEqual(before);
-    expect(bus.getRevision()).toBe(0);
-  });
-
-  it.each([
-    ["missing target", rename("A", "absent"), "INVALID_REFERENCE"],
-    ["duplicate ID", add("mesh-node"), "INVALID_COMMAND"],
-    ["missing parent", add("new", "absent"), "INVALID_REFERENCE"],
-    ["empty name", rename("   "), "INVALID_COMMAND"],
-    ["NaN", transform([Number.NaN, 0, 0]), "INVALID_COMMAND"],
-    ["Infinity", transform([Infinity, 0, 0]), "INVALID_COMMAND"],
-    ["target mismatch", { ...rename("A"), targetIds: ["nested-group"] }, "INVALID_COMMAND"],
-    ["invalid transform shape", { ...transform([1, 2, 3]), payload: { nodeId: "mesh-node", transform: { position: [1, 2], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] } } }, "INVALID_COMMAND"],
-  ] as const)("rejects %s without mutation", (_label, command, code) => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    expect(bus.executeCommand(command as ProjectCommand, 0)).toMatchObject({ ok: false, code });
-    expect(bus.getSnapshot()).toEqual(before);
-    expect(bus.getRevision()).toBe(0);
-  });
-
-  it("rejects locked and hidden ancestors, including attempts to change descendant flags", () => {
-    for (const ancestorFlag of [{ locked: true }, { visible: false }]) {
-      const bus = createCommandBus(createNestedMeshProject());
-      expect(bus.executeCommand(flags("nested-group", ancestorFlag), 0).ok).toBe(true);
-      const before = bus.getSnapshot();
-      const code = "locked" in ancestorFlag ? "NODE_LOCKED" : "NODE_HIDDEN";
-      expect(bus.executeCommand(rename("No"), 1)).toMatchObject({ ok: false, code });
-      expect(bus.executeCommand(flags("mesh-node", { locked: false, visible: true }), 1)).toMatchObject({ ok: false, code });
-      expect(bus.getSnapshot()).toEqual(before);
-      expect(bus.getRevision()).toBe(1);
-    }
-  });
-
-  it("rolls back a failing second command and allows the next valid operation", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    expect(bus.executeTransaction([add("new-leaf"), rename("No", "missing")], 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
-    expect(bus.getSnapshot()).toEqual(before);
-    expect(bus.getRevision()).toBe(0);
-    expect(bus.executeCommand(rename("Да"), 0).ok).toBe(true);
-  });
-
-  it("captures the final state when a transaction adds and then edits one node", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    const result = bus.executeTransaction([add("new-leaf"), rename("Итог", "new-leaf")], 0);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
-    expect(() => applyProjectPatch(result.project, result.patch)).toThrow();
-  });
-
-  it("rejects stale revisions and leaves semantic no-ops without a revision or patch", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const before = bus.getSnapshot();
-    const noOp = bus.executeCommand(rename("Куб"), 0);
-    expect(noOp).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
-    expect(bus.executeCommand(rename("New"), 1)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
-    expect(bus.getSnapshot()).toEqual(before);
-  });
-
-  it("treats a transaction with no net document change as a no-op", () => {
-    const bus = createCommandBus(createNestedMeshProject());
-    const result = bus.executeTransaction([rename("Temporary", "mesh-node", "first"), rename("Куб", "mesh-node", "second")], 0);
-    expect(result).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
-    expect(bus.getRevision()).toBe(0);
-    expect(bus.getSnapshot().model.revision).toBe(0);
-  });
-
-  it("does not leak input, snapshot, command payload or result references", () => {
-    const input = createNestedMeshProject();
-    const bus = createCommandBus(input);
-    const old = bus.getSnapshot();
-    input.nodes[0]?.children.push("injected");
-    old.nodes[0]?.children.push("injected");
-    const command = add("new-leaf");
-    const result = bus.executeCommand(command, 0);
-    if (command.type === "ADD_NODE") command.payload.node.name = "Tampered";
-    if (result.ok) result.project.nodes[0]?.children.push("tampered");
-    expect(bus.getSnapshot().nodes.find((node) => node.id === "new-leaf")?.name).toBe("Деталь");
-    expect(validateProject(bus.getSnapshot())).toEqual([]);
-    expect(old.nodes.find((node) => node.id === "new-leaf")).toBeUndefined();
-  });
-});
-</file>
-
 <file path="tests/domain/project.test.ts">
 import { describe, expect, it } from "vitest";
 import { createProject } from "../../src/domain/create-project";
@@ -5740,139 +5548,6 @@ test("write generated component for isolated harness", async () => {
   const sourceDirectory = join(output, "src");
   await mkdir(sourceDirectory, { recursive: true });
   await writeFile(join(sourceDirectory, result.filename), result.source, "utf8");
-});
-</file>
-
-<file path="tests/importers/glb.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import { createProject } from "../../src/domain/create-project";
-import { createEditorStore } from "../../src/app/editor-store";
-import { prepareGlb, commitGlb } from "../../src/importers/gltf/import-glb";
-import { applyProjectPatch } from "../../src/domain/command-bus";
-import { createNativeProjectArchive, openNativeProjectArchive, ARCHIVE_LIMITS } from "../../src/assets/native-project-archive";
-
-function fixture(change: (json: Record<string, unknown>) => void = () => {}): Uint8Array {
-  const json: Record<string, unknown> = {
-    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
-    meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
-    buffers: [{ byteLength: 36 }], bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }],
-    accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 0] }],
-  };
-  change(json);
-  const encoded = new TextEncoder().encode(JSON.stringify(json));
-  const jsonLength = Math.ceil(encoded.length / 4) * 4;
-  const bytes = new Uint8Array(12 + 8 + jsonLength + 8 + 36);
-  const view = new DataView(bytes.buffer);
-  view.setUint32(0, 0x46546c67, true); view.setUint32(4, 2, true); view.setUint32(8, bytes.length, true);
-  view.setUint32(12, jsonLength, true); view.setUint32(16, 0x4e4f534a, true);
-  bytes.fill(0x20, 20, 20 + jsonLength); bytes.set(encoded, 20);
-  const binAt = 20 + jsonLength;
-  view.setUint32(binAt, 36, true); view.setUint32(binAt + 4, 0x004e4942, true);
-  for (const [index, value] of [0, 0, 0, 1, 0, 0, 0, 1, 0].entries()) view.setFloat32(binAt + 8 + index * 4, value, true);
-  return bytes;
-}
-function file(bytes: Uint8Array, name = "triangle.glb") { return new File([bytes as BlobPart], name, { type: "model/gltf-binary" }); }
-
-describe("GLB import", () => {
-  it("validates geometry, commits atomically, replays patches and preserves bytes through archive", async () => {
-    const bytes = fixture();
-    const prepared = await prepareGlb(file(bytes));
-    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
-    if (!prepared.ok) return;
-    expect(prepared.value.triangles).toBe(1);
-    const store = createEditorStore(createProject());
-    const before = store.captureDocument();
-    let publications = 0;
-    store.subscribe(() => { publications += 1; expect(store.getSnapshot().document.project.assets.length).toBe(1); expect(store.getAssetBytes().ids()).toHaveLength(1); });
-    const result = commitGlb(store, prepared.value, before.revision, before.identity);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(publications).toBe(1);
-    expect(store.getSnapshot().document.dirty).toBe(true);
-    expect(store.getSnapshot().document.project.nodes).toHaveLength(2);
-    expect(applyProjectPatch(before.project, result.patch)).toEqual(result.project);
-    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.project);
-    const archived = await createNativeProjectArchive(store.captureDocument().project, store.getAssetBytes(), "0.1.0");
-    if (!archived.ok) throw new Error(JSON.stringify(archived.error));
-    if (!archived.ok) return;
-    const opened = await openNativeProjectArchive(archived.value);
-    expect(opened.ok).toBe(true);
-    if (!opened.ok) return;
-    const asset = opened.value.project.assets[0];
-    if (!asset) throw new Error("Missing imported asset");
-    expect(opened.value.assets.get(asset.id)).toEqual(bytes);
-    expect(opened.value.project.nodes[1]).toMatchObject({ parentId: opened.value.project.model.rootNodeId, meshSource: { assetId: asset.id } });
-  });
-
-  it("rejects corrupt or unsupported inputs before parsing and makes no network request", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
-    const cases = [
-      (() => { const value = fixture(); value[0] = 0; return value; })(),
-      (() => { const value = fixture(); new DataView(value.buffer).setUint32(4, 1, true); return value; })(),
-      (() => { const value = fixture(); new DataView(value.buffer).setUint32(8, 1, true); return value; })(),
-      (() => { const value = fixture(); value[20] = 0; return value; })(),
-      fixture((json) => { json.buffers = [{ byteLength: 36, uri: "https://example.com/model.bin" }]; }),
-      fixture((json) => { json.images = [{ uri: "../../secret.png" }]; }),
-      fixture((json) => { json.extensionsRequired = ["KHR_draco_mesh_compression"]; }),
-      fixture((json) => { json.animations = [{}]; }),
-      fixture((json) => { json.meshes = []; }),
-    ];
-    try {
-      for (const bytes of cases) expect((await prepareGlb(file(bytes))).ok).toBe(false);
-      expect((await prepareGlb(file(new Uint8Array(ARCHIVE_LIMITS.asset + 1)))).ok).toBe(false);
-      expect(fetchSpy).not.toHaveBeenCalled();
-    } finally { fetchSpy.mockRestore(); }
-  });
-
-  it("rejects a stale preparation without changing project, bytes or history", async () => {
-    const prepared = await prepareGlb(file(fixture()));
-    expect(prepared.ok).toBe(true);
-    if (!prepared.ok) return;
-    const store = createEditorStore(createProject());
-    const captured = store.captureDocument();
-    store.replaceProject({ project: createProject(), assets: store.getAssetBytes() }, captured.identity);
-    const before = store.getSnapshot();
-    expect(commitGlb(store, prepared.value, captured.revision, captured.identity).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(before);
-    expect(store.getAssetBytes().ids()).toHaveLength(0);
-  });
-
-  it("reuses identical bytes and rejects revision conflicts", async () => {
-    const prepared = await prepareGlb(file(fixture()));
-    if (!prepared.ok) throw new Error("fixture did not parse");
-    const store = createEditorStore(createProject());
-    const firstCapture = store.captureDocument();
-    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(true);
-    const afterFirst = store.captureDocument();
-    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(false);
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    expect(commitGlb(store, prepared.value, afterFirst.revision, afterFirst.identity).ok).toBe(true);
-    expect(store.getSnapshot().document.project.assets).toHaveLength(1);
-    expect(store.getAssetBytes().ids()).toHaveLength(1);
-    expect(store.getSnapshot().document.project.nodes).toHaveLength(3);
-  });
-
-  it("rolls back asset bytes and history on an entity ID conflict", async () => {
-    const prepared = await prepareGlb(file(fixture()));
-    if (!prepared.ok) throw new Error("fixture did not parse");
-    const store = createEditorStore(createProject());
-    const captured = store.captureDocument();
-    const rootId = captured.project.model.rootNodeId;
-    const assetId = crypto.randomUUID();
-    const command = {
-      commandId: crypto.randomUUID(), type: "ADD_MESH_ASSET" as const,
-      targetIds: [rootId, rootId, assetId] as [string, string, string],
-      payload: { parentId: rootId, node: {
-        id: rootId, kind: "mesh" as const, name: "bad", parentId: rootId, children: [],
-        transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
-        visible: true, locked: false, materialSlots: [], modifierIds: [], meshSource: { kind: "asset" as const, assetId },
-      }, asset: { id: assetId, hash: prepared.value.hash, path: `assets/${prepared.value.hash}.glb`, mediaType: "model/gltf-binary", colorSpace: "none" as const } },
-    };
-    expect(store.addMeshAsset(command, prepared.value.bytes, captured.revision, captured.identity).ok).toBe(false);
-    expect(store.getSnapshot().document.project).toEqual(captured.project);
-    expect(store.getSnapshot().history.entries).toHaveLength(0);
-    expect(store.getAssetBytes().ids()).toHaveLength(0);
-  });
 });
 </file>
 
@@ -6173,6 +5848,694 @@ export default defineConfig({
 });
 </file>
 
+<file path="src/assets/asset-bytes.ts">
+export class AssetBytes {
+  private readonly values = new Map<string, Uint8Array>();
+
+  constructor(entries: Iterable<readonly [string, Uint8Array]> = []) {
+    for (const [id, bytes] of entries) this.set(id, bytes);
+  }
+
+  get(id: string): Uint8Array | undefined {
+    const bytes = this.values.get(id);
+    return bytes?.slice();
+  }
+
+  set(id: string, bytes: Uint8Array): void {
+    this.values.set(id, bytes.slice());
+  }
+
+  ids(): string[] { return [...this.values.keys()]; }
+  delete(id: string): void { this.values.delete(id); }
+  clear(): void { this.values.clear(); }
+  clone(): AssetBytes { return new AssetBytes(this.values); }
+}
+</file>
+
+<file path="src/domain/validate-project.ts">
+import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+
+export type ValidationCode =
+  | "DUPLICATE_ID"
+  | "MISSING_REFERENCE"
+  | "INVALID_HIERARCHY"
+  | "HIERARCHY_CYCLE"
+  | "INVALID_NUMBER"
+  | "INVALID_STRUCTURE";
+
+export interface ValidationIssue {
+  code: ValidationCode;
+  path: string;
+  message: string;
+}
+
+export function validateProject(project: Project): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const entities = new Map<EntityId, string>();
+  const register = (id: EntityId, path: string): void => {
+    const previous = entities.get(id);
+    if (previous !== undefined) {
+      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
+    } else {
+      entities.set(id, path);
+    }
+  };
+  const finite = (value: number, path: string): void => {
+    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
+  };
+  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
+    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
+  };
+
+  register(project.id, "id");
+  register(project.model.id, "model.id");
+  finite(project.model.revision, "model.revision");
+  register(project.scene.id, "scene.id");
+  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
+  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
+  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
+  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
+  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
+  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
+  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
+  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
+
+  const nodeIds = new Set(project.nodes.map((node) => node.id));
+  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
+  const materialIds = new Set(project.materials.map((material) => material.id));
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const trackIds = new Set(project.tracks.map((track) => track.id));
+  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
+
+  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
+  if (root === undefined) {
+    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
+  } else if (root.parentId !== null) {
+    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
+  }
+
+  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  for (const node of project.nodes) {
+    if (node.id !== project.model.rootNodeId && node.parentId === null) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
+    }
+    const childSet = new Set<EntityId>();
+    for (const childId of node.children) {
+      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
+      childSet.add(childId);
+      const child = nodesById.get(childId);
+      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
+      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
+    }
+    if (node.parentId !== null) {
+      const parent = nodesById.get(node.parentId);
+      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
+      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
+    }
+    checkTransform(node, finite, `nodes.${node.id}.transform`);
+    if (node.kind === "mesh") {
+      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
+      else for (const [name, value] of Object.entries(node.meshSource.parameters)) finite(value, `nodes.${node.id}.meshSource.parameters.${name}`);
+    }
+    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
+      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
+      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
+    }
+    const orderedModifiers = node.modifierIds
+      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
+      .filter((modifier) => modifier !== undefined);
+    for (let index = 1; index < orderedModifiers.length; index += 1) {
+      const previous = orderedModifiers[index - 1];
+      const current = orderedModifiers[index];
+      if (previous && current && previous.order >= current.order) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
+        break;
+      }
+    }
+  }
+
+  if (root !== undefined) {
+    const visited = new Set<EntityId>();
+    const active = new Set<EntityId>();
+    const visit = (node: Node): void => {
+      if (active.has(node.id)) {
+        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
+        return;
+      }
+      if (visited.has(node.id)) return;
+      active.add(node.id);
+      visited.add(node.id);
+      for (const childId of node.children) {
+        const child = nodesById.get(childId);
+        if (child) visit(child);
+      }
+      active.delete(node.id);
+    };
+    visit(root);
+    for (const node of project.nodes) {
+      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
+    }
+  }
+
+  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
+  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
+  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
+  finite(project.scene.camera.near, "scene.camera.near");
+  finite(project.scene.camera.far, "scene.camera.far");
+  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
+  finite(project.scene.background.intensity, "scene.background.intensity");
+  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
+  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
+  project.scene.instances.forEach((instance, index) => {
+    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
+    checkTransform(instance, finite, `scene.instances[${index}].transform`);
+  });
+
+  for (const modifier of project.modifiers) {
+    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
+    finite(modifier.order, `modifiers.${modifier.id}.order`);
+    finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
+    }
+    for (const [name, value] of Object.entries(modifier.parameters)) {
+      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
+      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+  }
+  for (const material of project.materials) {
+    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
+      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
+    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
+    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
+    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+  }
+  for (const clip of project.animations) {
+    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
+    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
+  }
+  for (const track of project.tracks) {
+    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
+    const usedKeys = new Set<EntityId>();
+    for (const keyframeId of track.keyframeIds) {
+      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
+      usedKeys.add(keyframeId);
+      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
+    }
+  }
+  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
+  return issues;
+}
+
+function checkTransform(
+  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
+  finite: (value: number, path: string) => void,
+  path: string,
+): void {
+  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
+  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
+  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
+}
+
+function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
+  finite(light.intensity, `scene.lights[${index}].intensity`);
+  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
+  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
+  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
+}
+
+function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
+  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
+  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
+  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
+}
+</file>
+
+<file path="tests/domain/commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { applyProjectPatch, createCommandBus } from "../../src/domain";
+import type { GroupNode, ProjectCommand } from "../../src/domain";
+import { validateProject } from "../../src/domain/validate-project";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): ProjectCommand =>
+  ({ commandId, type: "RENAME_NODE", targetIds: [nodeId], payload: { nodeId, name } });
+const flags = (nodeId: string, values: { visible?: boolean; locked?: boolean }, commandId = "flags"): ProjectCommand =>
+  ({ commandId, type: "SET_NODE_FLAGS", targetIds: [nodeId], payload: { nodeId, ...values } });
+const transform = (position: readonly [number, number, number]): ProjectCommand =>
+  ({ commandId: "transform", type: "SET_NODE_TRANSFORM", targetIds: ["mesh-node"], payload: {
+    nodeId: "mesh-node", transform: { position, rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+  } });
+function add(id: string, parentId = "nested-group"): ProjectCommand {
+  const node: GroupNode = { id, kind: "group", name: "Деталь", parentId, children: [],
+    transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+    visible: true, locked: false, materialSlots: [], modifierIds: [] };
+  return { commandId: `add-${id}`, type: "ADD_NODE", targetIds: [parentId, id], payload: { parentId, node } };
+}
+
+describe("command bus", () => {
+  it("applies trusted history patches atomically and rejects stale or corrupt bases", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const forward = bus.executeCommand(flags("mesh-node", { locked: true, visible: false }), 0);
+    if (!forward.ok) throw new Error("fixture command failed");
+    const locked = bus.getSnapshot();
+    expect(bus.applyHistoryPatch(forward.undoPatch, 0)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(bus.applyHistoryPatch({ changes: [{ kind: "modelRevision", before: 999, after: 0 }] }, 1))
+      .toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
+    expect(bus.getSnapshot()).toEqual(locked);
+    expect(bus.getRevision()).toBe(1);
+    expect(bus.applyHistoryPatch(forward.undoPatch, 1)).toMatchObject({ ok: true, revision: 2 });
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
+    expect(bus.applyHistoryPatch(forward.patch, 2)).toMatchObject({ ok: true, revision: 3 });
+    expect(bus.getSnapshot()).toEqual(locked);
+  });
+  it("adds a leaf and keeps both hierarchy links and revisions consistent", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeCommand(add("new-leaf"), 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.changed).toBe(true);
+    expect(result.revision).toBe(1);
+    expect(result.project.model.revision).toBe(1);
+    expect(result.project.nodes.find((node) => node.id === "new-leaf")?.parentId).toBe("nested-group");
+    expect(result.project.nodes.find((node) => node.id === "nested-group")?.children).toContain("new-leaf");
+    expect(validateProject(result.project)).toEqual([]);
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+  });
+
+  it("renames and transforms only the target and accepts a multi-command transaction once", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeTransaction([rename("Новая деталь"), transform([3, 2, 1])], 0, "batch-1");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.id).toBe("batch-1");
+    expect(result.revision).toBe(1);
+    expect(result.project.model.revision).toBe(before.model.revision + 1);
+    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Новая деталь");
+    expect(result.project.nodes.find((node) => node.id === "mesh-node")?.transform.position).toEqual([3, 2, 1]);
+    expect(result.project.nodes.find((node) => node.id === "nested-group")).toEqual(before.nodes.find((node) => node.id === "nested-group"));
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+  });
+
+  it("changes flags partially and can unlock or reveal its own node", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
+    expect(bus.executeCommand(rename("Forbidden"), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
+    expect(bus.executeCommand(rename("Forbidden"), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+    expect(bus.executeCommand(flags("mesh-node", { visible: true }), 3).ok).toBe(true);
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "mesh-node")).toMatchObject({ visible: true, locked: false });
+  });
+
+  it("requires recovery actions when a node is locked or hidden", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 0).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 1)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(flags("mesh-node", { locked: false }), 1).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { visible: false }), 2).ok).toBe(true);
+    expect(bus.executeCommand(flags("mesh-node", { locked: true }), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+  });
+
+  it("rejects invalid references in a new leaf after final validation", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const command = add("bad-ref");
+    if (command.type === "ADD_NODE") command.payload.node.materialSlots.push({ name: "Missing", materialId: "absent" });
+    expect(bus.executeCommand(command, 0)).toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+  });
+
+  it.each([
+    ["missing target", rename("A", "absent"), "INVALID_REFERENCE"],
+    ["duplicate ID", add("mesh-node"), "INVALID_COMMAND"],
+    ["missing parent", add("new", "absent"), "INVALID_REFERENCE"],
+    ["empty name", rename("   "), "INVALID_COMMAND"],
+    ["NaN", transform([Number.NaN, 0, 0]), "INVALID_COMMAND"],
+    ["Infinity", transform([Infinity, 0, 0]), "INVALID_COMMAND"],
+    ["target mismatch", { ...rename("A"), targetIds: ["nested-group"] }, "INVALID_COMMAND"],
+    ["invalid transform shape", { ...transform([1, 2, 3]), payload: { nodeId: "mesh-node", transform: { position: [1, 2], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] } } }, "INVALID_COMMAND"],
+  ] as const)("rejects %s without mutation", (_label, command, code) => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    expect(bus.executeCommand(command as ProjectCommand, 0)).toMatchObject({ ok: false, code });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+  });
+
+  it("rejects locked and hidden ancestors, including attempts to change descendant flags", () => {
+    for (const ancestorFlag of [{ locked: true }, { visible: false }]) {
+      const bus = createCommandBus(createNestedMeshProject());
+      expect(bus.executeCommand(flags("nested-group", ancestorFlag), 0).ok).toBe(true);
+      const before = bus.getSnapshot();
+      const code = "locked" in ancestorFlag ? "NODE_LOCKED" : "NODE_HIDDEN";
+      expect(bus.executeCommand(rename("No"), 1)).toMatchObject({ ok: false, code });
+      expect(bus.executeCommand(flags("mesh-node", { locked: false, visible: true }), 1)).toMatchObject({ ok: false, code });
+      expect(bus.getSnapshot()).toEqual(before);
+      expect(bus.getRevision()).toBe(1);
+    }
+  });
+
+  it("rolls back a failing second command and allows the next valid operation", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    expect(bus.executeTransaction([add("new-leaf"), rename("No", "missing")], 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.executeCommand(rename("Да"), 0).ok).toBe(true);
+  });
+
+  it("captures the final state when a transaction adds and then edits one node", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const result = bus.executeTransaction([add("new-leaf"), rename("Итог", "new-leaf")], 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+    expect(() => applyProjectPatch(result.project, result.patch)).toThrow();
+  });
+
+  it("rejects stale revisions and leaves semantic no-ops without a revision or patch", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const before = bus.getSnapshot();
+    const noOp = bus.executeCommand(rename("Куб"), 0);
+    expect(noOp).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
+    expect(bus.executeCommand(rename("New"), 1)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(bus.getSnapshot()).toEqual(before);
+  });
+
+  it("treats a transaction with no net document change as a no-op", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const result = bus.executeTransaction([rename("Temporary", "mesh-node", "first"), rename("Куб", "mesh-node", "second")], 0);
+    expect(result).toMatchObject({ ok: true, changed: false, revision: 0, patch: { changes: [] } });
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.getSnapshot().model.revision).toBe(0);
+  });
+
+  it("does not leak input, snapshot, command payload or result references", () => {
+    const input = createNestedMeshProject();
+    const bus = createCommandBus(input);
+    const old = bus.getSnapshot();
+    input.nodes[0]?.children.push("injected");
+    old.nodes[0]?.children.push("injected");
+    const command = add("new-leaf");
+    const result = bus.executeCommand(command, 0);
+    if (command.type === "ADD_NODE") command.payload.node.name = "Tampered";
+    if (result.ok) result.project.nodes[0]?.children.push("tampered");
+    expect(bus.getSnapshot().nodes.find((node) => node.id === "new-leaf")?.name).toBe("Деталь");
+    expect(validateProject(bus.getSnapshot())).toEqual([]);
+    expect(old.nodes.find((node) => node.id === "new-leaf")).toBeUndefined();
+  });
+});
+</file>
+
+<file path="tests/fixtures/projects.ts">
+import { createProject } from "../../src/domain/create-project";
+import type { Material, MeshNode, Project } from "../../src/domain/types";
+
+function projectWithIds(): Project {
+  let next = 0;
+  return createProject(() => `id-${++next}`);
+}
+
+export const emptyProject = projectWithIds();
+
+export function createNestedMeshProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  const groupId = "nested-group";
+  const meshId = "mesh-node";
+  const group = {
+    id: groupId,
+    kind: "group" as const,
+    name: "Вложенная группа",
+    parentId: root.id,
+    children: [meshId],
+    transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
+    visible: true,
+    locked: false,
+    materialSlots: [],
+    modifierIds: [],
+  };
+  const mesh: MeshNode = {
+    ...group,
+    id: meshId,
+    kind: "mesh",
+    name: "Куб",
+    parentId: groupId,
+    children: [],
+    materialSlots: [],
+    modifierIds: [],
+    meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
+  };
+  project.nodes.push(group, mesh);
+  root.children.push(groupId);
+  return project;
+}
+
+export function createMaterialAnimationProject(): Project {
+  const project = createNestedMeshProject();
+  const material: Material = {
+    id: "material-1",
+    name: "Хром",
+    baseColor: [0.8, 0.8, 0.8],
+    metalness: 1,
+    roughness: 0.18,
+    emissive: [0, 0, 0],
+    opacity: 1,
+    transmission: 0,
+    ior: 1.5,
+    clearcoat: 0,
+    envIntensity: 1,
+    textureAssetIds: [],
+  };
+  project.materials.push(material);
+  const mesh = project.nodes.find((node) => node.kind === "mesh");
+  if (!mesh) throw new Error("Fixture mesh missing");
+  mesh.materialSlots.push({ name: "Основной", materialId: material.id });
+  project.animations.push({ id: "clip-1", name: "Подъём", durationSeconds: 2, loop: false, trackIds: ["track-1"] });
+  project.tracks.push({ id: "track-1", nodeId: mesh.id, property: "transform.position", keyframeIds: ["key-1", "key-2"] });
+  project.keyframes.push(
+    { id: "key-1", timeSeconds: 0, value: [0, 0, 0], interpolation: "linear" },
+    { id: "key-2", timeSeconds: 2, value: [0, 1, 0], interpolation: "linear" },
+  );
+  return project;
+}
+
+export function createInvalidHierarchyProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const group = project.nodes.find((node) => node.id === "nested-group");
+  if (!root || !group) throw new Error("Fixture hierarchy missing");
+  root.parentId = group.id;
+  group.children.push(root.id);
+  return project;
+}
+
+export function createDuplicateIdProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  const duplicate = project.nodes.find((node) => node.id === "mesh-node");
+  if (!root || !duplicate) throw new Error("Fixture nodes missing");
+  duplicate.id = root.id;
+  return project;
+}
+
+export function createInvalidNumberProject(): Project {
+  const project = projectWithIds();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.transform.position = [Number.NaN, 0, 0];
+  return project;
+}
+
+export function createMissingReferenceProject(): Project {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0];
+  if (!root) throw new Error("Fixture root node missing");
+  root.children.push("absent-node");
+  return project;
+}
+</file>
+
+<file path="tests/importers/glb.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { createProject } from "../../src/domain/create-project";
+import { createEditorStore } from "../../src/app/editor-store";
+import { prepareGlb, commitGlb } from "../../src/importers/gltf/import-glb";
+import { applyProjectPatch } from "../../src/domain/command-bus";
+import { createNativeProjectArchive, openNativeProjectArchive, ARCHIVE_LIMITS } from "../../src/assets/native-project-archive";
+
+function fixture(change: (json: Record<string, unknown>) => void = () => {}): Uint8Array {
+  const json: Record<string, unknown> = {
+    asset: { version: "2.0" }, scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+    buffers: [{ byteLength: 36 }], bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: 3, type: "VEC3", min: [0, 0, 0], max: [1, 1, 0] }],
+  };
+  change(json);
+  const encoded = new TextEncoder().encode(JSON.stringify(json));
+  const jsonLength = Math.ceil(encoded.length / 4) * 4;
+  const bytes = new Uint8Array(12 + 8 + jsonLength + 8 + 36);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 0x46546c67, true); view.setUint32(4, 2, true); view.setUint32(8, bytes.length, true);
+  view.setUint32(12, jsonLength, true); view.setUint32(16, 0x4e4f534a, true);
+  bytes.fill(0x20, 20, 20 + jsonLength); bytes.set(encoded, 20);
+  const binAt = 20 + jsonLength;
+  view.setUint32(binAt, 36, true); view.setUint32(binAt + 4, 0x004e4942, true);
+  for (const [index, value] of [0, 0, 0, 1, 0, 0, 0, 1, 0].entries()) view.setFloat32(binAt + 8 + index * 4, value, true);
+  return bytes;
+}
+function file(bytes: Uint8Array, name = "triangle.glb") { return new File([bytes as BlobPart], name, { type: "model/gltf-binary" }); }
+
+describe("GLB import", () => {
+  it("retains bytes for redo, prunes abandoned imports, and archives restored assets", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    let capture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, capture.revision, capture.identity).ok).toBe(true);
+    const firstId = store.getSnapshot().document.project.assets[0]!.id;
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(0);
+    expect(store.getAssetBytes().get(firstId)).toEqual(prepared.value.bytes);
+    expect(store.redo(2).ok).toBe(true);
+    const archive = await createNativeProjectArchive(store.captureDocument().project, store.getAssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) expect((await openNativeProjectArchive(archive.value)).ok).toBe(true);
+    expect(store.undo(3).ok).toBe(true);
+    capture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, capture.revision, capture.identity).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(1);
+    expect(store.getSnapshot().history.canRedo).toBe(false);
+    const currentId = store.getSnapshot().document.project.assets[0]!.id;
+    if (currentId !== firstId) expect(store.getAssetBytes().get(firstId)).toBeUndefined();
+  });
+  it("validates geometry, commits atomically, replays patches and preserves bytes through archive", async () => {
+    const bytes = fixture();
+    const prepared = await prepareGlb(file(bytes));
+    if (!prepared.ok) throw new Error(JSON.stringify(prepared.error));
+    if (!prepared.ok) return;
+    expect(prepared.value.triangles).toBe(1);
+    const store = createEditorStore(createProject());
+    const before = store.captureDocument();
+    let publications = 0;
+    store.subscribe(() => { publications += 1; expect(store.getSnapshot().document.project.assets.length).toBe(1); expect(store.getAssetBytes().ids()).toHaveLength(1); });
+    const result = commitGlb(store, prepared.value, before.revision, before.identity);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(publications).toBe(1);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.getSnapshot().document.project.nodes).toHaveLength(2);
+    expect(applyProjectPatch(before.project, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before.project);
+    const archived = await createNativeProjectArchive(store.captureDocument().project, store.getAssetBytes(), "0.1.0");
+    if (!archived.ok) throw new Error(JSON.stringify(archived.error));
+    if (!archived.ok) return;
+    const opened = await openNativeProjectArchive(archived.value);
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const asset = opened.value.project.assets[0];
+    if (!asset) throw new Error("Missing imported asset");
+    expect(opened.value.assets.get(asset.id)).toEqual(bytes);
+    expect(opened.value.project.nodes[1]).toMatchObject({ parentId: opened.value.project.model.rootNodeId, meshSource: { assetId: asset.id } });
+  });
+
+  it("rejects corrupt or unsupported inputs before parsing and makes no network request", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const cases = [
+      (() => { const value = fixture(); value[0] = 0; return value; })(),
+      (() => { const value = fixture(); new DataView(value.buffer).setUint32(4, 1, true); return value; })(),
+      (() => { const value = fixture(); new DataView(value.buffer).setUint32(8, 1, true); return value; })(),
+      (() => { const value = fixture(); value[20] = 0; return value; })(),
+      fixture((json) => { json.buffers = [{ byteLength: 36, uri: "https://example.com/model.bin" }]; }),
+      fixture((json) => { json.images = [{ uri: "../../secret.png" }]; }),
+      fixture((json) => { json.extensionsRequired = ["KHR_draco_mesh_compression"]; }),
+      fixture((json) => { json.animations = [{}]; }),
+      fixture((json) => { json.meshes = []; }),
+    ];
+    try {
+      for (const bytes of cases) expect((await prepareGlb(file(bytes))).ok).toBe(false);
+      expect((await prepareGlb(file(new Uint8Array(ARCHIVE_LIMITS.asset + 1)))).ok).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  it("rejects a stale preparation without changing project, bytes or history", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const store = createEditorStore(createProject());
+    const captured = store.captureDocument();
+    store.replaceProject({ project: createProject(), assets: store.getAssetBytes() }, captured.identity);
+    const before = store.getSnapshot();
+    expect(commitGlb(store, prepared.value, captured.revision, captured.identity).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+
+  it("reuses identical bytes and rejects revision conflicts", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    const firstCapture = store.captureDocument();
+    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(true);
+    const afterFirst = store.captureDocument();
+    expect(commitGlb(store, prepared.value, firstCapture.revision, firstCapture.identity).ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(commitGlb(store, prepared.value, afterFirst.revision, afterFirst.identity).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(1);
+    expect(store.getAssetBytes().ids()).toHaveLength(1);
+    expect(store.getSnapshot().document.project.nodes).toHaveLength(3);
+  });
+
+  it("rolls back asset bytes and history on an entity ID conflict", async () => {
+    const prepared = await prepareGlb(file(fixture()));
+    if (!prepared.ok) throw new Error("fixture did not parse");
+    const store = createEditorStore(createProject());
+    const captured = store.captureDocument();
+    const rootId = captured.project.model.rootNodeId;
+    const assetId = crypto.randomUUID();
+    const command = {
+      commandId: crypto.randomUUID(), type: "ADD_MESH_ASSET" as const,
+      targetIds: [rootId, rootId, assetId] as [string, string, string],
+      payload: { parentId: rootId, node: {
+        id: rootId, kind: "mesh" as const, name: "bad", parentId: rootId, children: [],
+        transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
+        visible: true, locked: false, materialSlots: [], modifierIds: [], meshSource: { kind: "asset" as const, assetId },
+      }, asset: { id: assetId, hash: prepared.value.hash, path: `assets/${prepared.value.hash}.glb`, mediaType: "model/gltf-binary", colorSpace: "none" as const } },
+    };
+    expect(store.addMeshAsset(command, prepared.value.bytes, captured.revision, captured.identity).ok).toBe(false);
+    expect(store.getSnapshot().document.project).toEqual(captured.project);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+});
+</file>
+
+<file path="eslint.config.js">
+import js from "@eslint/js";
+import globals from "globals";
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist/**", "node_modules/**", "repomix-output.xml"] },
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  { files: ["**/*.{js,mjs,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
+);
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -6214,6 +6577,7 @@ export interface CommandBus {
   getSnapshot(): Project;
   executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
   executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  applyHistoryPatch(patch: ProjectPatch, expectedRevision: number): CommandResult;
 }
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -6450,216 +6814,91 @@ export function createCommandBus(initialProject: Project): CommandBus {
     getSnapshot: () => structuredClone(committed),
     executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
     executeTransaction,
+    applyHistoryPatch(patch, expectedRevision) {
+      if (expectedRevision !== revision) return failure("history", CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+      try {
+        if (!patch || !Array.isArray(patch.changes) || patch.changes.length === 0)
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Пустой патч истории.");
+        const candidate = applyProjectPatch(committed, patch);
+        if (same(candidate, committed))
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Патч истории не изменяет документ.");
+        const issues = validateProject(candidate);
+        if (issues.length) return failure("history", CommandErrorCode.VALIDATION_FAILED, "Результат истории не прошёл проверку.", issues);
+        const project = structuredClone(candidate);
+        const forward = structuredClone(patch);
+        const undoPatch = inverse(forward);
+        committed = candidate;
+        revision += 1;
+        return { ok: true, id: "history", project, revision, patch: forward, undoPatch, changed: true };
+      } catch {
+        return failure("history", CommandErrorCode.VALIDATION_FAILED, "Патч истории не соответствует документу.");
+      }
+    },
   };
 }
 </file>
 
-<file path="src/domain/validate-project.ts">
-import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
+export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
+export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
+export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
 
-export type ValidationCode =
-  | "DUPLICATE_ID"
-  | "MISSING_REFERENCE"
-  | "INVALID_HIERARCHY"
-  | "HIERARCHY_CYCLE"
-  | "INVALID_NUMBER"
-  | "INVALID_STRUCTURE";
-
-export interface ValidationIssue {
-  code: ValidationCode;
-  path: string;
-  message: string;
-}
-
-export function validateProject(project: Project): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const entities = new Map<EntityId, string>();
-  const register = (id: EntityId, path: string): void => {
-    const previous = entities.get(id);
-    if (previous !== undefined) {
-      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
-    } else {
-      entities.set(id, path);
-    }
-  };
-  const finite = (value: number, path: string): void => {
-    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
-  };
-  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
-    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
-  };
-
-  register(project.id, "id");
-  register(project.model.id, "model.id");
-  finite(project.model.revision, "model.revision");
-  register(project.scene.id, "scene.id");
-  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
-  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
-  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
-  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
-  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
-  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
-  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
-  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
-  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
-
-  const nodeIds = new Set(project.nodes.map((node) => node.id));
-  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
-  const materialIds = new Set(project.materials.map((material) => material.id));
-  const assetIds = new Set(project.assets.map((asset) => asset.id));
-  const trackIds = new Set(project.tracks.map((track) => track.id));
-  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
-
-  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
-  if (root === undefined) {
-    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
-  } else if (root.parentId !== null) {
-    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
-  }
-
-  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
-  for (const node of project.nodes) {
-    if (node.id !== project.model.rootNodeId && node.parentId === null) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
-    }
-    const childSet = new Set<EntityId>();
-    for (const childId of node.children) {
-      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
-      childSet.add(childId);
-      const child = nodesById.get(childId);
-      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
-      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
-    }
-    if (node.parentId !== null) {
-      const parent = nodesById.get(node.parentId);
-      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
-      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
-    }
-    checkTransform(node, finite, `nodes.${node.id}.transform`);
-    if (node.kind === "mesh") {
-      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else for (const [name, value] of Object.entries(node.meshSource.parameters)) finite(value, `nodes.${node.id}.meshSource.parameters.${name}`);
-    }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
-    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
-      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
-      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
-      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
-    }
-    const orderedModifiers = node.modifierIds
-      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
-      .filter((modifier) => modifier !== undefined);
-    for (let index = 1; index < orderedModifiers.length; index += 1) {
-      const previous = orderedModifiers[index - 1];
-      const current = orderedModifiers[index];
-      if (previous && current && previous.order >= current.order) {
-        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
-        break;
-      }
-    }
-  }
-
-  if (root !== undefined) {
-    const visited = new Set<EntityId>();
-    const active = new Set<EntityId>();
-    const visit = (node: Node): void => {
-      if (active.has(node.id)) {
-        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
-        return;
-      }
-      if (visited.has(node.id)) return;
-      active.add(node.id);
-      visited.add(node.id);
-      for (const childId of node.children) {
-        const child = nodesById.get(childId);
-        if (child) visit(child);
-      }
-      active.delete(node.id);
-    };
-    visit(root);
-    for (const node of project.nodes) {
-      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
-    }
-  }
-
-  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
-  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
-  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
-  finite(project.scene.camera.near, "scene.camera.near");
-  finite(project.scene.camera.far, "scene.camera.far");
-  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
-  finite(project.scene.background.intensity, "scene.background.intensity");
-  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
-  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
-  project.scene.instances.forEach((instance, index) => {
-    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
-    checkTransform(instance, finite, `scene.instances[${index}].transform`);
-  });
-
-  for (const modifier of project.modifiers) {
-    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
-    finite(modifier.order, `modifiers.${modifier.id}.order`);
-    finite(modifier.version, `modifiers.${modifier.id}.version`);
-    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
-    }
-    for (const [name, value] of Object.entries(modifier.parameters)) {
-      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
-      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
-    }
-  }
-  for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
-  }
-  for (const clip of project.animations) {
-    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
-    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
-  }
-  for (const track of project.tracks) {
-    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
-    const usedKeys = new Set<EntityId>();
-    for (const keyframeId of track.keyframeIds) {
-      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
-      usedKeys.add(keyframeId);
-      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
-    }
-  }
-  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
-  return issues;
-}
-
-function checkTransform(
-  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
-  finite: (value: number, path: string) => void,
-  path: string,
-): void {
-  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
-  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
-  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
-}
-
-function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
-  finite(light.intensity, `scene.lights[${index}].intensity`);
-  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
-  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
-  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
-}
-
-function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
-  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
-  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
-  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
-}
+<file path="src/ui/styles/app.css">
+body { margin: 0; min-width: 960px; }
+#root { min-height: 100vh; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
+.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
+.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
+.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
+.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.file-actions { display: flex; align-items: center; gap: var(--space-2); }
+.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.file-actions button:disabled { opacity: .5; cursor: wait; }
+.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
+.import-confirm span { flex: 1; }
+.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
+.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
+.dock { background: var(--color-surface-base); }
+.left-dock { border-right: var(--border-default); }
+.right-dock { border-left: var(--border-default); }
+.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+.panel-content { padding: var(--space-4) var(--space-3); }
+.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
+.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
+.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
+.tree-row:first-of-type { background: var(--color-state-info-surface); }
+.tree-row span { color: var(--color-primary-accent-strong); }
+.tree-row small { margin-left: auto; color: var(--color-text-muted); }
+.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
+.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
+.info-block span { color: var(--color-text-secondary); }
+.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
+.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
+.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
+.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
+.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
+.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
+.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
+.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
+.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
 </file>
 
 <file path="tests/app/editor-store.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import { applyProjectPatch } from "../../src/domain";
-import type { ProjectCommand } from "../../src/domain";
+import type { GroupNode, ProjectCommand } from "../../src/domain";
 import { createEditorStore, selectDerived, selectDirty, selectProject, selectRevision } from "../../src/app/editor-store";
 import { createNestedMeshProject } from "../fixtures/projects";
 import { AssetBytes } from "../../src/assets/asset-bytes";
@@ -6669,6 +6908,101 @@ const rename = (name: string, nodeId = "mesh-node", commandId = "rename"): Proje
 });
 
 describe("editor store", () => {
+  it("replays 100 changes in both directions with monotonic session revisions", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    for (let index = 1; index <= 100; index += 1) {
+      expect(store.executeCommand(rename(`Name ${index}`), index - 1).ok).toBe(true);
+    }
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 100, canUndo: true, canRedo: false });
+    for (let index = 100; index > 0; index -= 1) expect(store.undo(200 - index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.getSnapshot().document.project.model.revision).toBe(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    for (let index = 0; index < 100; index += 1) expect(store.redo(200 + index).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Name 100");
+    expect(store.getSnapshot().document.project.model.revision).toBe(100);
+    expect(store.getSnapshot().document.revision).toBe(300);
+  });
+
+  it("treats a transaction and an explicit gesture as single reversible steps", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    expect(store.executeTransaction([rename("A", "mesh-node", "a"), rename("B", "mesh-node", "b")], 0).ok).toBe(true);
+    expect(store.executeCommand(rename("C"), 1, "drag-1").ok).toBe(true);
+    expect(store.executeCommand(rename("D"), 2, "drag-1").ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("B");
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("Куб");
+    expect(store.redo(5).ok).toBe(true);
+    expect(store.redo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")?.name).toBe("D");
+  });
+
+  it("preserves checkpoints, branches, and publication atomicity", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const seen: ReturnType<typeof store.getSnapshot>[] = [];
+    store.subscribe(() => seen.push(store.getSnapshot()));
+    store.executeCommand(rename("A"), 0, "gesture");
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    store.executeCommand(rename("B"), 1, "gesture");
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    const before = store.getSnapshot();
+    expect(store.redo(4)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.executeCommand(rename("missing", "missing"), 5).ok).toBe(false);
+    expect(store.executeCommand(rename("A"), 5)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot()).toBe(before);
+    store.executeCommand(rename("D"), 5);
+    expect(store.getSnapshot().history).toMatchObject({ cursor: 2, canRedo: false });
+    expect(store.redo(6).ok).toBe(false);
+    expect(store.undo(6).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(seen.every((snapshot) => snapshot.document.revision === snapshot.derived.documentRevision)).toBe(true);
+  });
+
+  it("does not mark a new branch clean after discarding its saved position", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.executeCommand(rename("A"), 0);
+    store.executeCommand(rename("B"), 1);
+    const saved = store.captureDocument();
+    expect(store.confirmSaved(saved.revision, saved.identity)).toBe(true);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.executeCommand(rename("D"), 3).ok).toBe(true);
+    expect(store.undo(4).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+  });
+
+  it("undoes a locked hidden node and rejects corrupt history patches atomically", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const flags: ProjectCommand = { commandId: "flags", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", locked: true, visible: false } };
+    expect(store.executeCommand(flags, 0).ok).toBe(true);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find((node) => node.id === "mesh-node")).toMatchObject({ locked: false, visible: true });
+    expect(store.redo(2).ok).toBe(true);
+    const mutable = store.getSnapshot().history.entries[0] as unknown as { patch: { changes: unknown[] } };
+    expect(Object.isFrozen(mutable.patch.changes)).toBe(true);
+  });
+
+  it("removes a selection when undo removes its node", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    const node: GroupNode = { id: "new-node", kind: "group", name: "New", parentId: "nested-group", children: [],
+      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+      visible: true, locked: false, materialSlots: [], modifierIds: [] };
+    const command: ProjectCommand = { commandId: "add", type: "ADD_NODE", targetIds: ["nested-group", node.id],
+      payload: { parentId: "nested-group", node } };
+    expect(store.executeCommand(command, 0).ok).toBe(true);
+    store.setSelection(["new-node"], "new-node");
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().selection).toEqual({ ids: [], activeId: null });
+  });
   it("initializes a stable, immutable RAM snapshot independently of its input", () => {
     const input = createNestedMeshProject();
     const store = createEditorStore(input);
@@ -6801,360 +7135,6 @@ describe("editor store", () => {
 });
 </file>
 
-<file path="tests/fixtures/projects.ts">
-import { createProject } from "../../src/domain/create-project";
-import type { Material, MeshNode, Project } from "../../src/domain/types";
-
-function projectWithIds(): Project {
-  let next = 0;
-  return createProject(() => `id-${++next}`);
-}
-
-export const emptyProject = projectWithIds();
-
-export function createNestedMeshProject(): Project {
-  const project = projectWithIds();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  const groupId = "nested-group";
-  const meshId = "mesh-node";
-  const group = {
-    id: groupId,
-    kind: "group" as const,
-    name: "Вложенная группа",
-    parentId: root.id,
-    children: [meshId],
-    transform: { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const },
-    visible: true,
-    locked: false,
-    materialSlots: [],
-    modifierIds: [],
-  };
-  const mesh: MeshNode = {
-    ...group,
-    id: meshId,
-    kind: "mesh",
-    name: "Куб",
-    parentId: groupId,
-    children: [],
-    materialSlots: [],
-    modifierIds: [],
-    meshSource: { kind: "primitive", primitive: "cube", parameters: { size: 1 } },
-  };
-  project.nodes.push(group, mesh);
-  root.children.push(groupId);
-  return project;
-}
-
-export function createMaterialAnimationProject(): Project {
-  const project = createNestedMeshProject();
-  const material: Material = {
-    id: "material-1",
-    name: "Хром",
-    baseColor: [0.8, 0.8, 0.8],
-    metalness: 1,
-    roughness: 0.18,
-    emissive: [0, 0, 0],
-    opacity: 1,
-    transmission: 0,
-    ior: 1.5,
-    clearcoat: 0,
-    envIntensity: 1,
-    textureAssetIds: [],
-  };
-  project.materials.push(material);
-  const mesh = project.nodes.find((node) => node.kind === "mesh");
-  if (!mesh) throw new Error("Fixture mesh missing");
-  mesh.materialSlots.push({ name: "Основной", materialId: material.id });
-  project.animations.push({ id: "clip-1", name: "Подъём", durationSeconds: 2, loop: false, trackIds: ["track-1"] });
-  project.tracks.push({ id: "track-1", nodeId: mesh.id, property: "transform.position", keyframeIds: ["key-1", "key-2"] });
-  project.keyframes.push(
-    { id: "key-1", timeSeconds: 0, value: [0, 0, 0], interpolation: "linear" },
-    { id: "key-2", timeSeconds: 2, value: [0, 1, 0], interpolation: "linear" },
-  );
-  return project;
-}
-
-export function createInvalidHierarchyProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  const group = project.nodes.find((node) => node.id === "nested-group");
-  if (!root || !group) throw new Error("Fixture hierarchy missing");
-  root.parentId = group.id;
-  group.children.push(root.id);
-  return project;
-}
-
-export function createDuplicateIdProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  const duplicate = project.nodes.find((node) => node.id === "mesh-node");
-  if (!root || !duplicate) throw new Error("Fixture nodes missing");
-  duplicate.id = root.id;
-  return project;
-}
-
-export function createInvalidNumberProject(): Project {
-  const project = projectWithIds();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  root.transform.position = [Number.NaN, 0, 0];
-  return project;
-}
-
-export function createMissingReferenceProject(): Project {
-  const project = createNestedMeshProject();
-  const root = project.nodes[0];
-  if (!root) throw new Error("Fixture root node missing");
-  root.children.push("absent-node");
-  return project;
-}
-</file>
-
-<file path="eslint.config.js">
-import js from "@eslint/js";
-import globals from "globals";
-import tseslint from "typescript-eslint";
-
-export default tseslint.config(
-  { ignores: ["dist/**", "node_modules/**", "repomix-output.xml"] },
-  js.configs.recommended,
-  ...tseslint.configs.recommended,
-  { files: ["**/*.{js,mjs,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
-);
-</file>
-
-<file path="src/app/editor-store.ts">
-import { createCommandBus } from "../domain/command-bus";
-import { CommandErrorCode } from "../domain/command-bus";
-import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
-import type { EntityId, Project } from "../domain/types";
-import { AssetBytes } from "../assets/asset-bytes";
-import type { LoadedProject } from "../assets/native-project-archive";
-
-export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
-  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
-
-export interface EditorState {
-  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
-  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
-  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
-  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
-  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
-  readonly history: { readonly entries: readonly HistoryEntry[] };
-  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
-}
-
-export interface HistoryEntry {
-  readonly id: string;
-  readonly revision: number;
-  readonly patch: DeepReadonly<ProjectPatch>;
-  readonly undoPatch: DeepReadonly<ProjectPatch>;
-}
-
-export interface EditorStore {
-  getSnapshot(): EditorState;
-  subscribe(listener: () => void): () => void;
-  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
-  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
-  addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
-  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
-  setTool(next: Partial<EditorState["tool"]>): void;
-  setView(next: Partial<EditorState["view"]>): void;
-  getAssetBytes(): AssetBytes;
-  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
-  confirmSaved(revision: number, identity: object): boolean;
-  replaceProject(loaded: LoadedProject, identity: object): boolean;
-}
-
-function deepFreeze<T>(value: T): DeepReadonly<T> {
-  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
-    for (const child of Object.values(value)) deepFreeze(child);
-    Object.freeze(value);
-  }
-  return value as DeepReadonly<T>;
-}
-
-export function createEditorStore(initialProject: Project): EditorStore {
-  let bus = createCommandBus(initialProject);
-  let assetBytes = new AssetBytes();
-  let identity: object = {};
-  const listeners = new Set<() => void>();
-  let state: EditorState = Object.freeze({
-    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
-    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
-    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
-    job: Object.freeze({ status: "idle" as const }),
-    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
-    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
-  });
-
-  function publish(next: EditorState): void {
-    state = Object.freeze(next);
-    for (const listener of [...listeners]) {
-      if (listeners.has(listener)) listener();
-    }
-  }
-
-  function commit(result: CommandResult): CommandResult {
-    if (!result.ok || !result.changed) return result;
-    identity = {};
-    const entry: HistoryEntry = Object.freeze({
-      id: result.id,
-      revision: result.revision,
-      patch: deepFreeze(structuredClone(result.patch)),
-      undoPatch: deepFreeze(structuredClone(result.undoPatch)),
-    });
-    publish({
-      ...state,
-      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
-      history: Object.freeze({ entries: Object.freeze([...state.history.entries, entry]) }),
-      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
-    });
-    return result;
-  }
-
-  return {
-    getSnapshot: () => state,
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => { listeners.delete(listener); };
-    },
-    executeCommand: (command, expectedRevision) => commit(bus.executeCommand(command, expectedRevision)),
-    executeTransaction: (commands, expectedRevision, transactionId) =>
-      commit(bus.executeTransaction(commands, expectedRevision, transactionId)),
-    addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
-      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
-        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
-      if (command.payload.asset && (bytes.byteLength === 0 || assetBytes.ids().includes(command.payload.asset.id)))
-        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Байты ресурса отсутствуют или ID уже занят." };
-      if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
-        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
-      try {
-        const nextAssets = assetBytes.clone();
-        if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
-        const result = bus.executeCommand(command, expectedRevision);
-        if (!result.ok) return result;
-        assetBytes = nextAssets;
-        return commit(result);
-      } catch {
-        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
-      }
-    },
-    getAssetBytes: () => assetBytes.clone(),
-    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
-    confirmSaved(revision, expectedIdentity) {
-      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
-      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
-      return true;
-    },
-    replaceProject(loaded, expectedIdentity) {
-      if (identity !== expectedIdentity) return false;
-      const nextBus = createCommandBus(loaded.project);
-      const nextAssets = loaded.assets.clone();
-      bus = nextBus;
-      assetBytes.clear();
-      assetBytes = nextAssets;
-      identity = {};
-      publish({
-        ...state,
-        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
-        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-        history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[] }),
-        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
-      });
-      return true;
-    },
-    setSelection(ids, activeId) {
-      const valid = new Set(state.document.project.nodes.map((node) => node.id));
-      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
-      const active = activeId === undefined ? (selected[0] ?? null) :
-        activeId !== null && selected.includes(activeId) ? activeId : null;
-      if (active === state.selection.activeId && selected.length === state.selection.ids.length
-        && selected.every((id, index) => id === state.selection.ids[index])) return;
-      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
-    },
-    setTool(next) {
-      const tool = { ...state.tool, ...next };
-      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
-      publish({ ...state, tool: Object.freeze(tool) });
-    },
-    setView(next) {
-      const view = { ...state.view, ...next };
-      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
-      publish({ ...state, view: Object.freeze(view) });
-    },
-  };
-}
-
-export const selectProject = (state: EditorState) => state.document.project;
-export const selectRevision = (state: EditorState) => state.document.revision;
-export const selectDirty = (state: EditorState) => state.document.dirty;
-export const selectSelectedIds = (state: EditorState) => state.selection.ids;
-export const selectActiveId = (state: EditorState) => state.selection.activeId;
-export const selectTool = (state: EditorState) => state.tool;
-export const selectJob = (state: EditorState) => state.job;
-export const selectDerived = (state: EditorState) => state.derived;
-</file>
-
-<file path="src/domain/index.ts">
-export { createProject } from "./create-project";
-export type { IdFactory } from "./create-project";
-export { validateProject } from "./validate-project";
-export type { ValidationCode, ValidationIssue } from "./validate-project";
-export type * from "./types";
-export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
-export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
-export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
-export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
-</file>
-
-<file path="src/ui/styles/app.css">
-body { margin: 0; min-width: 960px; }
-#root { min-height: 100vh; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
-.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
-.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
-.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
-.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
-.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
-.file-actions { display: flex; align-items: center; gap: var(--space-2); }
-.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.file-actions button:disabled { opacity: .5; cursor: wait; }
-.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
-.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
-.import-confirm span { flex: 1; }
-.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
-.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
-.dock { background: var(--color-surface-base); }
-.left-dock { border-right: var(--border-default); }
-.right-dock { border-left: var(--border-default); }
-.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
-.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
-.panel-content { padding: var(--space-4) var(--space-3); }
-.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
-.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
-.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
-.tree-row:first-of-type { background: var(--color-state-info-surface); }
-.tree-row span { color: var(--color-primary-accent-strong); }
-.tree-row small { margin-left: auto; color: var(--color-text-muted); }
-.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
-.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
-.info-block span { color: var(--color-text-secondary); }
-.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
-.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
-.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
-.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
-.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
-.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
-.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
-.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
-.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
-</file>
-
 <file path="tsconfig.json">
 {
   "compilerOptions": {
@@ -7233,12 +7213,244 @@ The earlier illustrative example used `formatVersion`, `projectId`, and `scene.m
 FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
 </file>
 
+<file path="src/app/editor-store.ts">
+import { createCommandBus } from "../domain/command-bus";
+import { CommandErrorCode } from "../domain/command-bus";
+import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
+import type { EntityId, Project } from "../domain/types";
+import { AssetBytes } from "../assets/asset-bytes";
+import type { LoadedProject } from "../assets/native-project-archive";
+
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
+
+export interface EditorState {
+  readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
+  readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
+  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
+  readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
+  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
+  readonly history: { readonly entries: readonly HistoryEntry[]; readonly cursor: number; readonly canUndo: boolean; readonly canRedo: boolean };
+  readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
+}
+
+export interface HistoryEntry {
+  readonly id: string;
+  readonly revision: number;
+  readonly patch: DeepReadonly<ProjectPatch>;
+  readonly undoPatch: DeepReadonly<ProjectPatch>;
+  readonly groupId?: string;
+}
+
+export interface EditorStore {
+  getSnapshot(): EditorState;
+  subscribe(listener: () => void): () => void;
+  executeCommand(command: ProjectCommand, expectedRevision: number, groupId?: string): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string, groupId?: string): CommandResult;
+  undo(expectedRevision: number): CommandResult;
+  redo(expectedRevision: number): CommandResult;
+  addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
+  setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
+  setTool(next: Partial<EditorState["tool"]>): void;
+  setView(next: Partial<EditorState["view"]>): void;
+  getAssetBytes(): AssetBytes;
+  captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  confirmSaved(revision: number, identity: object): boolean;
+  replaceProject(loaded: LoadedProject, identity: object): boolean;
+}
+
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
+}
+
+export function createEditorStore(initialProject: Project): EditorStore {
+  let bus = createCommandBus(initialProject);
+  let assetBytes = new AssetBytes();
+  let identity: object = {};
+  let savedPosition: object | null = {};
+  let positions: object[] = [savedPosition];
+  const listeners = new Set<() => void>();
+  let state: EditorState = Object.freeze({
+    document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+    selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+    tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
+    view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
+    job: Object.freeze({ status: "idle" as const }),
+    history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[], cursor: 0, canUndo: false, canRedo: false }),
+    derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
+  });
+
+  function publish(next: EditorState): void {
+    state = Object.freeze(next);
+    for (const listener of [...listeners]) {
+      if (listeners.has(listener)) listener();
+    }
+  }
+
+  function historyState(entries: readonly HistoryEntry[], cursor: number): EditorState["history"] {
+    return Object.freeze({ entries: Object.freeze(entries), cursor, canUndo: cursor > 0, canRedo: cursor < entries.length });
+  }
+
+  function pruneAssets(project: Project, entries: readonly HistoryEntry[]): void {
+    const needed = new Set(project.assets.map((asset) => asset.id));
+    for (const entry of entries) for (const change of entry.patch.changes) {
+      if (change.kind === "addAsset" || change.kind === "removeAsset") needed.add(change.asset.id);
+    }
+    for (const id of assetBytes.ids()) if (!needed.has(id)) assetBytes.delete(id);
+  }
+
+  function commit(result: CommandResult, groupId?: string): CommandResult {
+    if (!result.ok || !result.changed) return result;
+    identity = {};
+    const cursor = state.history.cursor;
+    const entries = state.history.entries.slice(0, cursor);
+    positions = positions.slice(0, cursor + 1);
+    const previous = entries.at(-1);
+    const combine = !!groupId && previous?.groupId === groupId && cursor === state.history.entries.length
+      && positions[cursor] !== savedPosition;
+    const entry: HistoryEntry = Object.freeze({
+      id: result.id,
+      revision: result.revision,
+      patch: deepFreeze(structuredClone(combine ? { changes: [...previous.patch.changes, ...result.patch.changes] } : result.patch)),
+      undoPatch: deepFreeze(structuredClone(combine ? { changes: [...result.undoPatch.changes, ...previous.undoPatch.changes] } : result.undoPatch)),
+      ...(groupId ? { groupId } : {}),
+    });
+    if (combine) entries[entries.length - 1] = entry;
+    else entries.push(entry);
+    if (combine) positions[cursor] = {};
+    else positions.push({});
+    const nextCursor = entries.length;
+    pruneAssets(result.project, entries);
+    publish({
+      ...state,
+      document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      history: historyState(entries, nextCursor),
+      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+    });
+    return result;
+  }
+
+  function travel(direction: -1 | 1, expectedRevision: number): CommandResult {
+    if (expectedRevision !== state.document.revision)
+      return { ok: false, id: "history", code: CommandErrorCode.REVISION_CONFLICT, message: "Ревизия документа изменилась." };
+    const cursor = state.history.cursor;
+    const entry = state.history.entries[direction === -1 ? cursor - 1 : cursor];
+    if (!entry) return { ok: false, id: "history", code: CommandErrorCode.INVALID_COMMAND, message: "Шаг истории недоступен." };
+    const result = bus.applyHistoryPatch(structuredClone(direction === -1 ? entry.undoPatch : entry.patch) as ProjectPatch, expectedRevision);
+    if (!result.ok) return result;
+    identity = {};
+    const nextCursor = cursor + direction;
+    const validIds = new Set(result.project.nodes.map((node) => node.id));
+    const ids = state.selection.ids.filter((id) => validIds.has(id));
+    publish({ ...state,
+      document: Object.freeze({ project: deepFreeze(result.project), revision: result.revision, dirty: positions[nextCursor] !== savedPosition }),
+      selection: Object.freeze({ ids: Object.freeze(ids), activeId: state.selection.activeId && ids.includes(state.selection.activeId) ? state.selection.activeId : null }),
+      history: historyState(state.history.entries, nextCursor),
+      derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+    });
+    return result;
+  }
+
+  return {
+    getSnapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    executeCommand: (command, expectedRevision, groupId) => commit(bus.executeCommand(command, expectedRevision), groupId),
+    executeTransaction: (commands, expectedRevision, transactionId, groupId) =>
+      commit(bus.executeTransaction(commands, expectedRevision, transactionId), groupId),
+    undo: (expectedRevision) => travel(-1, expectedRevision),
+    redo: (expectedRevision) => travel(1, expectedRevision),
+    addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      if (command.payload.asset && (bytes.byteLength === 0 || state.document.project.assets.some((asset) => asset.id === command.payload.asset?.id)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Байты ресурса отсутствуют или ID уже занят." };
+      if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
+      try {
+        const nextAssets = assetBytes.clone();
+        if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
+        const result = bus.executeCommand(command, expectedRevision);
+        if (!result.ok) return result;
+        assetBytes = nextAssets;
+        return commit(result);
+      } catch {
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
+      }
+    },
+    getAssetBytes: () => assetBytes.clone(),
+    captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    confirmSaved(revision, expectedIdentity) {
+      if (identity !== expectedIdentity || state.document.revision !== revision) return false;
+      savedPosition = positions[state.history.cursor] ?? null;
+      if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
+      return true;
+    },
+    replaceProject(loaded, expectedIdentity) {
+      if (identity !== expectedIdentity) return false;
+      const nextBus = createCommandBus(loaded.project);
+      const nextAssets = loaded.assets.clone();
+      bus = nextBus;
+      assetBytes.clear();
+      assetBytes = nextAssets;
+      identity = {};
+      savedPosition = {};
+      positions = [savedPosition];
+      publish({
+        ...state,
+        document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
+        selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+        history: historyState([], 0),
+        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
+      });
+      return true;
+    },
+    setSelection(ids, activeId) {
+      const valid = new Set(state.document.project.nodes.map((node) => node.id));
+      const selected = [...new Set(ids.filter((id) => valid.has(id)))];
+      const active = activeId === undefined ? (selected[0] ?? null) :
+        activeId !== null && selected.includes(activeId) ? activeId : null;
+      if (active === state.selection.activeId && selected.length === state.selection.ids.length
+        && selected.every((id, index) => id === state.selection.ids[index])) return;
+      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
+    },
+    setTool(next) {
+      const tool = { ...state.tool, ...next };
+      if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
+      publish({ ...state, tool: Object.freeze(tool) });
+    },
+    setView(next) {
+      const view = { ...state.view, ...next };
+      if (view.leftTab === state.view.leftTab && view.timelineExpanded === state.view.timelineExpanded) return;
+      publish({ ...state, view: Object.freeze(view) });
+    },
+  };
+}
+
+export const selectProject = (state: EditorState) => state.document.project;
+export const selectRevision = (state: EditorState) => state.document.revision;
+export const selectDirty = (state: EditorState) => state.document.dirty;
+export const selectSelectedIds = (state: EditorState) => state.selection.ids;
+export const selectActiveId = (state: EditorState) => state.selection.activeId;
+export const selectTool = (state: EditorState) => state.tool;
+export const selectJob = (state: EditorState) => state.job;
+export const selectDerived = (state: EditorState) => state.derived;
+export const selectCanUndo = (state: EditorState) => state.history.canUndo;
+export const selectCanRedo = (state: EditorState) => state.history.canRedo;
+</file>
+
 <file path="src/ui/App.tsx">
 import { createProject } from "../domain";
-import { createEditorStore, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject, selectRevision } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense } from "react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
 import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
@@ -7272,6 +7484,31 @@ function EditorShell() {
   const project = selectProject(state);
   const revision = selectRevision(state);
   const dirty = selectDirty(state);
+  const canUndo = selectCanUndo(state);
+  const canRedo = selectCanRedo(state);
+  function travel(direction: "undo" | "redo") {
+    if (fileBusy || pendingGlb) return;
+    const current = editorStore.getSnapshot();
+    const result = editorStore[direction](current.document.revision);
+    if (!result.ok) setFileStatus(result.message);
+    else setFileStatus(direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey || fileBusy || pendingGlb || event.isComposing) return;
+      const target = event.target;
+      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
+      const key = event.key.toLowerCase();
+      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
+      if (!direction) return;
+      const current = editorStore.getSnapshot();
+      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
+      event.preventDefault();
+      travel(direction);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   async function saveProject() {
     if (fileBusy) return;
     setFileBusy(true);
@@ -7345,6 +7582,8 @@ function EditorShell() {
         <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="brand-subtitle">Основа редактора</span></div>
         <div className="file-actions">
           <span className="topbar-note">Проект находится только в памяти текущей вкладки</span>
+          <button type="button" disabled={!canUndo || fileBusy || !!pendingGlb} onClick={() => travel("undo")}>Отменить</button>
+          <button type="button" disabled={!canRedo || fileBusy || !!pendingGlb} onClick={() => travel("redo")}>Повторить</button>
           <button type="button" disabled={fileBusy} onClick={saveProject}>Сохранить проект</button>
           <button type="button" disabled={fileBusy} onClick={() => fileInput.current?.click()}>Открыть проект</button>
           <button type="button" disabled={fileBusy} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
@@ -7427,6 +7666,12 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-011 — Undo/Redo delta history
+
+- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
+- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
+- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
 
 ## TASK-010B — Basic static GLB import
 
