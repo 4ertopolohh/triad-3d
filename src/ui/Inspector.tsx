@@ -122,7 +122,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
           : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
         {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
-      {state.meshEdit.mode === "vertex" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
+      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}
     <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
@@ -156,13 +156,13 @@ function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; 
   }
   const epoch = store.getProjectEpoch();
   function enter() {
-    const message = store.enterVertexMode(state.document.revision, epoch);
+    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
     setError(message ?? "");
   }
   return <div className="mesh-edit-actions">
     {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
-    {node.meshSource.kind === "editable" && (state.meshEdit.mode === "vertex"
-      ? <button type="button" onClick={() => store.exitVertexMode()}>Вернуться к объектам</button>
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
+      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
       : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
     {restriction && <p className="panel-hint">{restriction}</p>}
     {error && <p className="primitive-error" role="alert">{error}</p>}
@@ -180,9 +180,8 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
   function apply() {
     const current = store.getSnapshot();
     const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== "vertex" || current.meshEdit.nodeId !== nodeId
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.vertexIndices.length !== state.meshEdit.vertexIndices.length
-      || current.meshEdit.vertexIndices.some((index, position) => index !== state.meshEdit.vertexIndices[position])) {
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
       setError("Проект или выделение изменилось. Повторите действие."); return;
     }
     const parsed = delta.map(parseNumber);
@@ -190,15 +189,19 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
     if (failure && !failure.ok) { setError(failure.message); return; }
     const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
     if (values.every(value => value === 0)) { setError(""); return; }
+    const vertices = store.selectedMeshVertices();
+    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
     const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId],
-      payload: { nodeId, vertexIndices: [...current.meshEdit.vertexIndices], delta: values } }, current.document.revision);
+      payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision);
     setError(result.ok ? "" : result.message);
   }
-  return <section aria-label="Редактирование вершин"><h4>Редактирование вершин</h4>
-    <p className="panel-hint">{node.name} · Выбрано вершин: {state.meshEdit.vertexIndices.length}</p>
+  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
+  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
+    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
     <p className="panel-hint">Локальные координаты объекта</p>
     <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !state.meshEdit.vertexIndices.length} onClick={apply}>Применить смещение</button>
+    <button type="button" disabled={!!reason || !count} onClick={apply}>Применить смещение</button>
     {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
   </section>;
 }
