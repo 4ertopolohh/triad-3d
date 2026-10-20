@@ -62,7 +62,7 @@ describe("TASK-004 TSX export spike", () => {
     const modified = createNestedMeshProject();
     const modifiedMesh = modified.nodes.find((node) => node.kind === "mesh")!;
     modifiedMesh.modifierIds.push("modifier-1");
-    modified.modifiers.push({ id: "modifier-1", nodeId: modifiedMesh.id, kind: "mirror", order: 0, enabled: true, version: 1, parameters: {} });
+    modified.modifiers.push({ id: "modifier-1", nodeId: modifiedMesh.id, kind: "mirror", order: 0, enabled: true, version: 1, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
     expect(() => generateSpikeTsx(modified)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
     const missingMaterial = createMaterialAnimationProject();
     missingMaterial.materials.length = 0;

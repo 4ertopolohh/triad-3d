@@ -5,6 +5,7 @@ import type { MeshNode, Project } from "../domain/types";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import { accessReason } from "./inspector-logic";
 import { ArrayAdd, ArrayItem } from "./ArrayEditor";
+import { MirrorAdd, MirrorItem } from "./MirrorEditor";
 
 const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
 type Operation = BooleanParameters["operation"];
@@ -38,11 +39,14 @@ export function BooleanEditor({ store, project, target, disabled, reason }: { st
     {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
     <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
     <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
+    <MirrorAdd store={store} targetId={target.id} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />
     <h4>Стек модификаторов</h4>
     {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
     {stack.map((modifier, index) => {
       if (!modifier) return null;
       if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
+      if (modifier.kind === "mirror") return <MirrorItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />;
+      if (modifier.kind !== "boolean") return <p key={modifier.id} className="primitive-error" role="alert">{index + 1}. Тип модификатора не поддерживается.</p>;
       const params = modifier.parameters;
       const linked = project.nodes.find(node => node.id === params.cutterNodeId);
       return <div className="boolean-stack-item" key={modifier.id}>
