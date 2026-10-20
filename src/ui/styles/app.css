@@ -121,6 +121,11 @@ body { margin: 0; }
 .inspector-parameter { display: flex; gap: 5px; }
 .inspector-parameter button { flex: none; }
 .inspector .primitive-error { color: var(--color-state-danger); }
+.boolean-editor label { display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+.boolean-editor select { min-width: 0; width: 100%; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.boolean-editor .boolean-check { display: flex; align-items: center; gap: 7px; }
+.boolean-stack-item { display: grid; gap: 8px; padding: 10px; border: var(--border-default); border-radius: var(--radius-sm); }
+.boolean-stack-actions { display: flex; flex-wrap: wrap; gap: 5px; }
 button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
 button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 .object-tree { display: grid; gap: 8px; font-size: var(--font-size-sm); }

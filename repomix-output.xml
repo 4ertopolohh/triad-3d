@@ -111,6 +111,7 @@ src/
       import-glb.ts
   renderer/
     adapter.ts
+    modifier-preview.ts
     primitive.ts
     scene-sync.ts
     viewport-interactions.ts
@@ -169,6 +170,7 @@ tests/
     glb.test.ts
   renderer/
     adapter.test.ts
+    modifier-preview.test.ts
     primitives.test.ts
     scene-sync.test.ts
     viewport-interactions.test.ts
@@ -4995,6 +4997,98 @@ export class SurfaceQuery {
 }
 </file>
 
+<file path="src/renderer/modifier-preview.ts">
+import type { EditorStore } from "../app/editor-store";
+import type { Project } from "../domain/types";
+import { ModifierEvaluator } from "../geometry/modifiers";
+import type { EvaluationResult } from "../geometry/modifiers/types";
+import type { SceneSync } from "./scene-sync";
+
+/** Serializes renderer-owned evaluations. A cancelled job may settle before its Worker does. */
+export class ModifierPreview {
+  private readonly evaluator: ModifierEvaluator;
+  private generation = -1;
+  private epoch: object | undefined;
+  private token = 0;
+  private active = false;
+  private closed = false;
+  private pending: Promise<void> = Promise.resolve();
+  constructor(private store: EditorStore, private scene: SceneSync, evaluator?: ModifierEvaluator) {
+    this.evaluator = evaluator ?? new ModifierEvaluator();
+  }
+  sync(): void {
+    if (this.closed) return;
+    const state = this.store.getSnapshot();
+    const epoch = this.store.getProjectEpoch();
+    if (this.generation === state.derived.generation && this.epoch === epoch) return;
+    this.generation = state.derived.generation; this.epoch = epoch;
+    const token = ++this.token;
+    if (this.active) this.store.jobs.cancelJob();
+    const project = state.document.project;
+    this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
+    const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
+    const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));
+    this.pending = this.pending.then(async () => {
+      for (const node of nodes) {
+        if (!this.current(token, epoch)) return;
+        if (node.kind !== "mesh") continue;
+        if (node.meshSource.kind === "asset") {
+          this.scene.setModifierDiagnostics(node.id, ["Boolean для GLB пока недоступен; показана исходная геометрия."]);
+          continue;
+        }
+        try { await this.evaluate(project as Project, node.id, token, epoch); }
+        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра Boolean."]); }
+      }
+    });
+  }
+  private current(token: number, epoch: object): boolean {
+    return !this.closed && token === this.token && epoch === this.store.getProjectEpoch()
+      && this.generation === this.store.getSnapshot().derived.generation;
+  }
+  private async evaluate(project: Project, nodeId: string, token: number, epoch: object): Promise<void> {
+    let result: EvaluationResult | undefined;
+    let computation: Promise<EvaluationResult> | undefined;
+    this.active = true;
+    try {
+    const outcome = await this.store.jobs.run({
+      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление Boolean", cancellable: true,
+      validate: () => null,
+      compute: async (_input, signal) => {
+        computation = this.evaluator.evaluate(project, nodeId, signal);
+        result = await computation;
+        return result.ok ? { ok: true as const, value: result } : {
+          ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` },
+        };
+      },
+    });
+    // JobController releases the UI immediately on Cancel; wait for the evaluator to
+    // release its single active slot before scheduling another node or generation.
+    if (computation) await computation;
+    if (!this.current(token, epoch)) return;
+    if (outcome.ok && result?.ok) {
+      const messages = result.warnings.map(warning => warning.message);
+      if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
+      if ((project.nodes.find(node => node.id === nodeId)?.materialSlots.length ?? 0) > 1)
+        messages.push("Назначения нескольких материалов после Boolean не сохраняются.");
+      this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
+    } else if (!outcome.ok) {
+      const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;
+      if (result && !result.ok && result.fallback && result.mesh) {
+        this.scene.setDerived(nodeId, result.mesh, !!result.empty, [`Fallback последнего валидного этапа: ${description}`]);
+      } else this.scene.setModifierDiagnostics(nodeId, [`${description}; показана исходная геометрия.`]);
+      if (outcome.status === "cancelled") this.token++;
+    }
+    } finally { this.active = false; }
+  }
+  dispose(): void {
+    if (this.closed) return;
+    this.closed = true; this.token++;
+    if (this.active) this.store.jobs.cancelJob();
+    this.evaluator.dispose();
+  }
+}
+</file>
+
 <file path="src/spikes/export/generate-tsx.ts">
 import type { Material, Node, Project } from "../../domain/types";
 import { validateProject } from "../../domain/validate-project";
@@ -7573,6 +7667,138 @@ describe("renderer lifecycle", () => {
 });
 </file>
 
+<file path="tests/renderer/modifier-preview.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { createEditorStore } from "../../src/app/editor-store";
+import { ModifierEvaluator } from "../../src/geometry/modifiers";
+import { CsgError, type CsgRequest, type CsgResult } from "../../src/geometry/csg";
+import { ModifierPreview } from "../../src/renderer/modifier-preview";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+function fixture() {
+  const project = createNestedMeshProject();
+  const root = project.nodes[0]!;
+  const cutter = structuredClone(project.nodes.find(node => node.id === "mesh-node")!);
+  cutter.id = "cutter"; cutter.name = "Резак"; cutter.parentId = root.id; cutter.transform.position = [3, 0, 0];
+  project.nodes.push(cutter); root.children.push(cutter.id);
+  const target = project.nodes.find(node => node.id === "mesh-node")!;
+  target.modifierIds.push("boolean-1");
+  project.modifiers.push({ id: "boolean-1", nodeId: target.id, kind: "boolean", order: 0, version: 0,
+    enabled: true, parameters: { operation: "subtract", cutterNodeId: cutter.id } });
+  return project;
+}
+function result(request: CsgRequest, empty = false): CsgResult {
+  const output = empty ? { positions: new Float32Array(), indices: new Uint32Array() }
+    : { positions: request.target.mesh.positions.slice(), indices: request.target.mesh.indices.slice() };
+  if (!empty) output.positions[0]! += 0.15;
+  return { jobId: request.jobId, coordinateSpace: "target-local", output, empty,
+    faceOrigins: new Uint8Array(output.indices.length / 3), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] };
+}
+
+describe("production modifier preview", () => {
+  it.each(["subtract", "union", "intersect"] as const)("renders %s on the stable target and restores source on toggle", async operation => {
+    const project = fixture(); project.modifiers[0]!.parameters.operation = operation;
+    const original = JSON.stringify(project);
+    const store = createEditorStore(project);
+    const scene = new SceneSync(() => {});
+    const runner = { run: vi.fn(async (request: CsgRequest) => result(request)), cancel: vi.fn() };
+    const preview = new ModifierPreview(store, scene, new ModifierEvaluator({ csg: runner }));
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch());
+    const wrapper = scene.objects.get("mesh-node")!.object;
+    const source = scene.objects.get("mesh-node")!.content as T.Mesh;
+    const dispose = vi.spyOn(source.geometry, "dispose");
+    preview.sync();
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(scene.objects.get("mesh-node")!.content).not.toBe(source));
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(scene.objects.get("mesh-node")!.object).toBe(wrapper);
+    expect(scene.surfaces.nearest(new T.Ray(new T.Vector3(0, 0, 4), new T.Vector3(0, 0, -1)))?.nodeId).toBe("mesh-node");
+    expect(JSON.stringify(store.getSnapshot().document.project)).toBe(original);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    const rev = store.getSnapshot().document.revision;
+    expect(store.executeCommand({ commandId: "off", type: "SET_MODIFIER_ENABLED", targetIds: ["boolean-1"], payload: { modifierId: "boolean-1", enabled: false } }, rev).ok).toBe(true);
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    expect(scene.objects.get("mesh-node")!.object).toBe(wrapper);
+    expect(scene.objects.get("mesh-node")!.content).toBeInstanceOf(T.Mesh);
+    expect(runner.run).toHaveBeenCalledOnce();
+    const baseAfterToggle = scene.objects.get("mesh-node")!.content;
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    await vi.waitFor(() => expect(scene.objects.get("mesh-node")!.content).not.toBe(baseAfterToggle));
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    expect(scene.objects.get("mesh-node")!.content).toBeInstanceOf(T.Mesh);
+    preview.dispose(); scene.dispose();
+  });
+  it("shows a valid empty result without surface and with a diagnostic", async () => {
+    const store = createEditorStore(fixture());
+    const statuses: string[][] = [];
+    const scene = new SceneSync(status => statuses.push(status.diagnostics));
+    const runner = { run: vi.fn(async (request: CsgRequest) => result(request, true)), cancel: vi.fn() };
+    const preview = new ModifierPreview(store, scene, new ModifierEvaluator({ csg: runner }));
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    await vi.waitFor(() => expect(statuses.at(-1)?.join(" ")).toContain("Результат Boolean пуст"));
+    expect(scene.objects.get("mesh-node")!.content).toBeUndefined();
+    preview.dispose(); scene.dispose();
+  });
+  it("recomputes after cutter and target-parent transforms", async () => {
+    const store = createEditorStore(fixture()), scene = new SceneSync(() => {});
+    const runner = { run: vi.fn(async (request: CsgRequest) => result(request)), cancel: vi.fn() };
+    const preview = new ModifierPreview(store, scene, new ModifierEvaluator({ csg: runner }));
+    const update = (nodeId: string, x: number) => {
+      const node = store.getSnapshot().document.project.nodes.find(item => item.id === nodeId)!;
+      expect(store.executeCommand({ commandId: `move-${nodeId}-${x}`, type: "SET_NODE_TRANSFORM", targetIds: [nodeId],
+        payload: { nodeId, transform: { ...node.transform, position: [x, 0, 0] } } }, store.getSnapshot().document.revision).ok).toBe(true);
+      scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    };
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("succeeded"));
+    update("cutter", 4);
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(2));
+    expect(runner.run.mock.calls[1]![0].cutter.worldMatrix![12]).toBe(4);
+    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("succeeded"));
+    update("nested-group", 2);
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(3));
+    expect(runner.run.mock.calls[2]![0].target.worldMatrix![12]).toBe(2);
+    preview.dispose(); scene.dispose();
+  });
+  it("ignores a cancelled late Worker result and leaves document and history unchanged", async () => {
+    const project = fixture(), original = JSON.stringify(project);
+    const store = createEditorStore(project), scene = new SceneSync(() => {});
+    let finish!: (value: CsgResult) => void;
+    let request!: CsgRequest;
+    const runner = { run: vi.fn((value: CsgRequest) => { request = value; return new Promise<CsgResult>(resolve => { finish = resolve; }); }), cancel: vi.fn() };
+    const preview = new ModifierPreview(store, scene, new ModifierEvaluator({ csg: runner }));
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch());
+    const source = scene.objects.get("mesh-node")!.content;
+    preview.sync();
+    await vi.waitFor(() => expect(runner.run).toHaveBeenCalledOnce());
+    expect(store.jobs.cancelJob()).toBe(true);
+    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("cancelled"));
+    finish(result(request));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(scene.objects.get("mesh-node")!.content).toBe(source);
+    expect(JSON.stringify(store.getSnapshot().document.project)).toBe(original);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    preview.dispose(); scene.dispose();
+  });
+  it("labels evaluator fallback after Worker failure", async () => {
+    const store = createEditorStore(fixture()), statuses: string[][] = [];
+    const scene = new SceneSync(status => statuses.push(status.diagnostics));
+    const runner = { run: vi.fn(async () => { throw new CsgError("WORKER_FAILED", "worker unavailable"); }), cancel: vi.fn() };
+    const preview = new ModifierPreview(store, scene, new ModifierEvaluator({ csg: runner }));
+    scene.sync(store.getSnapshot().document.project, store.readAssetBytes, store.getProjectEpoch()); preview.sync();
+    await vi.waitFor(() => expect(statuses.at(-1)?.join(" ")).toContain("Fallback"));
+    expect(statuses.at(-1)?.join(" ")).toContain("WORKER_FAILED");
+    preview.dispose(); scene.dispose();
+  });
+});
+</file>
+
 <file path="tests/renderer/primitives.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -8517,92 +8743,6 @@ export function primitiveGeometry(source: DeepReadonly<Extract<MeshSource, { kin
     case "cone": return new T.ConeGeometry(p("radius"), p("height"), p("radialSegments"));
     case "plane": return new T.PlaneGeometry(p("width"), p("height"));
   }
-}
-</file>
-
-<file path="src/renderer/Viewport.tsx">
-import { useEffect, useRef, useState } from "react";
-import type { EditorStore } from "../app/editor-store";
-import { useEditorStore } from "../app/use-editor-store";
-import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
-import type { SceneStatus } from "./scene-sync";
-import { ViewportInteractions, editable } from "./viewport-interactions";
-
-export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
-  const host = useRef<HTMLDivElement>(null);
-  const interactions = useRef<ViewportInteractions | null>(null);
-  const state = useEditorStore(store);
-  const [snap, setSnap] = useState(false);
-  const blockedRef = useRef(blocked);
-  const snapRef = useRef(snap);
-  blockedRef.current = blocked;
-  snapRef.current = snap;
-  const [interactionError, setInteractionError] = useState<string | null>(null);
-  const [backendMode, setBackendMode] = useState<BackendMode>("auto");
-  const [attempt, setAttempt] = useState(0);
-  const [status, setStatus] = useState<RendererStatus>({ phase: "initializing", backend: "не определён", message: "Инициализация 3D…" });
-  const [scene, setScene] = useState<SceneStatus>({ loading: 0, diagnostics: [], errors: 0, empty: true });
-  useEffect(() => {
-    if (!host.current) return;
-    const adapter = new ThreeRendererAdapter(next => {
-      setStatus(next);
-      if (next.phase === "lost" || next.phase === "error") {
-        interactions.current?.dispose(); interactions.current = null;
-      }
-    }, setScene);
-    let generation = -1;
-    const sync = () => {
-      const state = store.getSnapshot();
-      if (generation === state.derived.generation) return;
-      generation = state.derived.generation;
-      adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
-    };
-    let disposed = false;
-    void adapter.initialize(host.current, backendMode).then(() => {
-      const canvas = adapter.canvas;
-      if (disposed || !canvas) return;
-      const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
-      controller.setSnap(snapRef.current);
-      interactions.current = controller;
-      adapter.setFrameHook(() => controller.frame());
-    });
-    sync();
-    const unsubscribe = store.subscribe(sync);
-    return () => { disposed = true; unsubscribe(); interactions.current?.dispose(); interactions.current = null;
-      adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
-  }, [store, backendMode, attempt]);
-  useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
-  useEffect(() => interactions.current?.setSnap(snap), [snap]);
-  const canTransform = editable(state, state.selection.activeId, blocked);
-  return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
-    <div className="renderer-toolbar">
-      <div className="viewport-tools" role="group" aria-label="Инструменты 3D">
-        {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
-          <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
-            disabled={tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
-      </div>
-      <div className="viewport-tools" role="group" aria-label="Пространство координат">
-        <button type="button" aria-pressed={state.tool.space === "local"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "local" })}>Локально</button>
-        <button type="button" aria-pressed={state.tool.space === "world"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "world" })}>Мировое</button>
-      </div>
-      <button type="button" aria-pressed={snap} disabled={mode !== "model" || blocked} title="Перенос: 0,5 · Вращение: 15° · Масштаб: 0,1"
-        onClick={() => setSnap(value => !value)}>Привязка {snap ? "вкл" : "выкл"}</button>
-      <button type="button" title="Показать выбранный объект или всю модель (F)" onClick={() => interactions.current?.fit()}>Показать объект</button>
-      <button type="button" title="Вернуть исходный вид проекта" onClick={() => interactions.current?.reset()}>Сбросить вид</button>
-      <label>Графика <select aria-label="Режим графики" value={backendMode} onChange={event => setBackendMode(event.target.value as BackendMode)}>
-        <option value="auto">Auto / WebGPU</option><option value="webgl2">WebGL2</option>
-      </select></label><span>Backend: {status.backend}</span>
-      <button type="button" onClick={() => setAttempt(n => n + 1)}>Повторить запуск</button>
-    </div>
-    <div className="renderer-host" ref={host} />
-    <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
-      <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
-      {state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
-      {interactionError && <span role="alert">{interactionError}</span>}
-      {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
-      {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
-    </div>
-  </section>;
 }
 </file>
 
@@ -9589,6 +9729,95 @@ export class ViewportInteractions {
 }
 </file>
 
+<file path="src/renderer/Viewport.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { EditorStore } from "../app/editor-store";
+import { useEditorStore } from "../app/use-editor-store";
+import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
+import type { SceneStatus } from "./scene-sync";
+import { ViewportInteractions, editable } from "./viewport-interactions";
+import { ModifierPreview } from "./modifier-preview";
+
+export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
+  const host = useRef<HTMLDivElement>(null);
+  const interactions = useRef<ViewportInteractions | null>(null);
+  const state = useEditorStore(store);
+  const [snap, setSnap] = useState(false);
+  const blockedRef = useRef(blocked);
+  const snapRef = useRef(snap);
+  blockedRef.current = blocked;
+  snapRef.current = snap;
+  const [interactionError, setInteractionError] = useState<string | null>(null);
+  const [backendMode, setBackendMode] = useState<BackendMode>("auto");
+  const [attempt, setAttempt] = useState(0);
+  const [status, setStatus] = useState<RendererStatus>({ phase: "initializing", backend: "не определён", message: "Инициализация 3D…" });
+  const [scene, setScene] = useState<SceneStatus>({ loading: 0, diagnostics: [], errors: 0, empty: true });
+  useEffect(() => {
+    if (!host.current) return;
+    const adapter = new ThreeRendererAdapter(next => {
+      setStatus(next);
+      if (next.phase === "lost" || next.phase === "error") {
+        interactions.current?.dispose(); interactions.current = null;
+      }
+    }, setScene);
+    const preview = new ModifierPreview(store, adapter.graph);
+    let generation = -1;
+    const sync = () => {
+      const state = store.getSnapshot();
+      if (generation === state.derived.generation) return;
+      generation = state.derived.generation;
+      adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
+      preview.sync();
+    };
+    let disposed = false;
+    void adapter.initialize(host.current, backendMode).then(() => {
+      const canvas = adapter.canvas;
+      if (disposed || !canvas) return;
+      const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
+      controller.setSnap(snapRef.current);
+      interactions.current = controller;
+      adapter.setFrameHook(() => controller.frame());
+    });
+    sync();
+    const unsubscribe = store.subscribe(sync);
+    return () => { disposed = true; unsubscribe(); preview.dispose(); interactions.current?.dispose(); interactions.current = null;
+      adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
+  }, [store, backendMode, attempt]);
+  useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
+  useEffect(() => interactions.current?.setSnap(snap), [snap]);
+  const canTransform = editable(state, state.selection.activeId, blocked);
+  return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
+    <div className="renderer-toolbar">
+      <div className="viewport-tools" role="group" aria-label="Инструменты 3D">
+        {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
+          <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
+            disabled={tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
+      </div>
+      <div className="viewport-tools" role="group" aria-label="Пространство координат">
+        <button type="button" aria-pressed={state.tool.space === "local"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "local" })}>Локально</button>
+        <button type="button" aria-pressed={state.tool.space === "world"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "world" })}>Мировое</button>
+      </div>
+      <button type="button" aria-pressed={snap} disabled={mode !== "model" || blocked} title="Перенос: 0,5 · Вращение: 15° · Масштаб: 0,1"
+        onClick={() => setSnap(value => !value)}>Привязка {snap ? "вкл" : "выкл"}</button>
+      <button type="button" title="Показать выбранный объект или всю модель (F)" onClick={() => interactions.current?.fit()}>Показать объект</button>
+      <button type="button" title="Вернуть исходный вид проекта" onClick={() => interactions.current?.reset()}>Сбросить вид</button>
+      <label>Графика <select aria-label="Режим графики" value={backendMode} onChange={event => setBackendMode(event.target.value as BackendMode)}>
+        <option value="auto">Auto / WebGPU</option><option value="webgl2">WebGL2</option>
+      </select></label><span>Backend: {status.backend}</span>
+      <button type="button" onClick={() => setAttempt(n => n + 1)}>Повторить запуск</button>
+    </div>
+    <div className="renderer-host" ref={host} />
+    <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
+      <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
+      {state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
+      {interactionError && <span role="alert">{interactionError}</span>}
+      {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
+      {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
+    </div>
+  </section>;
+}
+</file>
+
 <file path="tests/renderer/scene-sync.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -9971,169 +10200,6 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
-<file path="src/renderer/scene-sync.ts">
-import * as T from "three";
-import type { DeepReadonly } from "../app/editor-store";
-import type { Project, Transform, Material } from "../domain/types";
-import { decodeStaticGlb } from "../importers/gltf/import-glb";
-import { disposeObject } from "../assets/three-resources";
-import { primitiveGeometry } from "./primitive";
-import { SurfaceQuery } from "../geometry/surface-query";
-
-export type RenderProject = DeepReadonly<Project>;
-export type AssetReader = (id: string) => Uint8Array | undefined;
-export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
-type Entry = { object: T.Group; key: string; sourceKey: string; content?: T.Object3D; loading: boolean; error?: string };
-export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
-const decode: AssetDecoder = async bytes => {
-  const result = await decodeStaticGlb(bytes);
-  if (!result.ok) throw new Error(result.error.message);
-  return result.value.root;
-};
-
-export function applyTransform(object: T.Object3D, transform: Transform): void {
-  const { position, rotationQuat, scale } = transform;
-  const length = Math.hypot(...rotationQuat);
-  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
-  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
-  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
-  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
-  object.updateMatrix();
-}
-function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
-  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
-    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
-}
-function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
-  const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
-  content.traverse(object => { if (!(object instanceof T.Mesh)) return;
-    for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
-      oldMaterials.add(old);
-      for (const value of Object.values(old)) if (value instanceof T.Texture) oldTextures.add(value);
-    }
-    object.material = values.length > 1 ? values.map(value => material(value)) : material(values[0]);
-  });
-  for (const old of oldMaterials) old.dispose();
-  for (const texture of oldTextures) { texture.dispose(); if (typeof ImageBitmap !== "undefined" && texture.image instanceof ImageBitmap) texture.image.close(); }
-}
-
-export class SceneSync {
-  readonly surfaces = new SurfaceQuery(undefined, undefined, () => this.emit());
-  readonly scene = new T.Scene();
-  readonly camera = new T.PerspectiveCamera();
-  readonly cameraTarget = new T.Vector3();
-  cameraVersion = 0;
-  readonly objects = new Map<string, Entry>();
-  private lights = new T.Group();
-  private projectId = "";
-  private epoch: object | undefined;
-  private lightKey = "";
-  private cameraKey = "";
-  private diagnostics: string[] = [];
-  private closed = false;
-  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
-    if (this.closed) return;
-    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
-    this.diagnostics = [];
-    const camera = project.scene.camera;
-    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
-      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
-    const cameraKey = JSON.stringify(camera);
-    if (cameraKey !== this.cameraKey) {
-      this.cameraKey = cameraKey;
-      this.cameraTarget.fromArray(camera.target);
-      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
-      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
-      this.cameraVersion += 1;
-    }
-    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
-    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
-    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
-    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
-    const lightKey = JSON.stringify(project.scene.lights);
-    if (lightKey !== this.lightKey) {
-      this.lights.clear(); this.lightKey = lightKey;
-      for (const light of project.scene.lights) {
-        const color = new T.Color(...light.color);
-        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
-          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
-        object.position.fromArray(light.position);
-        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
-        this.lights.add(object);
-      }
-    }
-    const ids = new Set(project.nodes.map(n => n.id));
-    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
-    for (const node of project.nodes) {
-      let entry = this.objects.get(node.id);
-      if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
-      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
-      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
-      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
-      const source = node.kind === "mesh" ? node.meshSource : null;
-      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
-      const key = JSON.stringify([source, asset, materials]);
-      if (key === entry.key) continue;
-      const sourceKey = JSON.stringify([source, asset]);
-      if (entry.content && entry.sourceKey === sourceKey && (source?.kind === "primitive" || materials.length > 0)) {
-        replaceMaterials(entry.content, materials);
-        entry.key = key;
-        continue;
-      }
-      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
-      // Replacement token prevents late assets from attaching after delete, undo, or another source.
-      const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
-      if (!source) continue;
-      const assign = (content: T.Object3D) => {
-        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
-        next.content = content; next.loading = false; next.object.add(content);
-        this.surfaces.register(node.id, next.object, content); this.emit();
-      };
-      try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
-        else {
-          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
-          const bytes = readAsset(source.assetId);
-          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
-          next.loading = true;
-          void this.decoder(bytes).then(content => {
-            // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
-            assign(content);
-          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
-        }
-      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
-    }
-    for (const node of project.nodes) {
-      const object = this.objects.get(node.id)!.object;
-      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
-      if (parent && object.parent !== parent) parent.add(object);
-    }
-    for (const node of project.nodes) {
-      const parent = this.objects.get(node.id)?.object;
-      if (!parent) continue;
-      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
-      if (ordered.some((item, i) => parent.children[i] !== item)) {
-        for (const item of ordered) parent.remove(item);
-        for (const item of ordered) parent.add(item);
-      }
-    }
-    this.scene.updateMatrixWorld(true);
-    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
-    this.emit();
-  }
-  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
-    errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
-  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.surfaces.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
-}
-</file>
-
 <file path="docs/data-contracts.md">
 # Data and contracts
 
@@ -10195,6 +10261,208 @@ FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE 
 Enabled Boolean modifiers use `parameters: { operation: "subtract" | "union" | "intersect", cutterNodeId: string }`. This fits the existing document v1 parameter map without a schema change. `node.modifierIds` defines stack order; the corresponding `Modifier.order` values must be strictly increasing.
 
 `ModifierEvaluator.evaluate(project, meshNodeId, signal?)` returns a discriminated success/error result with detached local-space `MeshData`, `empty`, CSG warnings, applied modifier IDs and an optional fallback after failure. Asset-backed meshes require a local `assetResolver` that supplies detached geometry and a content fingerprint. The evaluator never writes Project or history. It owns an in-memory, byte-bounded LRU stage cache; `clearCache()` and `dispose()` release cached buffers. A single evaluator accepts one active job at a time. Boolean uses `CsgService`; UV, authored normals, material groups and slots are not preserved by CSG. SceneSync is not yet connected to this service.
+</file>
+
+<file path="src/renderer/scene-sync.ts">
+import * as T from "three";
+import type { DeepReadonly } from "../app/editor-store";
+import type { Project, Transform, Material } from "../domain/types";
+import { decodeStaticGlb } from "../importers/gltf/import-glb";
+import { disposeObject } from "../assets/three-resources";
+import { primitiveGeometry } from "./primitive";
+import { SurfaceQuery } from "../geometry/surface-query";
+import { validateMesh, type MeshData } from "../geometry/csg";
+
+export type RenderProject = DeepReadonly<Project>;
+export type AssetReader = (id: string) => Uint8Array | undefined;
+export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
+type Entry = { object: T.Group; key: string; sourceKey: string; content?: T.Object3D; loading: boolean; error?: string };
+export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
+const decode: AssetDecoder = async bytes => {
+  const result = await decodeStaticGlb(bytes);
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value.root;
+};
+
+export function applyTransform(object: T.Object3D, transform: Transform): void {
+  const { position, rotationQuat, scale } = transform;
+  const length = Math.hypot(...rotationQuat);
+  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
+  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
+  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
+  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
+  object.updateMatrix();
+}
+function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
+  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
+    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+}
+function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
+  const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
+  content.traverse(object => { if (!(object instanceof T.Mesh)) return;
+    for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
+      oldMaterials.add(old);
+      for (const value of Object.values(old)) if (value instanceof T.Texture) oldTextures.add(value);
+    }
+    object.material = values.length > 1 ? values.map(value => material(value)) : material(values[0]);
+  });
+  for (const old of oldMaterials) old.dispose();
+  for (const texture of oldTextures) { texture.dispose(); if (typeof ImageBitmap !== "undefined" && texture.image instanceof ImageBitmap) texture.image.close(); }
+}
+
+export class SceneSync {
+  readonly surfaces = new SurfaceQuery(undefined, undefined, () => this.emit());
+  readonly scene = new T.Scene();
+  readonly camera = new T.PerspectiveCamera();
+  readonly cameraTarget = new T.Vector3();
+  cameraVersion = 0;
+  readonly objects = new Map<string, Entry>();
+  private lights = new T.Group();
+  private projectId = "";
+  private epoch: object | undefined;
+  private lightKey = "";
+  private cameraKey = "";
+  private diagnostics: string[] = [];
+  private modifierDiagnostics = new Map<string, string[]>();
+  private derived = new Set<string>();
+  private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
+  private closed = false;
+  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
+    this.diagnostics = [];
+    const camera = project.scene.camera;
+    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
+      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
+    const cameraKey = JSON.stringify(camera);
+    if (cameraKey !== this.cameraKey) {
+      this.cameraKey = cameraKey;
+      this.cameraTarget.fromArray(camera.target);
+      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
+      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+      this.cameraVersion += 1;
+    }
+    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
+    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
+    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
+    const lightKey = JSON.stringify(project.scene.lights);
+    if (lightKey !== this.lightKey) {
+      this.lights.clear(); this.lightKey = lightKey;
+      for (const light of project.scene.lights) {
+        const color = new T.Color(...light.color);
+        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
+          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
+        object.position.fromArray(light.position);
+        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
+        this.lights.add(object);
+      }
+    }
+    const ids = new Set(project.nodes.map(n => n.id));
+    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); this.derived.delete(id); this.modifierDiagnostics.delete(id); this.nodeMaterials.delete(id); }
+    for (const node of project.nodes) {
+      let entry = this.objects.get(node.id);
+      if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
+      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
+      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
+      this.nodeMaterials.set(node.id, materials[0]);
+      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
+      const source = node.kind === "mesh" ? node.meshSource : null;
+      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
+      const key = JSON.stringify([source, asset, materials]);
+      if (key === entry.key) continue;
+      const sourceKey = JSON.stringify([source, asset]);
+      if (entry.content && entry.sourceKey === sourceKey && (source?.kind === "primitive" || materials.length > 0)) {
+        replaceMaterials(entry.content, materials);
+        entry.key = key;
+        continue;
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      // Replacement token prevents late assets from attaching after delete, undo, or another source.
+      const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
+      if (!source) continue;
+      const assign = (content: T.Object3D) => {
+        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
+        next.content = content; next.loading = false; next.object.add(content);
+        this.surfaces.register(node.id, next.object, content); this.emit();
+      };
+      try {
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
+        else {
+          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
+          const bytes = readAsset(source.assetId);
+          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
+          next.loading = true;
+          void this.decoder(bytes).then(content => {
+            // Keep imported materials when there is no explicit domain slot assignment.
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
+            assign(content);
+          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
+        }
+      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
+    }
+    for (const node of project.nodes) {
+      const object = this.objects.get(node.id)!.object;
+      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
+      if (parent && object.parent !== parent) parent.add(object);
+    }
+    for (const node of project.nodes) {
+      const parent = this.objects.get(node.id)?.object;
+      if (!parent) continue;
+      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
+      if (ordered.some((item, i) => parent.children[i] !== item)) {
+        for (const item of ordered) parent.remove(item);
+        for (const item of ordered) parent.add(item);
+      }
+    }
+    this.scene.updateMatrixWorld(true);
+    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
+    this.emit();
+  }
+  /** Derived buffers belong to the renderer and are never attached to the domain document. */
+  setDerived(nodeId: string, mesh: MeshData, empty: boolean, diagnostics: string[] = []): void {
+    if (this.closed) return;
+    const entry = this.objects.get(nodeId);
+    if (!entry) return;
+    validateMesh(mesh, empty);
+    if (empty !== (mesh.indices.length === 0)) throw new Error("Некорректный пустой результат Boolean.");
+    const geometry = new T.BufferGeometry();
+    let content: T.Mesh | undefined;
+    try {
+      if (!empty) {
+        geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
+        geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
+        geometry.computeVertexNormals();
+        content = new T.Mesh(geometry, material(this.nodeMaterials.get(nodeId)));
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
+      else geometry.dispose();
+      this.derived.add(nodeId);
+      this.setModifierDiagnostics(nodeId, diagnostics);
+    } catch (error) { if (content) disposeObject(content); else geometry.dispose(); throw error; }
+  }
+  setModifierDiagnostics(nodeId: string, diagnostics: string[]): void {
+    if (this.closed || !this.objects.has(nodeId)) return;
+    if (diagnostics.length) this.modifierDiagnostics.set(nodeId, diagnostics.map(message => `${nodeId}: ${message}`));
+    else this.modifierDiagnostics.delete(nodeId);
+    this.emit();
+  }
+  resetDerived(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    for (const id of this.derived) { const entry = this.objects.get(id); if (entry) { entry.key = ""; entry.sourceKey = ""; } }
+    this.derived.clear(); this.modifierDiagnostics.clear();
+    this.sync(project, readAsset, epoch);
+  }
+  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
+    errors: [...this.objects.values()].filter(e => e.error).length,
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
+  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+}
 </file>
 
 <file path="tests/app/editor-store.test.ts">

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
 import type { Node } from "../domain/types";
 import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
+import { BooleanEditor } from "./BooleanEditor";
 import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
 
 const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
@@ -119,6 +120,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
         {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
           : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
       </section>
+      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}
     <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
     <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
