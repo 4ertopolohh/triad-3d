@@ -66,4 +66,20 @@ describe("domain scene synchronization", () => {
     expect(() => sync.sync(project, noAssets)).toThrow(/матрица/);
     sync.dispose();
   });
+  it("preserves temporary navigation across document sync and restores project camera on replacement", () => {
+    const sync = new SceneSync(() => {});
+    const project = createNestedMeshProject();
+    const epoch = {};
+    sync.sync(project, noAssets, epoch);
+    const version = sync.cameraVersion;
+    sync.camera.position.set(20, 11, 7);
+    project.nodes.find(n => n.id === "mesh-node")!.transform.position = [2, 0, 0];
+    sync.sync(project, noAssets, epoch);
+    expect(sync.camera.position.toArray()).toEqual([20, 11, 7]);
+    expect(sync.cameraVersion).toBe(version);
+    sync.sync(project, noAssets, {});
+    expect(sync.camera.position.toArray()).toEqual(project.scene.camera.position);
+    expect(sync.cameraVersion).toBe(version + 1);
+    sync.dispose();
+  });
 });

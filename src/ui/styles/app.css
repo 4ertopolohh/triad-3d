@@ -83,3 +83,10 @@ body { margin: 0; }
 .renderer-host { flex: 1; position: relative; min-height: 220px; overflow: hidden; border-radius: var(--radius-sm); background: #202020; }
 .renderer-host canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
 .renderer-status { display: flex; flex-direction: column; gap: var(--space-1); max-height: 100px; overflow: auto; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+.viewport-tools { display: inline-flex; gap: 2px; }
+.renderer-toolbar button { padding: 0 var(--space-2); cursor: pointer; }
+.renderer-toolbar button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
+.renderer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
+.renderer-toolbar button:not(:disabled):hover { border-color: var(--color-primary-accent-strong); }
+.renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.renderer-status [role="alert"] { color: var(--color-state-danger); }

@@ -35,23 +35,32 @@ function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
 export class SceneSync {
   readonly scene = new T.Scene();
   readonly camera = new T.PerspectiveCamera();
+  readonly cameraTarget = new T.Vector3();
+  cameraVersion = 0;
   readonly objects = new Map<string, Entry>();
   private lights = new T.Group();
   private projectId = "";
   private epoch: object | undefined;
   private lightKey = "";
+  private cameraKey = "";
   private diagnostics: string[] = [];
   private closed = false;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
     if (this.closed) return;
-    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; }
+    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
     this.diagnostics = [];
     const camera = project.scene.camera;
     if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
       || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
-    this.camera.position.fromArray(camera.position); this.camera.lookAt(new T.Vector3(...camera.target));
-    this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+    const cameraKey = JSON.stringify(camera);
+    if (cameraKey !== this.cameraKey) {
+      this.cameraKey = cameraKey;
+      this.cameraTarget.fromArray(camera.target);
+      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
+      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+      this.cameraVersion += 1;
+    }
     this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
     if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
     if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");

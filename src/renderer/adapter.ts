@@ -23,6 +23,7 @@ export class ThreeRendererAdapter implements RendererAdapter {
   private job: Promise<void> | undefined;
   private cleanupJob: Promise<void> | undefined;
   private removeListeners = () => {};
+  private frameHook: (() => void) | undefined;
   constructor(private report: (state: RendererStatus) => void, sceneReport: (state: SceneStatus) => void,
     private factory: RendererFactory = mode => new WebGPURenderer({ antialias: true, forceWebGL: mode === "webgl2" })) {
     this.graph = new SceneSync(sceneReport);
@@ -34,6 +35,8 @@ export class ThreeRendererAdapter implements RendererAdapter {
     this.job = this.start(container, mode);
     return this.job;
   }
+  get canvas(): HTMLCanvasElement | undefined { return this.initialized && !this.closed && !this.stopped ? this.renderer?.domElement : undefined; }
+  setFrameHook(hook: (() => void) | undefined): void { this.frameHook = hook; }
   private fail(phase: "error" | "lost", message: string): void {
     if (this.closed) return;
     this.stopped = true; cancelAnimationFrame(this.frame);
@@ -62,7 +65,7 @@ export class ThreeRendererAdapter implements RendererAdapter {
       this.report({ phase: "ready", backend: this.backend, message: "Готово" });
       const draw = () => {
         if (this.closed || this.stopped) return;
-        try { renderer.render(this.graph.scene, this.graph.camera); }
+        try { this.frameHook?.(); renderer.render(this.graph.scene, this.graph.camera); }
         catch { this.fail("error", "Ошибка отрисовки. Повторите запуск 3D; документ остаётся в памяти."); return; }
         this.frame = requestAnimationFrame(draw);
       };
@@ -99,7 +102,7 @@ export class ThreeRendererAdapter implements RendererAdapter {
   }
   dispose(): Promise<void> {
     if (this.cleanupJob) return this.cleanupJob;
-    this.closed = true; cancelAnimationFrame(this.frame); this.observer?.disconnect(); this.removeListeners();
+    this.closed = true; this.frameHook = undefined; cancelAnimationFrame(this.frame); this.observer?.disconnect(); this.removeListeners();
     this.renderer?.domElement.remove(); this.graph.dispose();
     this.cleanupJob = (async () => { await this.job; this.removeListeners(); if (this.renderer) { try { await this.renderer.dispose(); } finally { this.renderer = undefined; } } })();
     return this.cleanupJob;
