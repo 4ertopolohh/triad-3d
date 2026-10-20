@@ -1,5 +1,12 @@
 # Implementation status
 
+## TASK-018 — Inspector трансформаций и параметров примитивов
+
+- Правая панель показывает числовые Position/Rotation/Scale в local/world, mixed values, reset, видимость/блокировку и контекстную геометрию. Редактирование нескольких узлов проходит одной атомарной транзакцией; числовой ввод использует короткий preview debounce и один Undo-шаг на сеанс поля. Esc и отклонённый ввод удаляют предпросмотр и его запись истории через `cancelGesture`.
+- World-преобразования пересчитываются в локальные через матрицу родителя и отклоняются при shear, вырождении или отрицательном детерминанте. Одновременная world-правка предка и потомка явно запрещена. Формы защищены от устаревшей ревизии, смены проекта, выделения и режима.
+- Шесть примитивов остаются параметрическими; GLB отображается как readonly. Параметры куба канонизируются при переходе от `size` к отдельным размерам. Scene mode сохраняет Inspector только для просмотра модели.
+- Проверки: typecheck, lint, 61 целевой Vitest тест и production build прошли. Встроенный браузер с desktop viewport подтвердил создание куба, изменение положения, Undo/Redo, редактирование размера, ошибку нулевого масштаба и откат предпросмотра по Esc. Полный сценарий gizmo/group/save/reopen в браузере не проверен. Большой Vite chunk остаётся прежним предупреждением.
+
 ## TASK-014 — Three.js renderer adapter
 
 - The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.

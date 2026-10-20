@@ -121,6 +121,7 @@ src/
       app.css
       tokens.css
     App.tsx
+    ObjectTree.tsx
   main.tsx
   vite-env.d.ts
 tests/
@@ -134,6 +135,7 @@ tests/
     csg.test.ts
   domain/
     commands.test.ts
+    hierarchy.test.ts
     project.test.ts
     serialization.test.ts
   export/
@@ -4122,267 +4124,6 @@ export function createPrimitiveNode(kind: PrimitiveKind, parentId: string, id: s
 }
 </file>
 
-<file path="src/renderer/viewport-interactions.ts">
-import * as T from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { TransformControls } from "three/addons/controls/TransformControls.js";
-import type { EditorStore, EditorState } from "../app/editor-store";
-import type { Transform } from "../domain/types";
-import { applyTransform, type SceneSync } from "./scene-sync";
-
-type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
-const EPS = 1e-6;
-
-export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
-  if (!id || blocked || state.tool.mode !== "model" || id === state.document.project.model.rootNodeId) return false;
-  const nodes = new Map(state.document.project.nodes.map(node => [node.id, node]));
-  let node = nodes.get(id);
-  if (!node) return false;
-  while (node) {
-    if (!node.visible || node.locked) return false;
-    node = node.parentId ? nodes.get(node.parentId) : undefined;
-  }
-  return true;
-}
-
-export function localTransform(object: T.Object3D): Transform | null {
-  const p = object.position.toArray();
-  const q = object.quaternion.toArray();
-  const s = object.scale.toArray();
-  const length = Math.hypot(...q);
-  if (![...p, ...q, ...s].every(Number.isFinite) || length < EPS || s.some(value => Math.abs(value) < EPS || value < 0)) return null;
-  const normalized = q.map(value => value / length) as [number, number, number, number];
-  return { position: p as [number, number, number], rotationQuat: normalized, scale: s as [number, number, number] };
-}
-
-export function transformChanged(a: Transform, b: Transform): boolean {
-  const distance = (x: readonly number[], y: readonly number[]) => x.some((value, index) => Math.abs(value - (y[index] ?? 0)) > EPS);
-  const q = Math.abs(a.rotationQuat.reduce((sum, value, index) => sum + value * (b.rotationQuat[index] ?? 0), 0));
-  return distance(a.position, b.position) || distance(a.scale, b.scale) || 1 - q > EPS;
-}
-
-function visibleBounds(object: T.Object3D, box: T.Box3): T.Box3 {
-  box.makeEmpty();
-  object.updateWorldMatrix(true, true);
-  const visit = (part: T.Object3D, visible: boolean) => {
-    const shown = visible && part.visible;
-    if (!shown) return;
-    if (part instanceof T.Mesh && part.geometry) {
-      if (!part.geometry.boundingBox) part.geometry.computeBoundingBox();
-      if (part.geometry.boundingBox) box.union(part.geometry.boundingBox.clone().applyMatrix4(part.matrixWorld));
-    }
-    for (const child of part.children) visit(child, shown);
-  };
-  visit(object, true);
-  return box;
-}
-
-export class ViewportInteractions {
-  readonly orbit: OrbitControls;
-  readonly gizmo: TransformControls;
-  private readonly raycaster = new T.Raycaster();
-  private readonly bounds = new T.Box3();
-  private readonly outline = new T.Box3Helper(this.bounds, 0xf9b44c);
-  private drag: Drag | null = null;
-  private down: { x: number; y: number; pointerId: number } | null = null;
-  private cameraVersion = -1;
-  private disposed = false;
-  private blocked = false;
-  private snap = false;
-  private gizmoPress = false;
-  private unsubscribe: () => void;
-
-  constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
-    private report: (message: string | null) => void, blocked: boolean) {
-    this.blocked = blocked;
-    this.orbit = new OrbitControls(graph.camera, canvas);
-    this.orbit.enableDamping = true;
-    this.orbit.minDistance = 0.05;
-    this.orbit.maxDistance = 100000;
-    this.orbit.screenSpacePanning = true;
-    this.gizmo = new TransformControls(graph.camera, canvas);
-    graph.scene.add(this.gizmo.getHelper());
-    this.outline.visible = false;
-    graph.scene.add(this.outline);
-    this.gizmo.addEventListener("mouseDown", this.onGizmoDown);
-    this.gizmo.addEventListener("mouseUp", this.onGizmoUp);
-    this.gizmo.addEventListener("dragging-changed", this.onDraggingChanged);
-    canvas.addEventListener("pointerdown", this.onPointerDown);
-    canvas.addEventListener("pointerup", this.onPointerUp);
-    canvas.addEventListener("pointercancel", this.onPointerCancel);
-    window.addEventListener("keydown", this.onKeyDown);
-    this.unsubscribe = store.subscribe(this.sync);
-    this.sync();
-  }
-
-  private onGizmoDown = () => {
-    this.gizmoPress = true;
-    const state = this.store.getSnapshot();
-    const id = state.selection.activeId;
-    const object = id && this.graph.objects.get(id)?.object;
-    if (!id || !object || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
-    this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
-      revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
-    this.report(null);
-  };
-  private onGizmoUp = () => {
-    const drag = this.drag;
-    if (!drag) return;
-    this.drag = null;
-    const state = this.store.getSnapshot();
-    if (state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
-      || state.tool.active !== drag.tool || state.tool.space !== drag.space
-      || state.selection.activeId !== drag.id || !editable(state, drag.id, this.blocked)
-      || this.graph.objects.get(drag.id)?.object !== drag.object) {
-      this.restore(drag); this.report("Изменение отменено: объект или проект изменился во время перетаскивания."); return;
-    }
-    const transform = localTransform(drag.object);
-    if (!transform) { this.restore(drag); this.report("Изменение отменено: недопустимое положение, вращение или масштаб."); return; }
-    if (!transformChanged(drag.start, transform)) { this.restore(drag); return; }
-    const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_TRANSFORM", targetIds: [drag.id],
-      payload: { nodeId: drag.id, transform } }, drag.revision);
-    if (!result.ok) { this.restore(drag); this.report(`Изменение отменено: ${result.message}`); }
-  };
-  private onDraggingChanged = (event: { value: unknown }) => { this.orbit.enabled = event.value !== true; };
-  private restore(drag: Drag): void {
-    const current = this.store.getSnapshot().document.project.nodes.find(node => node.id === drag.id);
-    if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
-  }
-  cancel(message: string | null = null): void {
-    if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
-    if (message) this.report(message);
-  }
-  private onPointerDown = (event: PointerEvent) => {
-    if (event.button === 0) this.down = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
-  };
-  private onPointerUp = (event: PointerEvent) => {
-    const down = this.down; this.down = null;
-    const gizmoPress = this.gizmoPress; this.gizmoPress = false;
-    if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
-      || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
-    // TransformControls clears its axis in its own pointerup handler; a gizmo press is not a selection click.
-    if (this.gizmo.axis) return;
-    const rect = this.canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
-      -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
-    const candidates: T.Object3D[] = [];
-    for (const entry of this.graph.objects.values()) if (entry.content && entry.object.visible) candidates.push(entry.content);
-    const hit = this.raycaster.intersectObjects(candidates, true).find(item => {
-      let current: T.Object3D | null = item.object;
-      while (current) { if (!current.visible) return false; current = current.parent; }
-      return true;
-    });
-    const wrappers = new Map<T.Object3D, string>([...this.graph.objects].map(([id, entry]) => [entry.object, id]));
-    let parent = hit?.object;
-    while (parent && !wrappers.has(parent)) parent = parent.parent ?? undefined;
-    const id = parent ? wrappers.get(parent) : undefined;
-    this.store.setSelection(id ? [id] : []);
-  };
-  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
-  private onKeyDown = (event: KeyboardEvent) => {
-    const target = event.target as HTMLElement | null;
-    if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
-    if (event.key === "Escape") {
-      if (this.drag) this.cancel("Преобразование отменено.");
-      else this.store.setSelection([]);
-      event.preventDefault(); return;
-    }
-    const key = event.key.toLowerCase();
-    if (key === "f") { this.fit(); event.preventDefault(); }
-    else if (editable(this.store.getSnapshot(), this.store.getSnapshot().selection.activeId, this.blocked) && ["g", "r", "s"].includes(key)) {
-      this.store.setTool({ active: key === "g" ? "move" : key === "r" ? "rotate" : "scale" }); event.preventDefault();
-    }
-  };
-
-  setBlocked(blocked: boolean): void { this.blocked = blocked; this.sync(); }
-  setSnap(enabled: boolean): void {
-    this.snap = enabled;
-    this.gizmo.setTranslationSnap(enabled ? 0.5 : null);
-    this.gizmo.setRotationSnap(enabled ? Math.PI / 12 : null);
-    this.gizmo.setScaleSnap(enabled ? 0.1 : null);
-  }
-  private sync = () => {
-    if (this.disposed) return;
-    const state = this.store.getSnapshot();
-    if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
-      || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
-      || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
-      this.cancel("Изменение отменено: состояние проекта изменилось.");
-    const id = state.selection.activeId;
-    const object = id && this.graph.objects.get(id)?.object;
-    this.gizmo.detach();
-    if (object && editable(state, id, this.blocked) && state.tool.active !== "select") {
-      this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
-      this.gizmo.setSpace(state.tool.space);
-      this.gizmo.attach(object);
-    }
-    this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
-    this.updateOutline(object || null);
-  };
-  private updateOutline(object: T.Object3D | null): void {
-    if (!object) { this.outline.visible = false; return; }
-    visibleBounds(object, this.bounds);
-    this.outline.visible = !this.bounds.isEmpty() && this.bounds.min.toArray().every(Number.isFinite) && this.bounds.max.toArray().every(Number.isFinite);
-    if (this.outline.visible) this.outline.updateMatrixWorld(true);
-  }
-  frame(): void {
-    if (this.cameraVersion !== this.graph.cameraVersion) {
-      this.cameraVersion = this.graph.cameraVersion;
-      this.orbit.target.copy(this.graph.cameraTarget);
-      this.orbit.update();
-    }
-    this.orbit.update();
-    const id = this.store.getSnapshot().selection.activeId;
-    const rootId = this.store.getSnapshot().document.project.model.rootNodeId;
-    this.updateOutline(id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
-  }
-  fit(): void {
-    const state = this.store.getSnapshot();
-    const selected = state.selection.activeId ? this.graph.objects.get(state.selection.activeId)?.object : undefined;
-    const root = this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
-    const target = selected?.visible ? selected : root;
-    if (!target) { this.reset(); return; }
-    visibleBounds(target, this.bounds);
-    if (this.bounds.isEmpty()) { this.reset(); return; }
-    const center = this.bounds.getCenter(new T.Vector3());
-    const size = this.bounds.getSize(new T.Vector3());
-    const radius = Math.max(size.length() / 2, 0.05);
-    const camera = this.graph.camera;
-    const halfFov = T.MathUtils.degToRad(camera.fov / 2);
-    const distance = Math.min(100000, Math.max(0.1, radius * 1.5 / Math.sin(Math.atan(Math.tan(halfFov) * Math.min(1, camera.aspect)))));
-    const direction = camera.position.clone().sub(this.orbit.target).normalize();
-    if (!direction.toArray().every(Number.isFinite) || direction.lengthSq() < EPS) direction.set(1, 0.7, 1).normalize();
-    camera.position.copy(center).addScaledVector(direction, distance);
-    camera.near = Math.max(0.001, (distance - radius * 2) / 100);
-    camera.far = Math.max(camera.near + 1, distance + radius * 4);
-    camera.updateProjectionMatrix();
-    this.orbit.target.copy(center); this.orbit.update();
-  }
-  reset(): void {
-    const camera = this.store.getSnapshot().document.project.scene.camera;
-    this.graph.camera.position.fromArray(camera.position);
-    this.graph.camera.near = camera.near; this.graph.camera.far = camera.far; this.graph.camera.fov = camera.fovDegrees;
-    this.graph.camera.updateProjectionMatrix();
-    this.orbit.target.fromArray(camera.target); this.orbit.update();
-  }
-  dispose(): void {
-    if (this.disposed) return;
-    this.cancel(); this.disposed = true; this.unsubscribe();
-    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
-    this.canvas.removeEventListener("pointerup", this.onPointerUp);
-    this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
-    window.removeEventListener("keydown", this.onKeyDown);
-    this.gizmo.removeEventListener("mouseDown", this.onGizmoDown);
-    this.gizmo.removeEventListener("mouseUp", this.onGizmoUp);
-    this.gizmo.removeEventListener("dragging-changed", this.onDraggingChanged);
-    this.gizmo.detach(); this.gizmo.getHelper().removeFromParent(); this.gizmo.dispose();
-    this.outline.removeFromParent(); this.outline.geometry.dispose(); (this.outline.material as T.Material).dispose();
-    this.orbit.dispose();
-  }
-}
-</file>
-
 <file path="src/spikes/csg/client.ts">
 import type { MeshData, Operation } from "./core";
 import type { Request, Response } from "./protocol";
@@ -5225,6 +4966,144 @@ textarea {
 }
 </file>
 
+<file path="src/ui/ObjectTree.tsx">
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import type { EditorStore, DeepReadonly } from "../app/editor-store";
+import type { Node, Project } from "../domain/types";
+import type { ProjectCommand } from "../domain/command-bus";
+
+type Row = { node: DeepReadonly<Node>; depth: number; path: string };
+const ROW = 30;
+const identity = { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] } as const;
+function projection(project: DeepReadonly<Project>, open: Set<string>, query: string): Row[] {
+  const map = new Map(project.nodes.map(node => [node.id, node]));
+  const result: Row[] = [];
+  const visit = (id: string, depth: number, path: string): boolean => {
+    const node = map.get(id); if (!node) return false;
+    const nextPath = path ? `${path} / ${node.name}` : node.name;
+    const start = result.length;
+    result.push({ node, depth, path: nextPath });
+    let match = node.name.toLocaleLowerCase().includes(query);
+    if (!query && !open.has(id)) return true;
+    for (const child of node.children) match = visit(child, depth + 1, nextPath) || match;
+    if (query && !match) result.splice(start);
+    return match;
+  };
+  visit(project.model.rootNodeId, 0, "");
+  return result;
+}
+function access(project: DeepReadonly<Project>, node: DeepReadonly<Node>): string {
+  const map = new Map(project.nodes.map(item => [item.id, item]));
+  let current: DeepReadonly<Node> | undefined = node;
+  while (current) {
+    if (current.locked) return "Объект или его родитель заблокирован.";
+    if (!current.visible) return "Объект или его родитель скрыт.";
+    current = current.parentId ? map.get(current.parentId) : undefined;
+  }
+  return "";
+}
+export function ObjectTree({ store, project, selection, blocked, mode, notice }: {
+  store: EditorStore; project: DeepReadonly<Project>;
+  selection: { readonly ids: readonly string[]; readonly activeId: string | null };
+  blocked: boolean; mode: "model" | "scene"; notice: (kind: "error" | "success" | "info", text: string) => void;
+}) {
+  const [open, setOpen] = useState<Set<string>>(() => new Set([project.model.rootNodeId]));
+  useEffect(() => { setOpen(previous => new Set([...previous, project.model.rootNodeId])); }, [project.model.rootNodeId]);
+  const [query, setQuery] = useState("");
+  const [scroll, setScroll] = useState(0);
+  const [height, setHeight] = useState(300);
+  const [target, setTarget] = useState(project.model.rootNodeId);
+  useEffect(() => { setTarget(project.model.rootNodeId); }, [project.model.rootNodeId]);
+  const [drag, setDrag] = useState<string | null>(null);
+  const [drop, setDrop] = useState<{ id: string; zone: "before" | "inside" | "after" } | null>(null);
+  const anchor = useRef<string | null>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const rows = useMemo(() => projection(project, open, query.trim().toLocaleLowerCase()), [project, open, query]);
+  const map = useMemo(() => new Map(project.nodes.map(node => [node.id, node])), [project]);
+  const start = Math.max(0, Math.floor(scroll / ROW) - 4);
+  const end = Math.min(rows.length, start + Math.ceil(height / ROW) + 8);
+  const editable = !blocked && mode === "model";
+  const selected = selection.ids.map(id => map.get(id)).filter((node): node is DeepReadonly<Node> => !!node);
+  const reason = selected.map(node => access(project, node)).find(Boolean) || "";
+  const flagReason = selected.map(node => node.parentId ? map.get(node.parentId) : undefined).filter((node): node is DeepReadonly<Node> => !!node).map(node => access(project, node)).find(Boolean) || "";
+  const command = (value: ProjectCommand) => {
+    const result = store.executeCommand(value, store.getSnapshot().document.revision);
+    if (!result.ok) notice("error", result.message);
+    return result.ok;
+  };
+  const batch = (values: ProjectCommand[]) => {
+    const result = store.executeTransaction(values, store.getSnapshot().document.revision);
+    if (!result.ok) notice("error", result.message);
+  };
+  function select(id: string, ctrl: boolean, shift: boolean) {
+    if (shift && anchor.current) {
+      const from = rows.findIndex(row => row.node.id === anchor.current);
+      const to = rows.findIndex(row => row.node.id === id);
+      if (from >= 0 && to >= 0) { const ids = rows.slice(Math.min(from, to), Math.max(from, to) + 1).map(row => row.node.id).filter(value => value !== project.model.rootNodeId); store.setSelection(ctrl ? [...selection.ids, ...ids] : ids, id); return; }
+    }
+    anchor.current = id;
+    if (ctrl) { const ids = selection.ids.includes(id) ? selection.ids.filter(value => value !== id) : [...selection.ids, id]; store.setSelection(ids, ids.includes(id) ? id : ids[0] ?? null); }
+    else store.setSelection(id === project.model.rootNodeId ? [] : [id], id === project.model.rootNodeId ? null : id);
+  }
+  function group() {
+    if (!selected.length || reason) return;
+    const parentId = selected[0]!.parentId;
+    if (!parentId || selected.some(node => node.parentId !== parentId)) { notice("error", "Выберите объекты одного родителя."); return; }
+    const id = crypto.randomUUID();
+    const group: Node = { id, kind: "group", name: "Группа", parentId, children: [], transform: { position: [...identity.position], rotationQuat: [...identity.rotationQuat], scale: [...identity.scale] }, visible: true, locked: false, materialSlots: [], modifierIds: [] };
+    if (command({ commandId: crypto.randomUUID(), type: "GROUP_NODES", targetIds: [...selection.ids, id], payload: { nodeIds: [...selection.ids], group } })) { setOpen(previous => new Set([...previous, id])); store.setSelection([id], id); }
+  }
+  function ungroup() { if (selected.length === 1 && selected[0]?.kind === "group") command({ commandId: crypto.randomUUID(), type: "UNGROUP_NODE", targetIds: [selected[0].id], payload: { nodeId: selected[0].id } }); }
+  function remove() { if (selected.length) batch(selected.filter(node => { let parentId = node.parentId; while (parentId) { if (selected.some(other => other.id === parentId)) return false; parentId = map.get(parentId)?.parentId ?? null; } return true; }).map(node => ({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [node.id], payload: { nodeId: node.id } }))); }
+  function flag(field: "visible" | "locked", value: boolean) {
+    const depth = (node: DeepReadonly<Node>) => { let count = 0; let parentId = node.parentId; while (parentId) { count++; parentId = map.get(parentId)?.parentId ?? null; } return count; };
+    const childrenFirst = value ? field === "locked" : field === "visible";
+    const ordered = [...selected].sort((a, b) => (depth(a) - depth(b)) * (childrenFirst ? -1 : 1));
+    batch(ordered.map(node => ({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: [node.id], payload: { nodeId: node.id, [field]: value } })));
+  }
+  function move(id: string, parentId: string, index: number) {
+    if (id === project.model.rootNodeId) return;
+    command({ commandId: crypto.randomUUID(), type: "MOVE_NODE", targetIds: [id, parentId], payload: { nodeId: id, parentId, index } });
+  }
+  const dropZone = (event: DragEvent<HTMLDivElement>) => { const y = event.clientY - event.currentTarget.getBoundingClientRect().top; return y < 9 ? "before" : y > 21 ? "after" : "inside"; };
+  const active = selection.activeId ? map.get(selection.activeId) : undefined;
+  return <div className="object-tree">
+    <p className="eyebrow">Текущий проект</p><div className="project-name">{project.name}</div>
+    <input className="tree-search" aria-label="Поиск объектов" placeholder="Поиск объектов" value={query} onChange={event => setQuery(event.target.value)} />
+    <div className="tree-tools" role="group" aria-label="Действия с объектами">
+      <button disabled={!editable || !selected.length || !!reason} title={reason} onClick={group}>Сгруппировать</button>
+      <button disabled={!editable || selected.length !== 1 || active?.kind !== "group" || !!reason} title={reason} onClick={ungroup}>Разгруппировать</button>
+      <button disabled={!editable || !selected.length || !!reason} title={reason} onClick={remove}>Удалить</button>
+    </div>
+    <div className="tree-scroll" ref={scroller} role="tree" aria-label="Дерево модели" onScroll={event => setScroll(event.currentTarget.scrollTop)}>
+      <div style={{ height: rows.length * ROW, position: "relative" }}>{rows.slice(start, end).map((row, offset) => {
+        const node = row.node; const isRoot = node.id === project.model.rootNodeId; const unavailable = access(project, node);
+        return <div role="treeitem" aria-level={row.depth + 1} aria-expanded={node.children.length ? open.has(node.id) : undefined} aria-selected={selection.ids.includes(node.id)} key={node.id}
+          className={`object-row ${selection.ids.includes(node.id) ? "is-selected" : ""} ${selection.activeId === node.id ? "is-active" : ""} ${drop?.id === node.id ? `is-drop-${drop.zone}` : ""}`}
+          style={{ top: (start + offset) * ROW, paddingLeft: 8 + row.depth * 15 }}
+          draggable={editable && !isRoot && !unavailable}
+          onDragStart={event => { setDrag(node.id); event.dataTransfer.setData("text/plain", node.id); event.dataTransfer.effectAllowed = "move"; }}
+          onDragEnd={() => { setDrag(null); setDrop(null); }}
+          onDragOver={event => { if (drag && drag !== node.id) { event.preventDefault(); const zone = dropZone(event); if (drop?.id !== node.id || drop.zone !== zone) setDrop({ id: node.id, zone }); } }}
+          onDragLeave={() => setDrop(null)}
+          onDrop={event => { event.preventDefault(); const id = drag; setDrop(null); setDrag(null); if (!id) return; const zone = dropZone(event); if (zone === "inside") move(id, node.id, node.children.length); else if (node.parentId) { const parent = map.get(node.parentId); if (parent) move(id, parent.id, parent.children.indexOf(node.id) + (zone === "after" ? 1 : 0)); } }}>
+          <button className="tree-toggle" type="button" aria-label={open.has(node.id) ? "Свернуть" : "Раскрыть"} disabled={!node.children.length} onClick={() => setOpen(previous => { const next = new Set(previous); if (next.has(node.id)) next.delete(node.id); else next.add(node.id); return next; })}>{node.children.length ? open.has(node.id) ? "▾" : "▸" : "·"}</button>
+          <button type="button" className="tree-name" title={row.path} onClick={event => select(node.id, event.ctrlKey || event.metaKey, event.shiftKey)} onKeyDown={event => { if (event.key === "Delete" && !isRoot && editable) { event.preventDefault(); command({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [node.id], payload: { nodeId: node.id } }); } }}>{node.kind === "group" ? "▦" : "◇"} {node.name}{selection.activeId === node.id ? " ●" : ""}</button>
+          {!isRoot && <><button type="button" className="tree-icon" title={node.visible ? "Скрыть" : "Показать"} disabled={!editable} onClick={() => command({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: [node.id], payload: { nodeId: node.id, visible: !node.visible } })}>{node.visible ? "◉" : "○"}</button><button type="button" className="tree-icon" title={node.locked ? "Разблокировать" : "Заблокировать"} disabled={!editable} onClick={() => command({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: [node.id], payload: { nodeId: node.id, locked: !node.locked } })}>{node.locked ? "🔒" : "○"}</button></>}
+        </div>;
+      })}</div>
+    </div>
+    {project.nodes.length === 1 && <p className="panel-hint">Модель пуста. Добавьте примитив из библиотеки.</p>}
+    <div className="tree-row">◫ Сцена <small>отдельно</small></div>
+    <p className="panel-hint">Выбрано: {selected.length}. {reason}</p>
+    {!!selected.length && <div className="tree-tools"><button disabled={!editable || !!flagReason} title={flagReason} onClick={() => flag("visible", !selected.every(node => node.visible))}>Видимость: {selected.every(node => node.visible) ? "да" : selected.every(node => !node.visible) ? "нет" : "смешано"}</button><button disabled={!editable || !!flagReason} title={flagReason} onClick={() => flag("locked", !selected.every(node => node.locked))}>Блокировка: {selected.every(node => node.locked) ? "да" : selected.every(node => !node.locked) ? "нет" : "смешано"}</button></div>}
+    {active && <div className="tree-edit"><button disabled={!editable || !!reason} onClick={() => { const name = window.prompt("Новое имя объекта", active.name); if (name?.trim()) command({ commandId: crypto.randomUUID(), type: "RENAME_NODE", targetIds: [active.id], payload: { nodeId: active.id, name: name.trim() } }); }}>Переименовать</button><select aria-label="Переместить в группу" value={target} onChange={event => setTarget(event.target.value)}>{project.nodes.filter(node => node.kind === "group").map(node => <option key={node.id} value={node.id}>{node.name}</option>)}</select><button disabled={!editable || !!reason} onClick={() => move(active.id, target, map.get(target)?.children.length ?? 0)}>Переместить</button>{active.parentId && <><button disabled={!editable || !!reason || map.get(active.parentId)!.children[0] === active.id} onClick={() => move(active.id, active.parentId!, map.get(active.parentId!)!.children.indexOf(active.id) - 1)}>Выше</button><button disabled={!editable || !!reason || map.get(active.parentId)!.children.at(-1) === active.id} onClick={() => move(active.id, active.parentId!, map.get(active.parentId!)!.children.indexOf(active.id) + 2)}>Ниже</button></>}</div>}
+    <p className="panel-hint">Ctrl — добавить к выделению, Shift — диапазон. При перетаскивании верх/низ строки задают порядок, середина помещает в группу.</p>
+    <div className="tree-measure" ref={element => { if (element && scroller.current && height !== scroller.current.clientHeight) setHeight(scroller.current.clientHeight); }} />
+  </div>;
+}
+</file>
+
 <file path="src/main.tsx">
 import React from "react";
 import { createRoot } from "react-dom/client";
@@ -5437,6 +5316,67 @@ describe("Manifold CSG spike", () => {
     const result = await compute("intersect", a, b);
     expect(result.empty).toBe(true);
     expect(result.outputTriangles).toBe(0);
+  });
+});
+</file>
+
+<file path="tests/domain/hierarchy.test.ts">
+import { describe, expect, it } from "vitest";
+import { applyProjectPatch, createCommandBus } from "../../src/domain/command-bus";
+import type { GroupNode } from "../../src/domain/types";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const blank = (id: string, parentId: string): GroupNode => ({ id, kind: "group", name: id, parentId, children: [], transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] }, visible: true, locked: false, materialSlots: [], modifierIds: [] });
+const move = (nodeId: string, parentId: string, index: number) => ({ commandId: `move-${nodeId}-${index}`, type: "MOVE_NODE" as const, targetIds: [nodeId, parentId] as [string, string], payload: { nodeId, parentId, index } });
+describe("hierarchy commands", () => {
+  it("groups, ungroups and replays delta patches", () => {
+    const initial = createNestedMeshProject(); const bus = createCommandBus(initial);
+    const group = blank("created", "nested-group");
+    const grouped = bus.executeCommand({ commandId: "group", type: "GROUP_NODES", targetIds: ["mesh-node", group.id], payload: { nodeIds: ["mesh-node"], group } }, 0);
+    expect(grouped.ok).toBe(true); if (!grouped.ok) return;
+    expect(grouped.project.nodes.find(node => node.id === "mesh-node")?.parentId).toBe(group.id);
+    expect(applyProjectPatch(initial, grouped.patch)).toEqual(grouped.project);
+    expect(applyProjectPatch(grouped.project, grouped.undoPatch)).toEqual(initial);
+    const ungrouped = bus.executeCommand({ commandId: "ungroup", type: "UNGROUP_NODE", targetIds: [group.id], payload: { nodeId: group.id } }, 1);
+    expect(ungrouped.ok).toBe(true); if (!ungrouped.ok) return;
+    expect(ungrouped.project.nodes.some(node => node.id === group.id)).toBe(false);
+    expect(applyProjectPatch(grouped.project, ungrouped.patch)).toEqual(ungrouped.project);
+    expect(applyProjectPatch(ungrouped.project, ungrouped.undoPatch)).toEqual(grouped.project);
+  });
+  it("preserves world coordinates, rejects cycles and shear without mutation", () => {
+    const initial = createNestedMeshProject(); const root = initial.nodes[0]!;
+    root.children.push("other"); initial.nodes.push(blank("other", root.id));
+    initial.nodes.find(node => node.id === "nested-group")!.transform = { position: [2, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] };
+    initial.nodes.find(node => node.id === "mesh-node")!.transform = { position: [1, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] };
+    const bus = createCommandBus(initial);
+    const result = bus.executeCommand(move("mesh-node", "other", 0), 0);
+    expect(result.ok).toBe(true); if (!result.ok) return;
+    expect(result.project.nodes.find(node => node.id === "mesh-node")?.transform.position).toEqual([3, 0, 0]);
+    expect(bus.executeCommand(move("other", "other", 0), 1).ok).toBe(false);
+    expect(bus.executeCommand(move(root.id, "other", 0), 1).ok).toBe(false);
+    const before = bus.getSnapshot();
+    const shear = structuredClone(before);
+    shear.nodes.find(node => node.id === "nested-group")!.transform.scale = [2, 1, 1];
+    shear.nodes.find(node => node.id === "nested-group")!.transform.rotationQuat = [0, 0, Math.sin(Math.PI / 8), Math.cos(Math.PI / 8)];
+    const shearBus = createCommandBus(shear);
+    const failed = shearBus.executeCommand(move("mesh-node", "nested-group", 0), 0);
+    expect(failed.ok).toBe(false);
+    expect(shearBus.getSnapshot()).toEqual(shear);
+    expect(bus.getSnapshot()).toEqual(before);
+  });
+  it("reorders and deletes reversibly while protecting dependent tracks", () => {
+    const initial = createNestedMeshProject(); const group = initial.nodes.find(node => node.id === "nested-group")!;
+    group.children.push("second"); initial.nodes.push(blank("second", group.id));
+    const bus = createCommandBus(initial);
+    const reordered = bus.executeCommand(move("second", group.id, 0), 0);
+    expect(reordered.ok).toBe(true); if (!reordered.ok) return;
+    expect(reordered.project.nodes.find(node => node.id === group.id)?.children).toEqual(["second", "mesh-node"]);
+    const deleted = bus.executeCommand({ commandId: "delete", type: "DELETE_NODE", targetIds: ["second"], payload: { nodeId: "second" } }, 1);
+    expect(deleted.ok).toBe(true); if (!deleted.ok) return;
+    expect(applyProjectPatch(reordered.project, deleted.patch)).toEqual(deleted.project);
+    expect(applyProjectPatch(deleted.project, deleted.undoPatch)).toEqual(reordered.project);
+    const dependent = createNestedMeshProject(); dependent.tracks.push({ id: "track", nodeId: "mesh-node", property: "transform.position", keyframeIds: [] });
+    expect(createCommandBus(dependent).executeCommand({ commandId: "delete", type: "DELETE_NODE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0).ok).toBe(false);
   });
 });
 </file>
@@ -6621,144 +6561,277 @@ export function primitiveGeometry(source: DeepReadonly<Extract<MeshSource, { kin
 }
 </file>
 
-<file path="src/renderer/scene-sync.ts">
+<file path="src/renderer/viewport-interactions.ts">
 import * as T from "three";
-import type { DeepReadonly } from "../app/editor-store";
-import type { Project, Transform, Material } from "../domain/types";
-import { decodeStaticGlb } from "../importers/gltf/import-glb";
-import { disposeObject } from "../assets/three-resources";
-import { primitiveGeometry } from "./primitive";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
+import type { EditorStore, EditorState } from "../app/editor-store";
+import type { Transform } from "../domain/types";
+import { applyTransform, type SceneSync } from "./scene-sync";
 
-export type RenderProject = DeepReadonly<Project>;
-export type AssetReader = (id: string) => Uint8Array | undefined;
-export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
-type Entry = { object: T.Group; key: string; content?: T.Object3D; loading: boolean; error?: string };
-export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
-const decode: AssetDecoder = async bytes => {
-  const result = await decodeStaticGlb(bytes);
-  if (!result.ok) throw new Error(result.error.message);
-  return result.value.root;
-};
+type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
+const EPS = 1e-6;
 
-export function applyTransform(object: T.Object3D, transform: Transform): void {
-  const { position, rotationQuat, scale } = transform;
-  const length = Math.hypot(...rotationQuat);
-  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
-  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
-  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
-  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
-  object.updateMatrix();
-}
-function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
-  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
-    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
+  if (!id || blocked || state.tool.mode !== "model" || id === state.document.project.model.rootNodeId) return false;
+  const nodes = new Map(state.document.project.nodes.map(node => [node.id, node]));
+  let node = nodes.get(id);
+  if (!node) return false;
+  while (node) {
+    if (!node.visible || node.locked) return false;
+    node = node.parentId ? nodes.get(node.parentId) : undefined;
+  }
+  return true;
 }
 
-export class SceneSync {
-  readonly scene = new T.Scene();
-  readonly camera = new T.PerspectiveCamera();
-  readonly cameraTarget = new T.Vector3();
-  cameraVersion = 0;
-  readonly objects = new Map<string, Entry>();
-  private lights = new T.Group();
-  private projectId = "";
-  private epoch: object | undefined;
-  private lightKey = "";
-  private cameraKey = "";
-  private diagnostics: string[] = [];
-  private closed = false;
-  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
-    if (this.closed) return;
-    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
-    this.diagnostics = [];
-    const camera = project.scene.camera;
-    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
-      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
-    const cameraKey = JSON.stringify(camera);
-    if (cameraKey !== this.cameraKey) {
-      this.cameraKey = cameraKey;
-      this.cameraTarget.fromArray(camera.target);
-      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
-      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
-      this.cameraVersion += 1;
+export function localTransform(object: T.Object3D): Transform | null {
+  const p = object.position.toArray();
+  const q = object.quaternion.toArray();
+  const s = object.scale.toArray();
+  const length = Math.hypot(...q);
+  if (![...p, ...q, ...s].every(Number.isFinite) || length < EPS || s.some(value => Math.abs(value) < EPS || value < 0)) return null;
+  const normalized = q.map(value => value / length) as [number, number, number, number];
+  return { position: p as [number, number, number], rotationQuat: normalized, scale: s as [number, number, number] };
+}
+
+export function transformChanged(a: Transform, b: Transform): boolean {
+  const distance = (x: readonly number[], y: readonly number[]) => x.some((value, index) => Math.abs(value - (y[index] ?? 0)) > EPS);
+  const q = Math.abs(a.rotationQuat.reduce((sum, value, index) => sum + value * (b.rotationQuat[index] ?? 0), 0));
+  return distance(a.position, b.position) || distance(a.scale, b.scale) || 1 - q > EPS;
+}
+
+function visibleBounds(object: T.Object3D, box: T.Box3): T.Box3 {
+  box.makeEmpty();
+  object.updateWorldMatrix(true, true);
+  const visit = (part: T.Object3D, visible: boolean) => {
+    const shown = visible && part.visible;
+    if (!shown) return;
+    if (part instanceof T.Mesh && part.geometry) {
+      if (!part.geometry.boundingBox) part.geometry.computeBoundingBox();
+      if (part.geometry.boundingBox) box.union(part.geometry.boundingBox.clone().applyMatrix4(part.matrixWorld));
     }
-    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
-    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
-    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
-    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
-    const lightKey = JSON.stringify(project.scene.lights);
-    if (lightKey !== this.lightKey) {
-      this.lights.clear(); this.lightKey = lightKey;
-      for (const light of project.scene.lights) {
-        const color = new T.Color(...light.color);
-        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
-          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
-        object.position.fromArray(light.position);
-        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
-        this.lights.add(object);
+    for (const child of part.children) visit(child, shown);
+  };
+  visit(object, true);
+  return box;
+}
+
+export class ViewportInteractions {
+  readonly orbit: OrbitControls;
+  readonly gizmo: TransformControls;
+  private readonly raycaster = new T.Raycaster();
+  private readonly bounds = new T.Box3();
+  private readonly outline = new T.Box3Helper(this.bounds, 0xf9b44c);
+  private drag: Drag | null = null;
+  private down: { x: number; y: number; pointerId: number } | null = null;
+  private cameraVersion = -1;
+  private disposed = false;
+  private blocked = false;
+  private snap = false;
+  private gizmoPress = false;
+  private unsubscribe: () => void;
+
+  constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
+    private report: (message: string | null) => void, blocked: boolean) {
+    this.blocked = blocked;
+    this.orbit = new OrbitControls(graph.camera, canvas);
+    this.orbit.enableDamping = true;
+    this.orbit.minDistance = 0.05;
+    this.orbit.maxDistance = 100000;
+    this.orbit.screenSpacePanning = true;
+    this.gizmo = new TransformControls(graph.camera, canvas);
+    graph.scene.add(this.gizmo.getHelper());
+    this.outline.visible = false;
+    graph.scene.add(this.outline);
+    this.gizmo.addEventListener("mouseDown", this.onGizmoDown);
+    this.gizmo.addEventListener("mouseUp", this.onGizmoUp);
+    this.gizmo.addEventListener("dragging-changed", this.onDraggingChanged);
+    canvas.addEventListener("pointerdown", this.onPointerDown);
+    canvas.addEventListener("pointerup", this.onPointerUp);
+    canvas.addEventListener("pointercancel", this.onPointerCancel);
+    window.addEventListener("keydown", this.onKeyDown);
+    this.unsubscribe = store.subscribe(this.sync);
+    this.sync();
+  }
+
+  private onGizmoDown = () => {
+    this.gizmoPress = true;
+    const state = this.store.getSnapshot();
+    const id = state.selection.activeId;
+    const object = id && this.graph.objects.get(id)?.object;
+    if (!id || !object || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
+    this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
+      revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
+    this.report(null);
+  };
+  private onGizmoUp = () => {
+    const drag = this.drag;
+    if (!drag) return;
+    this.drag = null;
+    const state = this.store.getSnapshot();
+    if (state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
+      || state.tool.active !== drag.tool || state.tool.space !== drag.space
+      || state.selection.activeId !== drag.id || !editable(state, drag.id, this.blocked)
+      || this.graph.objects.get(drag.id)?.object !== drag.object) {
+      this.restore(drag); this.report("Изменение отменено: объект или проект изменился во время перетаскивания."); return;
+    }
+    const transform = localTransform(drag.object);
+    if (!transform) { this.restore(drag); this.report("Изменение отменено: недопустимое положение, вращение или масштаб."); return; }
+    if (!transformChanged(drag.start, transform)) { this.restore(drag); return; }
+    const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_TRANSFORM", targetIds: [drag.id],
+      payload: { nodeId: drag.id, transform } }, drag.revision);
+    if (!result.ok) { this.restore(drag); this.report(`Изменение отменено: ${result.message}`); }
+  };
+  private onDraggingChanged = (event: { value: unknown }) => { this.orbit.enabled = event.value !== true; };
+  private restore(drag: Drag): void {
+    const current = this.store.getSnapshot().document.project.nodes.find(node => node.id === drag.id);
+    if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
+  }
+  cancel(message: string | null = null): void {
+    if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
+    if (message) this.report(message);
+  }
+  private onPointerDown = (event: PointerEvent) => {
+    if (event.button === 0) this.down = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+  };
+  private onPointerUp = (event: PointerEvent) => {
+    const down = this.down; this.down = null;
+    const gizmoPress = this.gizmoPress; this.gizmoPress = false;
+    if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
+      || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
+    // TransformControls clears its axis in its own pointerup handler; a gizmo press is not a selection click.
+    if (this.gizmo.axis) return;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
+      -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
+    const candidates: T.Object3D[] = [];
+    for (const entry of this.graph.objects.values()) if (entry.content && entry.object.visible) candidates.push(entry.content);
+    const hit = this.raycaster.intersectObjects(candidates, true).find(item => {
+      let current: T.Object3D | null = item.object;
+      while (current) { if (!current.visible) return false; current = current.parent; }
+      return true;
+    });
+    const wrappers = new Map<T.Object3D, string>([...this.graph.objects].map(([id, entry]) => [entry.object, id]));
+    let parent = hit?.object;
+    while (parent && !wrappers.has(parent)) parent = parent.parent ?? undefined;
+    const id = parent ? wrappers.get(parent) : undefined;
+    if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+      const ids = this.store.getSnapshot().selection.ids;
+      const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];
+      this.store.setSelection(next, next.includes(id) ? id : next[0] ?? null);
+    } else this.store.setSelection(id ? [id] : []);
+  };
+  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
+  private onKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
+    if (event.key === "Escape") {
+      if (this.drag) this.cancel("Преобразование отменено.");
+      else this.store.setSelection([]);
+      event.preventDefault(); return;
+    }
+    if (event.key === "Delete" && !this.blocked && this.store.getSnapshot().tool.mode === "model") {
+      const snapshot = this.store.getSnapshot();
+      const id = snapshot.selection.activeId;
+      if (id && id !== snapshot.document.project.model.rootNodeId) {
+        const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [id], payload: { nodeId: id } }, snapshot.document.revision);
+        if (!result.ok) this.report(result.message);
+        event.preventDefault(); return;
       }
     }
-    const ids = new Set(project.nodes.map(n => n.id));
-    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
-    for (const node of project.nodes) {
-      let entry = this.objects.get(node.id);
-      if (!entry) { entry = { object: new T.Group(), key: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
-      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
-      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
-      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
-      const source = node.kind === "mesh" ? node.meshSource : null;
-      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
-      const key = JSON.stringify([source, asset, materials]);
-      if (key === entry.key) continue;
-      if (entry.content) { disposeObject(entry.content); delete entry.content; }
-      // Replacement token prevents late assets from attaching after delete, undo, or another source.
-      const next: Entry = { object: entry.object, key, loading: false }; this.objects.set(node.id, next);
-      if (!source) continue;
-      const assign = (content: T.Object3D) => {
-        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
-        next.content = content; next.loading = false; next.object.add(content); this.emit();
-      };
-      try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
-        else {
-          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
-          const bytes = readAsset(source.assetId);
-          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
-          next.loading = true;
-          void this.decoder(bytes).then(content => {
-            // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) {
-              const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
-              content.traverse(o => { if (o instanceof T.Mesh) {
-                for (const m of Array.isArray(o.material) ? o.material : [o.material]) { oldMaterials.add(m); for (const v of Object.values(m)) if (v instanceof T.Texture) oldTextures.add(v); }
-                o.material = materials.map(m => material(m));
-              } });
-              for (const m of oldMaterials) m.dispose();
-              for (const t of oldTextures) { t.dispose(); if (typeof ImageBitmap !== "undefined" && t.image instanceof ImageBitmap) t.image.close(); }
-            }
-            assign(content);
-          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
-        }
-      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
+    const key = event.key.toLowerCase();
+    if (key === "f") { this.fit(); event.preventDefault(); }
+    else if (editable(this.store.getSnapshot(), this.store.getSnapshot().selection.activeId, this.blocked) && ["g", "r", "s"].includes(key)) {
+      this.store.setTool({ active: key === "g" ? "move" : key === "r" ? "rotate" : "scale" }); event.preventDefault();
     }
-    for (const node of project.nodes) {
-      const object = this.objects.get(node.id)!.object;
-      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
-      if (parent && object.parent !== parent) parent.add(object);
-    }
-    this.scene.updateMatrixWorld(true);
-    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
-    this.emit();
+  };
+
+  setBlocked(blocked: boolean): void { this.blocked = blocked; this.sync(); }
+  setSnap(enabled: boolean): void {
+    this.snap = enabled;
+    this.gizmo.setTranslationSnap(enabled ? 0.5 : null);
+    this.gizmo.setRotationSnap(enabled ? Math.PI / 12 : null);
+    this.gizmo.setScaleSnap(enabled ? 0.1 : null);
   }
-  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
-    errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
-  private remove(entry: Entry): void { if (entry.content) disposeObject(entry.content); entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.lights.clear(); this.scene.clear(); }
+  private sync = () => {
+    if (this.disposed) return;
+    const state = this.store.getSnapshot();
+    if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
+      || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
+      || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
+      this.cancel("Изменение отменено: состояние проекта изменилось.");
+    const id = state.selection.activeId;
+    const object = id && this.graph.objects.get(id)?.object;
+    this.gizmo.detach();
+    if (object && editable(state, id, this.blocked) && state.tool.active !== "select") {
+      this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
+      this.gizmo.setSpace(state.tool.space);
+      this.gizmo.attach(object);
+    }
+    this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
+    this.updateOutline(object || null);
+  };
+  private updateOutline(object: T.Object3D | null): void {
+    if (!object) { this.outline.visible = false; return; }
+    visibleBounds(object, this.bounds);
+    this.outline.visible = !this.bounds.isEmpty() && this.bounds.min.toArray().every(Number.isFinite) && this.bounds.max.toArray().every(Number.isFinite);
+    if (this.outline.visible) this.outline.updateMatrixWorld(true);
+  }
+  frame(): void {
+    if (this.cameraVersion !== this.graph.cameraVersion) {
+      this.cameraVersion = this.graph.cameraVersion;
+      this.orbit.target.copy(this.graph.cameraTarget);
+      this.orbit.update();
+    }
+    this.orbit.update();
+    const id = this.store.getSnapshot().selection.activeId;
+    const rootId = this.store.getSnapshot().document.project.model.rootNodeId;
+    this.updateOutline(id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
+  }
+  fit(): void {
+    const state = this.store.getSnapshot();
+    const selected = state.selection.activeId ? this.graph.objects.get(state.selection.activeId)?.object : undefined;
+    const root = this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
+    const target = selected?.visible ? selected : root;
+    if (!target) { this.reset(); return; }
+    visibleBounds(target, this.bounds);
+    if (this.bounds.isEmpty()) { this.reset(); return; }
+    const center = this.bounds.getCenter(new T.Vector3());
+    const size = this.bounds.getSize(new T.Vector3());
+    const radius = Math.max(size.length() / 2, 0.05);
+    const camera = this.graph.camera;
+    const halfFov = T.MathUtils.degToRad(camera.fov / 2);
+    const distance = Math.min(100000, Math.max(0.1, radius * 1.5 / Math.sin(Math.atan(Math.tan(halfFov) * Math.min(1, camera.aspect)))));
+    const direction = camera.position.clone().sub(this.orbit.target).normalize();
+    if (!direction.toArray().every(Number.isFinite) || direction.lengthSq() < EPS) direction.set(1, 0.7, 1).normalize();
+    camera.position.copy(center).addScaledVector(direction, distance);
+    camera.near = Math.max(0.001, (distance - radius * 2) / 100);
+    camera.far = Math.max(camera.near + 1, distance + radius * 4);
+    camera.updateProjectionMatrix();
+    this.orbit.target.copy(center); this.orbit.update();
+  }
+  reset(): void {
+    const camera = this.store.getSnapshot().document.project.scene.camera;
+    this.graph.camera.position.fromArray(camera.position);
+    this.graph.camera.near = camera.near; this.graph.camera.far = camera.far; this.graph.camera.fov = camera.fovDegrees;
+    this.graph.camera.updateProjectionMatrix();
+    this.orbit.target.fromArray(camera.target); this.orbit.update();
+  }
+  dispose(): void {
+    if (this.disposed) return;
+    this.cancel(); this.disposed = true; this.unsubscribe();
+    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
+    this.canvas.removeEventListener("pointerup", this.onPointerUp);
+    this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
+    window.removeEventListener("keydown", this.onKeyDown);
+    this.gizmo.removeEventListener("mouseDown", this.onGizmoDown);
+    this.gizmo.removeEventListener("mouseUp", this.onGizmoUp);
+    this.gizmo.removeEventListener("dragging-changed", this.onDraggingChanged);
+    this.gizmo.detach(); this.gizmo.getHelper().removeFromParent(); this.gizmo.dispose();
+    this.outline.removeFromParent(); this.outline.geometry.dispose(); (this.outline.material as T.Material).dispose();
+    this.orbit.dispose();
+  }
 }
 </file>
 
@@ -7297,94 +7370,6 @@ describe("GLB import", () => {
 });
 </file>
 
-<file path="tests/renderer/scene-sync.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
-
-const noAssets = () => undefined;
-describe("domain scene synchronization", () => {
-  it("preserves stable objects and local hierarchy while transforms and visibility change", () => {
-    const project = createNestedMeshProject();
-    const states = [] as unknown[];
-    const sync = new SceneSync(state => states.push(state));
-    sync.sync(project, noAssets);
-    const root = sync.objects.get(project.model.rootNodeId)!.object;
-    const group = sync.objects.get("nested-group")!.object;
-    const mesh = sync.objects.get("mesh-node")!.object;
-    const originalContent = sync.objects.get("mesh-node")!.content;
-    expect(group.parent).toBe(root);
-    expect(mesh.parent).toBe(group);
-    const node = project.nodes.find(n => n.id === "mesh-node")!;
-    node.transform.position = [3, 2, 1]; node.visible = false;
-    sync.sync(project, noAssets);
-    expect(sync.objects.get("mesh-node")!.object).toBe(mesh);
-    expect(sync.objects.get("mesh-node")!.content).toBe(originalContent);
-    expect(mesh.position.toArray()).toEqual([3, 2, 1]);
-    expect(mesh.visible).toBe(false);
-    const oldGeometry = (originalContent as T.Mesh).geometry;
-    const disposed = vi.spyOn(oldGeometry, "dispose");
-    project.nodes = project.nodes.filter(n => n.id !== "mesh-node");
-    project.nodes.find(n => n.id === "nested-group")!.children = [];
-    sync.sync(project, noAssets);
-    expect(disposed).toHaveBeenCalledOnce();
-    expect(sync.objects.has("mesh-node")).toBe(false);
-    sync.dispose();
-  });
-  it("clears old project and ignores late asset results after replacement", async () => {
-    const project = createNestedMeshProject();
-    const mesh = project.nodes.find(n => n.id === "mesh-node");
-    if (!mesh || mesh.kind !== "mesh") throw new Error("fixture");
-    mesh.meshSource = { kind: "asset", assetId: "a" };
-    project.assets.push({ id: "a", hash: "f".repeat(64), mediaType: "model/gltf-binary", path: "assets/a.glb", colorSpace: "none" });
-    let resolve!: (root: T.Object3D) => void;
-    const pending = new Promise<T.Object3D>(r => { resolve = r; });
-    const statuses = [] as { loading: number; diagnostics: string[] }[];
-    const sync = new SceneSync(status => statuses.push(status), () => pending);
-    const firstEpoch = {};
-    sync.sync(project, () => new Uint8Array([1]), firstEpoch);
-    expect(statuses.at(-1)?.loading).toBe(1);
-    const oldObject = sync.objects.get("mesh-node")!.object;
-    const replacement = structuredClone(emptyProject);
-    replacement.id = project.id;
-    sync.sync(replacement, noAssets, {});
-    const geometry = new T.BoxGeometry();
-    const disposed = vi.spyOn(geometry, "dispose");
-    resolve(new T.Mesh(geometry, new T.MeshBasicMaterial()));
-    await pending; await Promise.resolve();
-    expect(disposed).toHaveBeenCalledOnce();
-    expect(oldObject.parent).toBeNull();
-    expect(sync.objects.has("mesh-node")).toBe(false);
-    sync.dispose();
-  });
-  it("rejects invalid transforms without corrupting a valid world matrix", () => {
-    const sync = new SceneSync(() => {});
-    const project = createNestedMeshProject();
-    sync.sync(project, noAssets);
-    project.nodes.find(n => n.id === "nested-group")!.transform.position = [Infinity, 0, 0];
-    expect(() => sync.sync(project, noAssets)).toThrow(/матрица/);
-    sync.dispose();
-  });
-  it("preserves temporary navigation across document sync and restores project camera on replacement", () => {
-    const sync = new SceneSync(() => {});
-    const project = createNestedMeshProject();
-    const epoch = {};
-    sync.sync(project, noAssets, epoch);
-    const version = sync.cameraVersion;
-    sync.camera.position.set(20, 11, 7);
-    project.nodes.find(n => n.id === "mesh-node")!.transform.position = [2, 0, 0];
-    sync.sync(project, noAssets, epoch);
-    expect(sync.camera.position.toArray()).toEqual([20, 11, 7]);
-    expect(sync.cameraVersion).toBe(version);
-    sync.sync(project, noAssets, {});
-    expect(sync.camera.position.toArray()).toEqual(project.scene.camera.position);
-    expect(sync.cameraVersion).toBe(version + 1);
-    sync.dispose();
-  });
-});
-</file>
-
 <file path="eslint.config.js">
 import js from "@eslint/js";
 import globals from "globals";
@@ -7616,6 +7601,263 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
+<file path="src/renderer/scene-sync.ts">
+import * as T from "three";
+import type { DeepReadonly } from "../app/editor-store";
+import type { Project, Transform, Material } from "../domain/types";
+import { decodeStaticGlb } from "../importers/gltf/import-glb";
+import { disposeObject } from "../assets/three-resources";
+import { primitiveGeometry } from "./primitive";
+
+export type RenderProject = DeepReadonly<Project>;
+export type AssetReader = (id: string) => Uint8Array | undefined;
+export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
+type Entry = { object: T.Group; key: string; content?: T.Object3D; loading: boolean; error?: string };
+export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
+const decode: AssetDecoder = async bytes => {
+  const result = await decodeStaticGlb(bytes);
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value.root;
+};
+
+export function applyTransform(object: T.Object3D, transform: Transform): void {
+  const { position, rotationQuat, scale } = transform;
+  const length = Math.hypot(...rotationQuat);
+  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
+  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
+  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
+  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
+  object.updateMatrix();
+}
+function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
+  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
+    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+}
+
+export class SceneSync {
+  readonly scene = new T.Scene();
+  readonly camera = new T.PerspectiveCamera();
+  readonly cameraTarget = new T.Vector3();
+  cameraVersion = 0;
+  readonly objects = new Map<string, Entry>();
+  private lights = new T.Group();
+  private projectId = "";
+  private epoch: object | undefined;
+  private lightKey = "";
+  private cameraKey = "";
+  private diagnostics: string[] = [];
+  private closed = false;
+  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
+    this.diagnostics = [];
+    const camera = project.scene.camera;
+    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
+      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
+    const cameraKey = JSON.stringify(camera);
+    if (cameraKey !== this.cameraKey) {
+      this.cameraKey = cameraKey;
+      this.cameraTarget.fromArray(camera.target);
+      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
+      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+      this.cameraVersion += 1;
+    }
+    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
+    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
+    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
+    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
+    const lightKey = JSON.stringify(project.scene.lights);
+    if (lightKey !== this.lightKey) {
+      this.lights.clear(); this.lightKey = lightKey;
+      for (const light of project.scene.lights) {
+        const color = new T.Color(...light.color);
+        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
+          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
+        object.position.fromArray(light.position);
+        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
+        this.lights.add(object);
+      }
+    }
+    const ids = new Set(project.nodes.map(n => n.id));
+    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
+    for (const node of project.nodes) {
+      let entry = this.objects.get(node.id);
+      if (!entry) { entry = { object: new T.Group(), key: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
+      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
+      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
+      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
+      const source = node.kind === "mesh" ? node.meshSource : null;
+      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
+      const key = JSON.stringify([source, asset, materials]);
+      if (key === entry.key) continue;
+      if (entry.content) { disposeObject(entry.content); delete entry.content; }
+      // Replacement token prevents late assets from attaching after delete, undo, or another source.
+      const next: Entry = { object: entry.object, key, loading: false }; this.objects.set(node.id, next);
+      if (!source) continue;
+      const assign = (content: T.Object3D) => {
+        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
+        next.content = content; next.loading = false; next.object.add(content); this.emit();
+      };
+      try {
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
+        else {
+          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
+          const bytes = readAsset(source.assetId);
+          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
+          next.loading = true;
+          void this.decoder(bytes).then(content => {
+            // Keep imported materials when there is no explicit domain slot assignment.
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) {
+              const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
+              content.traverse(o => { if (o instanceof T.Mesh) {
+                for (const m of Array.isArray(o.material) ? o.material : [o.material]) { oldMaterials.add(m); for (const v of Object.values(m)) if (v instanceof T.Texture) oldTextures.add(v); }
+                o.material = materials.map(m => material(m));
+              } });
+              for (const m of oldMaterials) m.dispose();
+              for (const t of oldTextures) { t.dispose(); if (typeof ImageBitmap !== "undefined" && t.image instanceof ImageBitmap) t.image.close(); }
+            }
+            assign(content);
+          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
+        }
+      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
+    }
+    for (const node of project.nodes) {
+      const object = this.objects.get(node.id)!.object;
+      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
+      if (parent && object.parent !== parent) parent.add(object);
+    }
+    for (const node of project.nodes) {
+      const parent = this.objects.get(node.id)?.object;
+      if (!parent) continue;
+      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
+      if (ordered.some((item, i) => parent.children[i] !== item)) {
+        for (const item of ordered) parent.remove(item);
+        for (const item of ordered) parent.add(item);
+      }
+    }
+    this.scene.updateMatrixWorld(true);
+    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
+    this.emit();
+  }
+  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
+    errors: [...this.objects.values()].filter(e => e.error).length,
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+  private remove(entry: Entry): void { if (entry.content) disposeObject(entry.content); entry.object.removeFromParent(); entry.object.clear(); }
+  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.lights.clear(); this.scene.clear(); }
+}
+</file>
+
+<file path="tests/renderer/scene-sync.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
+
+const noAssets = () => undefined;
+describe("domain scene synchronization", () => {
+  it("keeps wrapper and geometry identity while reparenting and reordering", () => {
+    const project = createNestedMeshProject();
+    const root = project.nodes[0]!;
+    const group = project.nodes.find(node => node.id === "nested-group")!;
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const wrapper = sync.objects.get(mesh.id)!.object;
+    const content = sync.objects.get(mesh.id)!.content;
+    root.children = [mesh.id, group.id]; group.children = []; mesh.parentId = root.id;
+    sync.sync(project, noAssets);
+    expect(sync.objects.get(mesh.id)!.object).toBe(wrapper);
+    expect(sync.objects.get(mesh.id)!.content).toBe(content);
+    expect(wrapper.parent).toBe(sync.objects.get(root.id)!.object);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([wrapper, sync.objects.get(group.id)!.object]);
+    root.children = [group.id, mesh.id]; sync.sync(project, noAssets);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([sync.objects.get(group.id)!.object, wrapper]);
+    sync.dispose();
+  });
+  it("preserves stable objects and local hierarchy while transforms and visibility change", () => {
+    const project = createNestedMeshProject();
+    const states = [] as unknown[];
+    const sync = new SceneSync(state => states.push(state));
+    sync.sync(project, noAssets);
+    const root = sync.objects.get(project.model.rootNodeId)!.object;
+    const group = sync.objects.get("nested-group")!.object;
+    const mesh = sync.objects.get("mesh-node")!.object;
+    const originalContent = sync.objects.get("mesh-node")!.content;
+    expect(group.parent).toBe(root);
+    expect(mesh.parent).toBe(group);
+    const node = project.nodes.find(n => n.id === "mesh-node")!;
+    node.transform.position = [3, 2, 1]; node.visible = false;
+    sync.sync(project, noAssets);
+    expect(sync.objects.get("mesh-node")!.object).toBe(mesh);
+    expect(sync.objects.get("mesh-node")!.content).toBe(originalContent);
+    expect(mesh.position.toArray()).toEqual([3, 2, 1]);
+    expect(mesh.visible).toBe(false);
+    const oldGeometry = (originalContent as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    project.nodes = project.nodes.filter(n => n.id !== "mesh-node");
+    project.nodes.find(n => n.id === "nested-group")!.children = [];
+    sync.sync(project, noAssets);
+    expect(disposed).toHaveBeenCalledOnce();
+    expect(sync.objects.has("mesh-node")).toBe(false);
+    sync.dispose();
+  });
+  it("clears old project and ignores late asset results after replacement", async () => {
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find(n => n.id === "mesh-node");
+    if (!mesh || mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "asset", assetId: "a" };
+    project.assets.push({ id: "a", hash: "f".repeat(64), mediaType: "model/gltf-binary", path: "assets/a.glb", colorSpace: "none" });
+    let resolve!: (root: T.Object3D) => void;
+    const pending = new Promise<T.Object3D>(r => { resolve = r; });
+    const statuses = [] as { loading: number; diagnostics: string[] }[];
+    const sync = new SceneSync(status => statuses.push(status), () => pending);
+    const firstEpoch = {};
+    sync.sync(project, () => new Uint8Array([1]), firstEpoch);
+    expect(statuses.at(-1)?.loading).toBe(1);
+    const oldObject = sync.objects.get("mesh-node")!.object;
+    const replacement = structuredClone(emptyProject);
+    replacement.id = project.id;
+    sync.sync(replacement, noAssets, {});
+    const geometry = new T.BoxGeometry();
+    const disposed = vi.spyOn(geometry, "dispose");
+    resolve(new T.Mesh(geometry, new T.MeshBasicMaterial()));
+    await pending; await Promise.resolve();
+    expect(disposed).toHaveBeenCalledOnce();
+    expect(oldObject.parent).toBeNull();
+    expect(sync.objects.has("mesh-node")).toBe(false);
+    sync.dispose();
+  });
+  it("rejects invalid transforms without corrupting a valid world matrix", () => {
+    const sync = new SceneSync(() => {});
+    const project = createNestedMeshProject();
+    sync.sync(project, noAssets);
+    project.nodes.find(n => n.id === "nested-group")!.transform.position = [Infinity, 0, 0];
+    expect(() => sync.sync(project, noAssets)).toThrow(/матрица/);
+    sync.dispose();
+  });
+  it("preserves temporary navigation across document sync and restores project camera on replacement", () => {
+    const sync = new SceneSync(() => {});
+    const project = createNestedMeshProject();
+    const epoch = {};
+    sync.sync(project, noAssets, epoch);
+    const version = sync.cameraVersion;
+    sync.camera.position.set(20, 11, 7);
+    project.nodes.find(n => n.id === "mesh-node")!.transform.position = [2, 0, 0];
+    sync.sync(project, noAssets, epoch);
+    expect(sync.camera.position.toArray()).toEqual([20, 11, 7]);
+    expect(sync.cameraVersion).toBe(version);
+    sync.sync(project, noAssets, {});
+    expect(sync.camera.position.toArray()).toEqual(project.scene.camera.position);
+    expect(sync.cameraVersion).toBe(version + 1);
+    sync.dispose();
+  });
+});
+</file>
+
 <file path="tsconfig.json">
 {
   "compilerOptions": {
@@ -7698,6 +7940,7 @@ FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE 
 import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
+import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
@@ -7705,7 +7948,11 @@ export type ProjectCommand =
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
   | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
   | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } }
-  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } };
+  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
+  | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
+  | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
+  | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
+  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } };
 
 export const CommandErrorCode = {
   REVISION_CONFLICT: "REVISION_CONFLICT",
@@ -7723,7 +7970,7 @@ export type PatchChange =
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
   | { kind: "removeAsset"; asset: Asset }
-  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children" | "parentId"; before: Node["name"] | Transform | boolean | EntityId[] | EntityId | null; after: Node["name"] | Transform | boolean | EntityId[] | EntityId | null }
   | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
   | { kind: "modelRevision"; before: number; after: number };
 export interface ProjectPatch { changes: PatchChange[] }
@@ -7779,6 +8026,16 @@ function validNode(value: unknown): value is Node {
 function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
+  if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "GROUP_NODES") return ownKeys(payload, ["nodeIds", "group"]) && idList(payload.nodeIds)
+    && payload.nodeIds.length > 0 && new Set(payload.nodeIds).size === payload.nodeIds.length
+    && validNode(payload.group) && payload.group.kind === "group" && payload.group.children.length === 0
+    && same(value.targetIds, [...payload.nodeIds, payload.group.id]);
+  if (value.type === "MOVE_NODE") return ownKeys(payload, ["nodeId", "parentId", "index"])
+    && id(payload.nodeId) && id(payload.parentId) && Number.isSafeInteger(payload.index) && (payload.index as number) >= 0
+    && same(value.targetIds, [payload.nodeId, payload.parentId]);
+  if (value.type === "UNGROUP_NODE" || value.type === "DELETE_NODE") return ownKeys(payload, ["nodeId"])
+    && id(payload.nodeId) && same(value.targetIds, [payload.nodeId]);
   if (value.type === "ADD_MESH_ASSET") {
     const asset = payload.asset;
     const node = payload.node;
@@ -7810,6 +8067,46 @@ function validCommand(value: unknown): value is ProjectCommand {
   }
 }
 
+const nodeById = (project: Project, nodeId: string): Node | undefined => project.nodes.find(node => node.id === nodeId);
+function matrix(transform: Transform): Matrix4 {
+  return new Matrix4().compose(new Vector3(...transform.position), new Quaternion(...transform.rotationQuat), new Vector3(...transform.scale));
+}
+function worldMatrix(project: Project, node: Node): Matrix4 {
+  const chain: Node[] = [];
+  let current: Node | undefined = node;
+  while (current) { chain.unshift(current); current = current.parentId ? nodeById(project, current.parentId) : undefined; }
+  return chain.reduce((result, item) => result.multiply(matrix(item.transform)), new Matrix4());
+}
+function relativeTransform(project: Project, node: Node, parent: Node): Transform | null {
+  const parentWorld = worldMatrix(project, parent);
+  if (Math.abs(parentWorld.determinant()) < 1e-12) return null;
+  const target = parentWorld.invert().multiply(worldMatrix(project, node));
+  const position = new Vector3(); const rotation = new Quaternion(); const scale = new Vector3();
+  target.decompose(position, rotation, scale);
+  const recomposed = new Matrix4().compose(position, rotation, scale);
+  if (![...target.elements, ...recomposed.elements].every(Number.isFinite)
+    || target.elements.some((value, index) => Math.abs(value - recomposed.elements[index]!) > 1e-6 * Math.max(1, Math.abs(value)))) return null;
+  return { position: position.toArray() as [number, number, number], rotationQuat: rotation.toArray() as [number, number, number, number], scale: scale.toArray() as [number, number, number] };
+}
+function descendants(project: Project, node: Node): Node[] {
+  return [node, ...node.children.flatMap(childId => { const child = nodeById(project, childId); return child ? descendants(project, child) : []; })];
+}
+function guarded(project: Project, node: Node): CommandErrorCode | null { return blocked(project, node); }
+function move(project: Project, node: Node, parent: Node, index: number, commandId: string): CommandResult | null {
+  if (node.id === project.model.rootNodeId || parent.kind !== "group" || descendants(project, node).some(item => item.id === parent.id))
+    return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Корень и циклические переносы запрещены.");
+  const oldParent = node.parentId && nodeById(project, node.parentId);
+  if (!oldParent || index > parent.children.length || guarded(project, node) || guarded(project, oldParent) || guarded(project, parent))
+    return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Перенос запрещён: узел, родитель или позиция недоступны.");
+  const transform = oldParent.id === parent.id ? node.transform : relativeTransform(project, node, parent);
+  if (!transform) return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Перенос создаёт недопустимый сдвиг (shear) или необратимую трансформацию.");
+  const oldIndex = oldParent.children.indexOf(node.id);
+  oldParent.children = oldParent.children.filter(id => id !== node.id);
+  parent.children.splice(Math.min(index - (oldParent.id === parent.id && oldIndex < index ? 1 : 0), parent.children.length), 0, node.id);
+  node.parentId = parent.id; node.transform = transform;
+  return null;
+}
+
 function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
   return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
 }
@@ -7825,6 +8122,56 @@ function blocked(project: Project, node: Node, flags = false): CommandErrorCode 
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "MOVE_NODE") {
+    const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
+    if (!node || !parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел или новая группа не найдены.");
+    return move(project, node, parent, command.payload.index, command.commandId);
+  }
+  if (command.type === "GROUP_NODES") {
+    const nodes = command.payload.nodeIds.map(id => nodeById(project, id));
+    const first = nodes[0]; const parent = first?.parentId && nodeById(project, first.parentId);
+    const group = command.payload.group;
+    if (!first || !parent || nodes.some(node => !node || node.id === project.model.rootNodeId || node.parentId !== parent.id)
+      || group.parentId !== parent.id || parent.kind !== "group" || entityIds(project).has(group.id) || guarded(project, parent)
+      || !same(group.transform, { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] })
+      || nodes.some(node => guarded(project, node!)) || group.modifierIds.length || group.materialSlots.length)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Группировать можно доступные узлы одного родителя.");
+    const ordered = parent.children.filter(id => command.payload.nodeIds.includes(id));
+    const insertion = parent.children.indexOf(ordered[0]!);
+    parent.children = parent.children.filter(id => !ordered.includes(id)); parent.children.splice(insertion, 0, group.id);
+    project.nodes.push(structuredClone(group));
+    const created = nodeById(project, group.id)!;
+    for (const id of ordered) { const node = nodeById(project, id)!; node.parentId = group.id; created.children.push(id); }
+    return null;
+  }
+  if (command.type === "UNGROUP_NODE") {
+    const group = nodeById(project, command.payload.nodeId);
+    const parent = group?.parentId && nodeById(project, group.parentId);
+    if (!group || !parent || group.kind !== "group" || group.id === project.model.rootNodeId || guarded(project, group)
+      || guarded(project, parent) || group.modifierIds.length || group.materialSlots.length || project.tracks.some(track => track.nodeId === group.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Группу нельзя безопасно разгруппировать.");
+    const children = group.children.map(id => nodeById(project, id)!);
+    const transforms = children.map(child => relativeTransform(project, child, parent));
+    if (transforms.some(value => !value)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Разгруппировка создаёт shear или необратимую трансформацию.");
+    const index = parent.children.indexOf(group.id);
+    parent.children.splice(index, 1, ...group.children);
+    children.forEach((child, i) => { child.parentId = parent.id; child.transform = transforms[i]!; });
+    project.nodes = project.nodes.filter(node => node.id !== group.id);
+    return null;
+  }
+  if (command.type === "DELETE_NODE") {
+    const node = nodeById(project, command.payload.nodeId);
+    const parent = node?.parentId && nodeById(project, node.parentId);
+    if (!node || !parent || node.id === project.model.rootNodeId || guarded(project, node) || guarded(project, parent))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел нельзя удалить.");
+    const removed = descendants(project, node); const ids = new Set(removed.map(item => item.id));
+    if (removed.some(item => item.modifierIds.length) || project.modifiers.some(item => ids.has(item.nodeId))
+      || project.tracks.some(item => ids.has(item.nodeId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "У структуры есть зависимые дорожки или модификаторы.");
+    parent.children = parent.children.filter(id => id !== node.id);
+    project.nodes = project.nodes.filter(item => !ids.has(item.id));
+    return null;
+  }
   if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
     const { parentId, node } = command.payload;
     if (command.type === "ADD_MESH_ASSET") {
@@ -7895,13 +8242,14 @@ function diff(before: Project, after: Project): ProjectPatch {
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
-    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
+    for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
     if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
       changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
   }
+  for (const node of before.nodes) if (!after.nodes.some(entry => entry.id === node.id)) changes.push({ kind: "removeNode", node: structuredClone(node) });
   if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
   return { changes };
 }
@@ -8272,6 +8620,18 @@ describe("editor store", () => {
     expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
     expect(store.getSnapshot().document.dirty).toBe(false);
   });
+  it("prunes deleted selection and restores hierarchy through one undo step", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.setSelection(["mesh-node"], "mesh-node");
+    const result = store.executeCommand({ commandId: "delete-node", type: "DELETE_NODE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0);
+    expect(result.ok).toBe(true);
+    expect(store.getSnapshot().selection).toMatchObject({ ids: [], activeId: null });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.some(node => node.id === "mesh-node")).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
 });
 </file>
 
@@ -8390,9 +8750,12 @@ export function createEditorStore(initialProject: Project): EditorStore {
     else positions.push({});
     const nextCursor = entries.length;
     pruneAssets(result.project, entries);
+    const validIds = new Set(result.project.nodes.map(node => node.id));
+    const selectedIds = state.selection.ids.filter(id => validIds.has(id));
     publish({
       ...state,
       document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      selection: Object.freeze({ ids: Object.freeze(selectedIds), activeId: state.selection.activeId && selectedIds.includes(state.selection.activeId) ? state.selection.activeId : selectedIds[0] ?? null }),
       history: historyState(entries, nextCursor),
       derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
     });
@@ -8513,6 +8876,45 @@ export const selectCanUndo = (state: EditorState) => state.history.canUndo;
 export const selectCanRedo = (state: EditorState) => state.history.canRedo;
 </file>
 
+<file path="package.json">
+{
+  "name": "triad-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "export:check": "node scripts/check-export-harness.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@zip.js/zip.js": "^2.24.0",
+    "ajv": "^8.20.0",
+    "manifold-3d": "^3.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "three": "0.186.1"
+  }
+}
+</file>
+
 <file path="src/ui/styles/app.css">
 body { margin: 0; }
 #root { min-height: 100vh; }
@@ -8614,45 +9016,111 @@ body { margin: 0; }
 .primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
 button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
 button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
+.object-tree { display: grid; gap: 8px; font-size: var(--font-size-sm); }
+.tree-search { width: 100%; box-sizing: border-box; min-height: 30px; border: var(--border-default); border-radius: var(--radius-sm); padding: 4px 8px; background: var(--color-surface-base); color: var(--color-text-primary); }
+.tree-tools, .tree-edit { display: flex; flex-wrap: wrap; gap: 4px; }
+.tree-tools button, .tree-edit button, .tree-edit select { border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); min-height: 26px; cursor: pointer; }
+.tree-tools button:disabled, .tree-edit button:disabled { opacity: .45; cursor: not-allowed; }
+.tree-scroll { height: 300px; overflow: auto; border: var(--border-default); border-radius: var(--radius-sm); }
+.object-row { position: absolute; left: 0; right: 0; height: 30px; box-sizing: border-box; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.object-row:hover { background: var(--color-state-info-surface); }
+.object-row.is-selected { background: var(--color-state-info-surface); }
+.object-row.is-active { outline: 1px solid var(--color-primary-accent-strong); outline-offset: -1px; }
+.object-row.is-drop-inside { box-shadow: inset 0 0 0 2px var(--color-primary-accent-strong); }
+.object-row.is-drop-before { box-shadow: inset 0 2px 0 var(--color-primary-accent-strong); }
+.object-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--color-primary-accent-strong); }
+.object-row button { border: 0; background: transparent; color: var(--color-text-primary); cursor: pointer; }
+.object-row button:focus-visible, .tree-tools button:focus-visible, .tree-edit button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); }
+.object-row .tree-toggle { width: 18px; padding: 0; }
+.object-row .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.object-row .tree-icon { width: 24px; padding: 0; }
+.tree-measure { display: none; }
 </file>
 
-<file path="package.json">
-{
-  "name": "triad-3d",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "test": "vitest run",
-    "export:check": "node scripts/check-export-harness.mjs"
-  },
-  "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@types/three": "0.186.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "eslint": "^10.13.0",
-    "globals": "^17.13.0",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.72.0",
-    "vite": "^8.3.4",
-    "vitest": "^5.0.5"
-  },
-  "dependencies": {
-    "@zip.js/zip.js": "^2.24.0",
-    "ajv": "^8.20.0",
-    "manifold-3d": "^3.5.4",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "three": "0.186.1"
-  }
-}
+<file path="docs/implementation-status.md">
+# Implementation status
+
+## TASK-014 — Three.js renderer adapter
+
+- The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.
+- GPU geometry, materials, and textures are disposed when sources disappear or change, and asynchronous GLB results cannot attach after project replacement or viewport teardown. The renderer owns its canvas, resize observer, frame loop, and context-loss listeners. A graphics failure stops rendering and offers explicit retry from the current Project snapshot.
+- Scene mode labels the primary model as a preview; it does not synthesize serialized instances. HDRI environment assets, Scene instances, material textures, and modifier evaluation are not yet rendered, with visible diagnostics. Actual device loss and cross-browser recovery remain unverified on hardware; the loss handler and retry were tested in isolation.
+- In the in-app Chromium desktop viewport, Auto selected WebGPU and forced WebGL2 selected WebGL2. A local static GLB rendered, Undo/Redo changed the preview, and switching Model/Scene kept one canvas. Save/Open UI, dock resizing, and actual device loss were not browser-tested in this run.
+
+## TASK-013 — Unsaved changes and RAM-only lifecycle
+
+- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
+- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
+
+## TASK-012 — Desktop workspace and topbar
+
+- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
+- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
+- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
+
+## TASK-011 — Undo/Redo delta history
+
+- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
+- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
+- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
+
+## TASK-010B — Basic static GLB import
+
+- Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.
+- A confirmed import registers SHA-256 asset metadata and an identity transform mesh node in one domain transaction; bytes stay in RAM and round-trip through `.triad3d`. The Russian UI offers a separate import action, confirmation, diagnostics and a visible model entry.
+- TASK-010 / FR-064 remain partial: broader glTF scene and animation import, editable imported materials, and production 3D rendering are not implemented.
+
+## TASK-010A — Native project archive and manual file actions
+
+- Added `.triad3d` ZIP save/open with `manifest.json`, `document.json`, SHA-256 verified binary assets, strict entry/path checks, and bounded streaming extraction. Asset bytes remain in RAM and are excluded from JSON and command history.
+- EditorStore now replaces a validated loaded project and its asset store in one publication, resets selection/history, keeps serialized `model.revision`, and rejects stale asynchronous replacements. Confirmed File System Access writes mark the captured revision clean; browser download fallback reports only that download was initiated.
+- Added Russian save/open controls and status messages. Security limits are temporary protective bounds pending performance profiling: 128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest.
+- TASK-010 remains partial: the GLB/GLTF import adapter is not included in TASK-010A.
+
+## TASK-009 — Versioned project JSON serialization
+
+- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
+- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
+- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
+
+## TASK-007 — Domain commands and transactions
+
+- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
+- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
+- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
+- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
+
+## TASK-004 — TSX export harness spike
+
+- Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.
+- Targeted export tests, domain regression, root typecheck/lint/build, and WebGL smoke passed. Supported fields and omissions are recorded in [tsx-export-feasibility.md](tsx-export-feasibility.md). Production TASK-044 remains open.
+
+## TASK-003 — CSG/Manifold WASM spike
+
+- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
+- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
+
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
+## TASK-006 — React/Vite foundation
+
+- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
+- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
+- The document remains in memory only. No browser storage or backend is used.
+- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
+- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
+- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+
+## TASK-016 — Параметрическая библиотека примитивов (FR-012, FR-024)
+
+- Добавлены единые определения и валидация шести примитивов в `src/geometry/primitives.ts`; фабрика Three.js использует их для вычисления геометрии по изменению source. Доменная проверка отклоняет неверные размеры, сегменты, неизвестные ключи и вырожденный цилиндр до фиксации проекта.
+- Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
+- Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
+- Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
 </file>
 
 <file path="src/ui/App.tsx">
@@ -8668,6 +9136,7 @@ import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/impor
 import packageInfo from "../../package.json";
 import { createPrimitiveNode, primitiveDefinitions, validatePrimitiveSource, type PrimitiveKind, type PrimitiveSource } from "../geometry/primitives";
 import type { DeepReadonly } from "../app/editor-store";
+import { ObjectTree } from "./ObjectTree";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -8934,12 +9403,7 @@ function EditorShell() {
           <div className="dock-tabs" role="group" aria-label="Левая панель"><button type="button" aria-pressed={state.view.leftTab === "structure"} onClick={() => editorStore.setView({ leftTab: "structure" })}>Структура</button><button type="button" aria-pressed={state.view.leftTab === "assets"} onClick={() => editorStore.setView({ leftTab: "assets" })}>Библиотека</button></div>
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
-            <p className="eyebrow">Текущий проект</p>
-            <div className="project-name">{project.name}</div>
-            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <button type="button" className="tree-row" key={node.id} aria-pressed={state.selection.activeId === node.id} onClick={() => editorStore.setSelection([node.id], node.id)}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></button>)}
-            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
-            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
+            <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
           </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
@@ -8986,92 +9450,6 @@ function PrimitiveEditor({ source, disabled, reason, onApply }: { source: DeepRe
     {error && <p className="primitive-error" role="alert">{error}</p>}
   </form>;
 }
-</file>
-
-<file path="docs/implementation-status.md">
-# Implementation status
-
-## TASK-014 — Three.js renderer adapter
-
-- The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.
-- GPU geometry, materials, and textures are disposed when sources disappear or change, and asynchronous GLB results cannot attach after project replacement or viewport teardown. The renderer owns its canvas, resize observer, frame loop, and context-loss listeners. A graphics failure stops rendering and offers explicit retry from the current Project snapshot.
-- Scene mode labels the primary model as a preview; it does not synthesize serialized instances. HDRI environment assets, Scene instances, material textures, and modifier evaluation are not yet rendered, with visible diagnostics. Actual device loss and cross-browser recovery remain unverified on hardware; the loss handler and retry were tested in isolation.
-- In the in-app Chromium desktop viewport, Auto selected WebGPU and forced WebGL2 selected WebGL2. A local static GLB rendered, Undo/Redo changed the preview, and switching Model/Scene kept one canvas. Save/Open UI, dock resizing, and actual device loss were not browser-tested in this run.
-
-## TASK-013 — Unsaved changes and RAM-only lifecycle
-
-- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
-- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
-
-## TASK-012 — Desktop workspace and topbar
-
-- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
-- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
-- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
-
-## TASK-011 — Undo/Redo delta history
-
-- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
-- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
-- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
-
-## TASK-010B — Basic static GLB import
-
-- Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.
-- A confirmed import registers SHA-256 asset metadata and an identity transform mesh node in one domain transaction; bytes stay in RAM and round-trip through `.triad3d`. The Russian UI offers a separate import action, confirmation, diagnostics and a visible model entry.
-- TASK-010 / FR-064 remain partial: broader glTF scene and animation import, editable imported materials, and production 3D rendering are not implemented.
-
-## TASK-010A — Native project archive and manual file actions
-
-- Added `.triad3d` ZIP save/open with `manifest.json`, `document.json`, SHA-256 verified binary assets, strict entry/path checks, and bounded streaming extraction. Asset bytes remain in RAM and are excluded from JSON and command history.
-- EditorStore now replaces a validated loaded project and its asset store in one publication, resets selection/history, keeps serialized `model.revision`, and rejects stale asynchronous replacements. Confirmed File System Access writes mark the captured revision clean; browser download fallback reports only that download was initiated.
-- Added Russian save/open controls and status messages. Security limits are temporary protective bounds pending performance profiling: 128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest.
-- TASK-010 remains partial: the GLB/GLTF import adapter is not included in TASK-010A.
-
-## TASK-009 — Versioned project JSON serialization
-
-- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
-- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
-- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
-
-## TASK-007 — Domain commands and transactions
-
-- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
-- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
-- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
-- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
-
-## TASK-004 — TSX export harness spike
-
-- Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.
-- Targeted export tests, domain regression, root typecheck/lint/build, and WebGL smoke passed. Supported fields and omissions are recorded in [tsx-export-feasibility.md](tsx-export-feasibility.md). Production TASK-044 remains open.
-
-## TASK-003 — CSG/Manifold WASM spike
-
-- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
-- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
-
-## TASK-002 — Renderer/PBR spike
-
-- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
-- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
-- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
-
-## TASK-006 — React/Vite foundation
-
-- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
-- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
-- The document remains in memory only. No browser storage or backend is used.
-- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
-- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
-- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
-
-## TASK-016 — Параметрическая библиотека примитивов (FR-012, FR-024)
-
-- Добавлены единые определения и валидация шести примитивов в `src/geometry/primitives.ts`; фабрика Three.js использует их для вычисления геометрии по изменению source. Доменная проверка отклоняет неверные размеры, сегменты, неизвестные ключи и вырожденный цилиндр до фиксации проекта.
-- Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
-- Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
-- Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
 </file>
 
 </files>

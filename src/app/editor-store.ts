@@ -33,6 +33,7 @@ export interface EditorStore {
   executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string, groupId?: string): CommandResult;
   undo(expectedRevision: number): CommandResult;
   redo(expectedRevision: number): CommandResult;
+  cancelGesture(groupId: string, expectedRevision: number): CommandResult;
   addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   setTool(next: Partial<EditorState["tool"]>): void;
@@ -156,6 +157,23 @@ export function createEditorStore(initialProject: Project): EditorStore {
       commit(bus.executeTransaction(commands, expectedRevision, transactionId), groupId),
     undo: (expectedRevision) => travel(-1, expectedRevision),
     redo: (expectedRevision) => travel(1, expectedRevision),
+    cancelGesture(groupId, expectedRevision) {
+      const cursor = state.history.cursor;
+      const entry = state.history.entries[cursor - 1];
+      if (expectedRevision !== state.document.revision || cursor !== state.history.entries.length || !entry || entry.groupId !== groupId || positions[cursor] === savedPosition)
+        return { ok: false, id: groupId, code: CommandErrorCode.REVISION_CONFLICT, message: "Жест изменился и не может быть отменён." };
+      const result = bus.applyHistoryPatch(structuredClone(entry.undoPatch) as ProjectPatch, expectedRevision);
+      if (!result.ok) return result;
+      identity = {};
+      const entries = state.history.entries.slice(0, -1);
+      positions = positions.slice(0, -1);
+      publish({ ...state,
+        document: Object.freeze({ project: deepFreeze(result.project), revision: result.revision, dirty: positions[cursor - 1] !== savedPosition }),
+        history: historyState(entries, cursor - 1),
+        derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
+      });
+      return result;
+    },
     addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
       if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
         return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
