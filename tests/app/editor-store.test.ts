@@ -252,4 +252,16 @@ describe("editor store", () => {
     expect(store.confirmSaved(current.revision, current.identity)).toBe(true);
     expect(store.getSnapshot().document.dirty).toBe(false);
   });
+  it("prunes deleted selection and restores hierarchy through one undo step", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.setSelection(["mesh-node"], "mesh-node");
+    const result = store.executeCommand({ commandId: "delete-node", type: "DELETE_NODE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0);
+    expect(result.ok).toBe(true);
+    expect(store.getSnapshot().selection).toMatchObject({ ids: [], activeId: null });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().document.dirty).toBe(true);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.some(node => node.id === "mesh-node")).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
 });

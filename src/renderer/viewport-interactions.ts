@@ -152,7 +152,11 @@ export class ViewportInteractions {
     let parent = hit?.object;
     while (parent && !wrappers.has(parent)) parent = parent.parent ?? undefined;
     const id = parent ? wrappers.get(parent) : undefined;
-    this.store.setSelection(id ? [id] : []);
+    if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+      const ids = this.store.getSnapshot().selection.ids;
+      const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];
+      this.store.setSelection(next, next.includes(id) ? id : next[0] ?? null);
+    } else this.store.setSelection(id ? [id] : []);
   };
   private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
   private onKeyDown = (event: KeyboardEvent) => {
@@ -162,6 +166,15 @@ export class ViewportInteractions {
       if (this.drag) this.cancel("Преобразование отменено.");
       else this.store.setSelection([]);
       event.preventDefault(); return;
+    }
+    if (event.key === "Delete" && !this.blocked && this.store.getSnapshot().tool.mode === "model") {
+      const snapshot = this.store.getSnapshot();
+      const id = snapshot.selection.activeId;
+      if (id && id !== snapshot.document.project.model.rootNodeId) {
+        const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [id], payload: { nodeId: id } }, snapshot.document.revision);
+        if (!result.ok) this.report(result.message);
+        event.preventDefault(); return;
+      }
     }
     const key = event.key.toLowerCase();
     if (key === "f") { this.fit(); event.preventDefault(); }

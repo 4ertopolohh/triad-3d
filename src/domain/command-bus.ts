@@ -1,6 +1,7 @@
 import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
+import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
@@ -8,7 +9,11 @@ export type ProjectCommand =
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
   | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
   | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } }
-  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } };
+  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
+  | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
+  | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
+  | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
+  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } };
 
 export const CommandErrorCode = {
   REVISION_CONFLICT: "REVISION_CONFLICT",
@@ -26,7 +31,7 @@ export type PatchChange =
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
   | { kind: "removeAsset"; asset: Asset }
-  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children" | "parentId"; before: Node["name"] | Transform | boolean | EntityId[] | EntityId | null; after: Node["name"] | Transform | boolean | EntityId[] | EntityId | null }
   | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
   | { kind: "modelRevision"; before: number; after: number };
 export interface ProjectPatch { changes: PatchChange[] }
@@ -82,6 +87,16 @@ function validNode(value: unknown): value is Node {
 function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
+  if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "GROUP_NODES") return ownKeys(payload, ["nodeIds", "group"]) && idList(payload.nodeIds)
+    && payload.nodeIds.length > 0 && new Set(payload.nodeIds).size === payload.nodeIds.length
+    && validNode(payload.group) && payload.group.kind === "group" && payload.group.children.length === 0
+    && same(value.targetIds, [...payload.nodeIds, payload.group.id]);
+  if (value.type === "MOVE_NODE") return ownKeys(payload, ["nodeId", "parentId", "index"])
+    && id(payload.nodeId) && id(payload.parentId) && Number.isSafeInteger(payload.index) && (payload.index as number) >= 0
+    && same(value.targetIds, [payload.nodeId, payload.parentId]);
+  if (value.type === "UNGROUP_NODE" || value.type === "DELETE_NODE") return ownKeys(payload, ["nodeId"])
+    && id(payload.nodeId) && same(value.targetIds, [payload.nodeId]);
   if (value.type === "ADD_MESH_ASSET") {
     const asset = payload.asset;
     const node = payload.node;
@@ -113,6 +128,46 @@ function validCommand(value: unknown): value is ProjectCommand {
   }
 }
 
+const nodeById = (project: Project, nodeId: string): Node | undefined => project.nodes.find(node => node.id === nodeId);
+function matrix(transform: Transform): Matrix4 {
+  return new Matrix4().compose(new Vector3(...transform.position), new Quaternion(...transform.rotationQuat), new Vector3(...transform.scale));
+}
+function worldMatrix(project: Project, node: Node): Matrix4 {
+  const chain: Node[] = [];
+  let current: Node | undefined = node;
+  while (current) { chain.unshift(current); current = current.parentId ? nodeById(project, current.parentId) : undefined; }
+  return chain.reduce((result, item) => result.multiply(matrix(item.transform)), new Matrix4());
+}
+function relativeTransform(project: Project, node: Node, parent: Node): Transform | null {
+  const parentWorld = worldMatrix(project, parent);
+  if (Math.abs(parentWorld.determinant()) < 1e-12) return null;
+  const target = parentWorld.invert().multiply(worldMatrix(project, node));
+  const position = new Vector3(); const rotation = new Quaternion(); const scale = new Vector3();
+  target.decompose(position, rotation, scale);
+  const recomposed = new Matrix4().compose(position, rotation, scale);
+  if (![...target.elements, ...recomposed.elements].every(Number.isFinite)
+    || target.elements.some((value, index) => Math.abs(value - recomposed.elements[index]!) > 1e-6 * Math.max(1, Math.abs(value)))) return null;
+  return { position: position.toArray() as [number, number, number], rotationQuat: rotation.toArray() as [number, number, number, number], scale: scale.toArray() as [number, number, number] };
+}
+function descendants(project: Project, node: Node): Node[] {
+  return [node, ...node.children.flatMap(childId => { const child = nodeById(project, childId); return child ? descendants(project, child) : []; })];
+}
+function guarded(project: Project, node: Node): CommandErrorCode | null { return blocked(project, node); }
+function move(project: Project, node: Node, parent: Node, index: number, commandId: string): CommandResult | null {
+  if (node.id === project.model.rootNodeId || parent.kind !== "group" || descendants(project, node).some(item => item.id === parent.id))
+    return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Корень и циклические переносы запрещены.");
+  const oldParent = node.parentId && nodeById(project, node.parentId);
+  if (!oldParent || index > parent.children.length || guarded(project, node) || guarded(project, oldParent) || guarded(project, parent))
+    return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Перенос запрещён: узел, родитель или позиция недоступны.");
+  const transform = oldParent.id === parent.id ? node.transform : relativeTransform(project, node, parent);
+  if (!transform) return failure(commandId, CommandErrorCode.INVALID_COMMAND, "Перенос создаёт недопустимый сдвиг (shear) или необратимую трансформацию.");
+  const oldIndex = oldParent.children.indexOf(node.id);
+  oldParent.children = oldParent.children.filter(id => id !== node.id);
+  parent.children.splice(Math.min(index - (oldParent.id === parent.id && oldIndex < index ? 1 : 0), parent.children.length), 0, node.id);
+  node.parentId = parent.id; node.transform = transform;
+  return null;
+}
+
 function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
   return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
 }
@@ -128,6 +183,56 @@ function blocked(project: Project, node: Node, flags = false): CommandErrorCode 
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "MOVE_NODE") {
+    const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
+    if (!node || !parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел или новая группа не найдены.");
+    return move(project, node, parent, command.payload.index, command.commandId);
+  }
+  if (command.type === "GROUP_NODES") {
+    const nodes = command.payload.nodeIds.map(id => nodeById(project, id));
+    const first = nodes[0]; const parent = first?.parentId && nodeById(project, first.parentId);
+    const group = command.payload.group;
+    if (!first || !parent || nodes.some(node => !node || node.id === project.model.rootNodeId || node.parentId !== parent.id)
+      || group.parentId !== parent.id || parent.kind !== "group" || entityIds(project).has(group.id) || guarded(project, parent)
+      || !same(group.transform, { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] })
+      || nodes.some(node => guarded(project, node!)) || group.modifierIds.length || group.materialSlots.length)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Группировать можно доступные узлы одного родителя.");
+    const ordered = parent.children.filter(id => command.payload.nodeIds.includes(id));
+    const insertion = parent.children.indexOf(ordered[0]!);
+    parent.children = parent.children.filter(id => !ordered.includes(id)); parent.children.splice(insertion, 0, group.id);
+    project.nodes.push(structuredClone(group));
+    const created = nodeById(project, group.id)!;
+    for (const id of ordered) { const node = nodeById(project, id)!; node.parentId = group.id; created.children.push(id); }
+    return null;
+  }
+  if (command.type === "UNGROUP_NODE") {
+    const group = nodeById(project, command.payload.nodeId);
+    const parent = group?.parentId && nodeById(project, group.parentId);
+    if (!group || !parent || group.kind !== "group" || group.id === project.model.rootNodeId || guarded(project, group)
+      || guarded(project, parent) || group.modifierIds.length || group.materialSlots.length || project.tracks.some(track => track.nodeId === group.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Группу нельзя безопасно разгруппировать.");
+    const children = group.children.map(id => nodeById(project, id)!);
+    const transforms = children.map(child => relativeTransform(project, child, parent));
+    if (transforms.some(value => !value)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Разгруппировка создаёт shear или необратимую трансформацию.");
+    const index = parent.children.indexOf(group.id);
+    parent.children.splice(index, 1, ...group.children);
+    children.forEach((child, i) => { child.parentId = parent.id; child.transform = transforms[i]!; });
+    project.nodes = project.nodes.filter(node => node.id !== group.id);
+    return null;
+  }
+  if (command.type === "DELETE_NODE") {
+    const node = nodeById(project, command.payload.nodeId);
+    const parent = node?.parentId && nodeById(project, node.parentId);
+    if (!node || !parent || node.id === project.model.rootNodeId || guarded(project, node) || guarded(project, parent))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел нельзя удалить.");
+    const removed = descendants(project, node); const ids = new Set(removed.map(item => item.id));
+    if (removed.some(item => item.modifierIds.length) || project.modifiers.some(item => ids.has(item.nodeId))
+      || project.tracks.some(item => ids.has(item.nodeId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "У структуры есть зависимые дорожки или модификаторы.");
+    parent.children = parent.children.filter(id => id !== node.id);
+    project.nodes = project.nodes.filter(item => !ids.has(item.id));
+    return null;
+  }
   if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
     const { parentId, node } = command.payload;
     if (command.type === "ADD_MESH_ASSET") {
@@ -198,13 +303,14 @@ function diff(before: Project, after: Project): ProjectPatch {
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
-    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
+    for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
     if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
       changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
   }
+  for (const node of before.nodes) if (!after.nodes.some(entry => entry.id === node.id)) changes.push({ kind: "removeNode", node: structuredClone(node) });
   if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
   return { changes };
 }

@@ -112,9 +112,12 @@ export function createEditorStore(initialProject: Project): EditorStore {
     else positions.push({});
     const nextCursor = entries.length;
     pruneAssets(result.project, entries);
+    const validIds = new Set(result.project.nodes.map(node => node.id));
+    const selectedIds = state.selection.ids.filter(id => validIds.has(id));
     publish({
       ...state,
       document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
+      selection: Object.freeze({ ids: Object.freeze(selectedIds), activeId: state.selection.activeId && selectedIds.includes(state.selection.activeId) ? state.selection.activeId : selectedIds[0] ?? null }),
       history: historyState(entries, nextCursor),
       derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
     });

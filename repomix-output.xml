@@ -90,6 +90,8 @@ src/
     project-serialization.ts
     types.ts
     validate-project.ts
+  geometry/
+    primitives.ts
   importers/
     gltf/
       import-glb.ts
@@ -143,6 +145,7 @@ tests/
     glb.test.ts
   renderer/
     adapter.test.ts
+    primitives.test.ts
     scene-sync.test.ts
     viewport-interactions.test.ts
   visual/
@@ -4070,32 +4073,52 @@ export interface Keyframe {
 }
 </file>
 
-<file path="src/renderer/primitive.ts">
-import * as T from "three";
-import type { MeshSource } from "../domain/types";
-import type { DeepReadonly } from "../app/editor-store";
+<file path="src/geometry/primitives.ts">
+import type { MeshNode, MeshSource } from "../domain/types";
 
-export function primitiveGeometry(source: DeepReadonly<Extract<MeshSource, { kind: "primitive" }>>): T.BufferGeometry {
-  const allowed: Record<typeof source.primitive, string[]> = {
-    cube: ["size", "width", "height", "depth"], sphere: ["radius", "widthSegments", "heightSegments"],
-    torus: ["radius", "tube", "radialSegments", "tubularSegments"], cylinder: ["radiusTop", "radiusBottom", "height", "radialSegments"],
-    cone: ["radius", "height", "radialSegments"], plane: ["width", "height"],
-  };
-  for (const key of Object.keys(source.parameters)) if (!allowed[source.primitive].includes(key)) throw new Error(`Параметр примитива «${key}» пока не поддерживается.`);
-  const p = (key: string, fallback: number, segment = false, zero = false) => {
-    const value = source.parameters[key] ?? fallback;
-    if (!Number.isFinite(value) || value < (zero ? 0 : segment ? 3 : Number.MIN_VALUE) || value > (segment ? 128 : 10000) || segment && !Number.isInteger(value))
-      throw new Error(`Недопустимый параметр примитива «${key}».`);
-    return value;
-  };
-  switch (source.primitive) {
-    case "cube": return new T.BoxGeometry(p("width", p("size", 1)), p("height", p("size", 1)), p("depth", p("size", 1)));
-    case "sphere": return new T.SphereGeometry(p("radius", 1), p("widthSegments", 32, true), p("heightSegments", 16, true));
-    case "torus": return new T.TorusGeometry(p("radius", 1), p("tube", .25), p("radialSegments", 16, true), p("tubularSegments", 48, true));
-    case "cylinder": return new T.CylinderGeometry(p("radiusTop", 1, false, true), p("radiusBottom", 1, false, true), p("height", 2), p("radialSegments", 32, true));
-    case "cone": return new T.ConeGeometry(p("radius", 1), p("height", 2), p("radialSegments", 32, true));
-    case "plane": return new T.PlaneGeometry(p("width", 1), p("height", 1));
+export type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
+export type PrimitiveKind = PrimitiveSource["primitive"];
+export type ParameterSpec = { label: string; defaultValue: number; min: number; max: number; integer?: boolean };
+const dimension = (label: string, defaultValue: number): ParameterSpec => ({ label, defaultValue, min: Number.MIN_VALUE, max: 10000 });
+const segment = (label: string, defaultValue: number, min = 3): ParameterSpec => ({ label, defaultValue, min, max: 128, integer: true });
+
+export const primitiveDefinitions: Record<PrimitiveKind, { label: string; parameters: Record<string, ParameterSpec> }> = {
+  cube: { label: "Куб", parameters: { size: dimension("Размер", 1), width: dimension("Ширина", 1), height: dimension("Высота", 1), depth: dimension("Глубина", 1) } },
+  sphere: { label: "Сфера", parameters: { radius: dimension("Радиус", 1), widthSegments: segment("Сегменты по ширине", 32), heightSegments: segment("Сегменты по высоте", 16, 2) } },
+  torus: { label: "Тор", parameters: { radius: dimension("Радиус", 1), tube: dimension("Радиус трубки", .25), radialSegments: segment("Радиальные сегменты", 16), tubularSegments: segment("Круговые сегменты", 48) } },
+  cylinder: { label: "Цилиндр", parameters: { radiusTop: { ...dimension("Верхний радиус", 1), min: 0 }, radiusBottom: { ...dimension("Нижний радиус", 1), min: 0 }, height: dimension("Высота", 2), radialSegments: segment("Радиальные сегменты", 32) } },
+  cone: { label: "Конус", parameters: { radius: dimension("Радиус", 1), height: dimension("Высота", 2), radialSegments: segment("Радиальные сегменты", 32) } },
+  plane: { label: "Плоскость", parameters: { width: dimension("Ширина", 1), height: dimension("Высота", 1) } },
+};
+
+export function validatePrimitiveSource(source: unknown): string | null {
+  if (!source || typeof source !== "object") return "Источник примитива отсутствует.";
+  const value = source as Partial<PrimitiveSource>;
+  if (Object.keys(value).some(key => !["kind", "primitive", "parameters"].includes(key))) return "Источник примитива содержит неподдерживаемое поле.";
+  if (value.kind !== "primitive" || !value.primitive || !Object.hasOwn(primitiveDefinitions, value.primitive)) return "Неизвестный тип примитива.";
+  if (!value.parameters || typeof value.parameters !== "object" || Array.isArray(value.parameters)) return "Параметры примитива должны быть словарём.";
+  const specs = primitiveDefinitions[value.primitive].parameters;
+  for (const [key, input] of Object.entries(value.parameters)) {
+    const spec = specs[key];
+    if (!spec) return `Параметр «${key}» не поддерживается.`;
+    if (typeof input !== "number" || !Number.isFinite(input) || input < spec.min || input > spec.max || spec.integer && !Number.isInteger(input))
+      return `Параметр «${spec.label}» должен быть ${spec.integer ? "целым числом" : "числом"} ${spec.min === Number.MIN_VALUE ? "больше 0" : `от ${spec.min}`} до ${spec.max}.`;
   }
+  if (value.primitive === "cylinder" && (value.parameters.radiusTop ?? 1) === 0 && (value.parameters.radiusBottom ?? 1) === 0)
+    return "У цилиндра хотя бы один радиус должен быть больше нуля.";
+  return null;
+}
+
+export function createPrimitiveSource(kind: PrimitiveKind): PrimitiveSource {
+  if (!Object.hasOwn(primitiveDefinitions, kind)) throw new Error("Неизвестный тип примитива.");
+  const keys = kind === "cube" ? ["size"] : Object.keys(primitiveDefinitions[kind].parameters);
+  return { kind: "primitive", primitive: kind, parameters: Object.fromEntries(keys.map(key => [key, primitiveDefinitions[kind].parameters[key]!.defaultValue])) };
+}
+
+export function createPrimitiveNode(kind: PrimitiveKind, parentId: string, id: string): MeshNode {
+  return { id, kind: "mesh", name: primitiveDefinitions[kind].label, parentId, children: [],
+    transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+    visible: true, locked: false, materialSlots: [], modifierIds: [], meshSource: createPrimitiveSource(kind) };
 }
 </file>
 
@@ -5782,6 +5805,122 @@ describe("renderer lifecycle", () => {
 });
 </file>
 
+<file path="tests/renderer/primitives.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { createPrimitiveNode, createPrimitiveSource, primitiveDefinitions, validatePrimitiveSource, type PrimitiveKind } from "../../src/geometry/primitives";
+import { primitiveGeometry } from "../../src/renderer/primitive";
+import { createProject } from "../../src/domain/create-project";
+import { createCommandBus } from "../../src/domain/command-bus";
+import { validateProject } from "../../src/domain/validate-project";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
+import { createEditorStore } from "../../src/app/editor-store";
+
+const kinds = Object.keys(primitiveDefinitions) as PrimitiveKind[];
+describe("parametric primitives", () => {
+  it.each(kinds)("builds finite indexed %s geometry with normals and UVs", kind => {
+    const source = createPrimitiveSource(kind);
+    const original = structuredClone(source);
+    const geometry = primitiveGeometry(source);
+    expect(geometry.index?.count).toBeGreaterThan(0);
+    for (const attribute of ["position", "normal", "uv"]) {
+      const data = geometry.getAttribute(attribute) as T.BufferAttribute;
+      expect(data.count).toBeGreaterThan(0);
+      expect(Array.from(data.array).every(Number.isFinite)).toBe(true);
+    }
+    expect(source).toEqual(original);
+    expect(primitiveGeometry(source).getAttribute("position").array).toEqual(geometry.getAttribute("position").array);
+    geometry.dispose();
+  });
+  it("rejects invalid dimensions, segments, unknown keys and degenerate cylinders", () => {
+    for (const value of [NaN, Infinity, -1, 0]) expect(validatePrimitiveSource({ kind: "primitive", primitive: "sphere", parameters: { radius: value } })).toBeTruthy();
+    for (const value of [2.5, 129]) expect(validatePrimitiveSource({ kind: "primitive", primitive: "sphere", parameters: { widthSegments: value } })).toBeTruthy();
+    expect(validatePrimitiveSource({ kind: "primitive", primitive: "cube", parameters: { unsupported: 1 } })).toBeTruthy();
+    expect(validatePrimitiveSource({ kind: "primitive", primitive: "cylinder", parameters: { radiusTop: 0, radiusBottom: 0 } })).toBeTruthy();
+    expect(validatePrimitiveSource({ kind: "primitive", primitive: "cylinder", parameters: { radiusTop: 0, radiusBottom: 1 } })).toBeNull();
+  });
+  it("rejects parameter edits on an asset-backed mesh without changing revision", () => {
+    const project = createProject((() => { let n = 0; return () => `asset-project-${++n}`; })());
+    project.assets.push({ id: "asset-1", hash: "f".repeat(64), mediaType: "model/gltf-binary", path: `assets/${"f".repeat(64)}.glb`, colorSpace: "none" });
+    const node = createPrimitiveNode("cube", project.model.rootNodeId, "asset-mesh");
+    node.meshSource = { kind: "asset", assetId: "asset-1" };
+    project.nodes.push(node);
+    project.nodes[0]!.children.push(node.id);
+    const bus = createCommandBus(project);
+    expect(bus.executeCommand({ commandId: "edit-asset", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: createPrimitiveSource("cube") } }, 0))
+      .toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.getSnapshot()).toEqual(project);
+  });
+  it("keeps failed edits out of store history and replays successful parameter edits", () => {
+    const project = createProject((() => { let n = 0; return () => `store-${++n}`; })());
+    const store = createEditorStore(project);
+    const node = createPrimitiveNode("sphere", project.model.rootNodeId, "sphere-node");
+    expect(store.executeCommand({ commandId: "add", type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, 0).ok).toBe(true);
+    const source = { kind: "primitive" as const, primitive: "sphere" as const, parameters: { radius: 2, widthSegments: 32, heightSegments: 16 } };
+    expect(store.executeCommand({ commandId: "bad", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: { ...source, parameters: { ...source.parameters, radius: NaN } } } }, 1).ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().document.revision).toBe(1);
+    expect(store.executeCommand({ commandId: "edit", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source } }, 1).ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(n => n.id === node.id)).toMatchObject({ meshSource: { parameters: { radius: 1 } } });
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(n => n.id === node.id)).toMatchObject({ meshSource: { parameters: { radius: 2 } } });
+  });
+  it("adds, edits, replays and renders without rebuilding on transforms", () => {
+    const project = createProject((() => { let n = 0; return () => `id-${++n}`; })());
+    const bus = createCommandBus(project);
+    const node = createPrimitiveNode("cube", project.model.rootNodeId, "cube-1");
+    const added = bus.executeCommand({ commandId: "add", type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, 0);
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    const sync = new SceneSync(() => {});
+    sync.sync(added.project, () => undefined);
+    const first = (sync.objects.get(node.id)!.content as T.Mesh).geometry;
+    const disposed = vi.spyOn(first, "dispose");
+    const source = { kind: "primitive" as const, primitive: "cube" as const, parameters: { size: 2 } };
+    const edited = bus.executeCommand({ commandId: "edit", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source } }, 1);
+    expect(edited.ok).toBe(true);
+    if (!edited.ok) return;
+    expect(validateProject(edited.project)).toEqual([]);
+    const serialized = serializeProjectDocument(edited.project);
+    expect(serialized.ok).toBe(true);
+    if (serialized.ok) expect(deserializeProjectDocument(serialized.value)).toEqual({ ok: true, value: edited.project });
+    sync.sync(edited.project, () => undefined);
+    expect(disposed).toHaveBeenCalledOnce();
+    const second = (sync.objects.get(node.id)!.content as T.Mesh).geometry;
+    expect((second as T.BoxGeometry).parameters.width).toBe(2);
+    const noop = bus.executeCommand({ commandId: "same", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source } }, 2);
+    expect(noop).toMatchObject({ ok: true, changed: false, revision: 2 });
+    const invalid = bus.executeCommand({ commandId: "bad", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: { ...source, parameters: { size: -1 } } } }, 2);
+    expect(invalid).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(bus.getRevision()).toBe(2);
+    expect(bus.executeCommand({ commandId: "wrong-type", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: createPrimitiveSource("sphere") } }, 2))
+      .toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    const locked = bus.executeCommand({ commandId: "lock", type: "SET_NODE_FLAGS", targetIds: [node.id], payload: { nodeId: node.id, locked: true } }, 2);
+    expect(locked.ok).toBe(true);
+    expect(bus.executeCommand({ commandId: "locked-edit", type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source } }, 3))
+      .toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    if (!locked.ok) return;
+    expect(bus.applyHistoryPatch(locked.undoPatch, 3).ok).toBe(true);
+    expect(bus.applyHistoryPatch(edited.undoPatch, 4).ok).toBe(true);
+    expect(bus.getSnapshot().nodes.find(n => n.id === node.id)).toMatchObject({ meshSource: { parameters: { size: 1 } } });
+    expect(bus.applyHistoryPatch(edited.patch, 5).ok).toBe(true);
+    sync.sync(bus.getSnapshot(), () => undefined);
+    const stable = (sync.objects.get(node.id)!.content as T.Mesh).geometry;
+    const moved = bus.executeCommand({ commandId: "move", type: "SET_NODE_TRANSFORM", targetIds: [node.id], payload: { nodeId: node.id, transform: { ...node.transform, position: [1, 0, 0] } } }, 6);
+    if (!moved.ok) throw new Error(moved.message);
+    sync.sync(moved.project, () => undefined);
+    expect((sync.objects.get(node.id)!.content as T.Mesh).geometry).toBe(stable);
+    sync.sync(project, () => undefined);
+    expect(sync.objects.has(node.id)).toBe(false);
+    sync.dispose();
+  });
+});
+</file>
+
 <file path="tests/renderer/viewport-interactions.test.ts">
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -6180,208 +6319,6 @@ export class AssetBytes {
 }
 </file>
 
-<file path="src/domain/validate-project.ts">
-import type { EntityId, Keyframe, Light, Node, Project } from "./types";
-
-export type ValidationCode =
-  | "DUPLICATE_ID"
-  | "MISSING_REFERENCE"
-  | "INVALID_HIERARCHY"
-  | "HIERARCHY_CYCLE"
-  | "INVALID_NUMBER"
-  | "INVALID_STRUCTURE";
-
-export interface ValidationIssue {
-  code: ValidationCode;
-  path: string;
-  message: string;
-}
-
-export function validateProject(project: Project): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const entities = new Map<EntityId, string>();
-  const register = (id: EntityId, path: string): void => {
-    const previous = entities.get(id);
-    if (previous !== undefined) {
-      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
-    } else {
-      entities.set(id, path);
-    }
-  };
-  const finite = (value: number, path: string): void => {
-    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
-  };
-  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
-    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
-  };
-
-  register(project.id, "id");
-  register(project.model.id, "model.id");
-  finite(project.model.revision, "model.revision");
-  register(project.scene.id, "scene.id");
-  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
-  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
-  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
-  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
-  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
-  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
-  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
-  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
-  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
-
-  const nodeIds = new Set(project.nodes.map((node) => node.id));
-  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
-  const materialIds = new Set(project.materials.map((material) => material.id));
-  const assetIds = new Set(project.assets.map((asset) => asset.id));
-  const trackIds = new Set(project.tracks.map((track) => track.id));
-  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
-
-  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
-  if (root === undefined) {
-    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
-  } else if (root.parentId !== null) {
-    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
-  }
-
-  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
-  for (const node of project.nodes) {
-    if (node.id !== project.model.rootNodeId && node.parentId === null) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
-    }
-    const childSet = new Set<EntityId>();
-    for (const childId of node.children) {
-      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
-      childSet.add(childId);
-      const child = nodesById.get(childId);
-      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
-      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
-    }
-    if (node.parentId !== null) {
-      const parent = nodesById.get(node.parentId);
-      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
-      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
-    }
-    checkTransform(node, finite, `nodes.${node.id}.transform`);
-    if (node.kind === "mesh") {
-      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else for (const [name, value] of Object.entries(node.meshSource.parameters)) finite(value, `nodes.${node.id}.meshSource.parameters.${name}`);
-    }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
-    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
-      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
-      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
-      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
-    }
-    const orderedModifiers = node.modifierIds
-      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
-      .filter((modifier) => modifier !== undefined);
-    for (let index = 1; index < orderedModifiers.length; index += 1) {
-      const previous = orderedModifiers[index - 1];
-      const current = orderedModifiers[index];
-      if (previous && current && previous.order >= current.order) {
-        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
-        break;
-      }
-    }
-  }
-
-  if (root !== undefined) {
-    const visited = new Set<EntityId>();
-    const active = new Set<EntityId>();
-    const visit = (node: Node): void => {
-      if (active.has(node.id)) {
-        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
-        return;
-      }
-      if (visited.has(node.id)) return;
-      active.add(node.id);
-      visited.add(node.id);
-      for (const childId of node.children) {
-        const child = nodesById.get(childId);
-        if (child) visit(child);
-      }
-      active.delete(node.id);
-    };
-    visit(root);
-    for (const node of project.nodes) {
-      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
-    }
-  }
-
-  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
-  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
-  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
-  finite(project.scene.camera.near, "scene.camera.near");
-  finite(project.scene.camera.far, "scene.camera.far");
-  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
-  finite(project.scene.background.intensity, "scene.background.intensity");
-  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
-  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
-  project.scene.instances.forEach((instance, index) => {
-    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
-    checkTransform(instance, finite, `scene.instances[${index}].transform`);
-  });
-
-  for (const modifier of project.modifiers) {
-    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
-    finite(modifier.order, `modifiers.${modifier.id}.order`);
-    finite(modifier.version, `modifiers.${modifier.id}.version`);
-    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
-    }
-    for (const [name, value] of Object.entries(modifier.parameters)) {
-      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
-      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
-    }
-  }
-  for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
-  }
-  for (const clip of project.animations) {
-    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
-    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
-  }
-  for (const track of project.tracks) {
-    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
-    const usedKeys = new Set<EntityId>();
-    for (const keyframeId of track.keyframeIds) {
-      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
-      usedKeys.add(keyframeId);
-      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
-    }
-  }
-  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
-  return issues;
-}
-
-function checkTransform(
-  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
-  finite: (value: number, path: string) => void,
-  path: string,
-): void {
-  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
-  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
-  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
-}
-
-function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
-  finite(light.intensity, `scene.lights[${index}].intensity`);
-  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
-  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
-  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
-}
-
-function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
-  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
-  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
-  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
-}
-</file>
-
 <file path="src/importers/gltf/import-glb.ts">
 import { disposeObject } from "../../assets/three-resources";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -6659,6 +6596,27 @@ export class ThreeRendererAdapter implements RendererAdapter {
     this.renderer?.domElement.remove(); this.graph.dispose();
     this.cleanupJob = (async () => { await this.job; this.removeListeners(); if (this.renderer) { try { await this.renderer.dispose(); } finally { this.renderer = undefined; } } })();
     return this.cleanupJob;
+  }
+}
+</file>
+
+<file path="src/renderer/primitive.ts">
+import * as T from "three";
+import type { MeshSource } from "../domain/types";
+import type { DeepReadonly } from "../app/editor-store";
+import { primitiveDefinitions, validatePrimitiveSource } from "../geometry/primitives";
+
+export function primitiveGeometry(source: DeepReadonly<Extract<MeshSource, { kind: "primitive" }>>): T.BufferGeometry {
+  const error = validatePrimitiveSource(source);
+  if (error) throw new Error(error);
+  const p = (key: string) => source.parameters[key] ?? primitiveDefinitions[source.primitive].parameters[key]!.defaultValue;
+  switch (source.primitive) {
+    case "cube": return new T.BoxGeometry(source.parameters.width ?? p("size"), source.parameters.height ?? p("size"), source.parameters.depth ?? p("size"));
+    case "sphere": return new T.SphereGeometry(p("radius"), p("widthSegments"), p("heightSegments"));
+    case "torus": return new T.TorusGeometry(p("radius"), p("tube"), p("radialSegments"), p("tubularSegments"));
+    case "cylinder": return new T.CylinderGeometry(p("radiusTop"), p("radiusBottom"), p("height"), p("radialSegments"));
+    case "cone": return new T.ConeGeometry(p("radius"), p("height"), p("radialSegments"));
+    case "plane": return new T.PlaneGeometry(p("width"), p("height"));
   }
 }
 </file>
@@ -7440,308 +7398,6 @@ export default tseslint.config(
 );
 </file>
 
-<file path="src/domain/command-bus.ts">
-import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
-import { validateProject, type ValidationIssue } from "./validate-project";
-
-export type ProjectCommand =
-  | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
-  | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
-  | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
-  | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
-  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
-
-export const CommandErrorCode = {
-  REVISION_CONFLICT: "REVISION_CONFLICT",
-  INVALID_COMMAND: "INVALID_COMMAND",
-  INVALID_REFERENCE: "INVALID_REFERENCE",
-  NODE_LOCKED: "NODE_LOCKED",
-  NODE_HIDDEN: "NODE_HIDDEN",
-  VALIDATION_FAILED: "VALIDATION_FAILED",
-  INTERNAL_ERROR: "INTERNAL_ERROR",
-} as const;
-export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
-
-export type PatchChange =
-  | { kind: "addNode"; node: Node }
-  | { kind: "removeNode"; node: Node }
-  | { kind: "addAsset"; asset: Asset }
-  | { kind: "removeAsset"; asset: Asset }
-  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
-  | { kind: "modelRevision"; before: number; after: number };
-export interface ProjectPatch { changes: PatchChange[] }
-
-export type CommandResult =
-  | { ok: true; id: string; project: Project; revision: number; patch: ProjectPatch; undoPatch: ProjectPatch; changed: boolean }
-  | { ok: false; id: string; code: CommandErrorCode; message: string; issues?: ValidationIssue[] };
-
-export interface CommandBus {
-  /** Session revision starts at 0, regardless of the serialized model revision. */
-  getRevision(): number;
-  getSnapshot(): Project;
-  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
-  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
-  applyHistoryPatch(patch: ProjectPatch, expectedRevision: number): CommandResult;
-}
-
-const record = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
-const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
-const idList = (value: unknown): value is string[] => Array.isArray(value) && value.every(id);
-const numbers = (value: unknown, count: number): value is number[] =>
-  Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
-const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
-const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
-  Object.keys(value).every((key) => keys.includes(key));
-
-function validTransform(value: unknown): value is Transform {
-  return record(value) && ownKeys(value, ["position", "rotationQuat", "scale"])
-    && numbers(value.position, 3) && numbers(value.rotationQuat, 4) && numbers(value.scale, 3);
-}
-
-function validNode(value: unknown): value is Node {
-  if (!record(value) || !id(value.id) || !["group", "mesh"].includes(String(value.kind))) return false;
-  const keys = ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"];
-  if (!ownKeys(value, value.kind === "mesh" ? [...keys, "meshSource"] : keys)) return false;
-  if (typeof value.name !== "string" || !value.name.trim() || !id(value.parentId) || !idList(value.children)
-    || !validTransform(value.transform) || typeof value.visible !== "boolean" || typeof value.locked !== "boolean"
-    || !Array.isArray(value.materialSlots) || !value.materialSlots.every((slot: unknown) =>
-      record(slot) && ownKeys(slot, ["name", "materialId"]) && typeof slot.name === "string" && id(slot.materialId))
-    || !idList(value.modifierIds)) return false;
-  if (value.kind === "group") return true;
-  const source = value.meshSource;
-  if (!record(source)) return false;
-  if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
-  return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
-    && ["cube", "sphere", "torus", "cylinder", "cone", "plane"].includes(String(source.primitive))
-    && record(source.parameters) && Object.values(source.parameters).every((item) => typeof item === "number" && Number.isFinite(item));
-}
-
-function validCommand(value: unknown): value is ProjectCommand {
-  if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
-  const payload = value.payload;
-  if (value.type === "ADD_MESH_ASSET") {
-    const asset = payload.asset;
-    const node = payload.node;
-    return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
-      && ownKeys(payload, ["parentId", "node", "asset"]) && id(payload.parentId)
-      && validNode(node) && node.kind === "mesh" && node.meshSource.kind === "asset"
-      && (asset === null || (record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
-        && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
-        && asset.path === `assets/${asset.hash}.glb` && asset.mediaType === "model/gltf-binary" && asset.colorSpace === "none"))
-      && value.targetIds.length === 3 && value.targetIds[0] === payload.parentId
-      && value.targetIds[1] === node.id && value.targetIds[2] === node.meshSource.assetId
-      && (asset === null || asset.id === node.meshSource.assetId);
-  }
-  if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
-    && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
-    && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
-  if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
-    || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
-  switch (value.type) {
-    case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
-    case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
-    case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
-      && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
-      && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
-      && (!Object.hasOwn(payload, "locked") || typeof payload.locked === "boolean");
-    default: return false;
-  }
-}
-
-function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
-  return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
-}
-
-function blocked(project: Project, node: Node, flags = false): CommandErrorCode | null {
-  let current: Node | undefined = node;
-  while (current) {
-    if (current.locked && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_LOCKED;
-    if (!current.visible && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_HIDDEN;
-    current = current.parentId === null ? undefined : project.nodes.find((entry) => entry.id === current?.parentId);
-  }
-  return null;
-}
-
-function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
-  if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
-    const { parentId, node } = command.payload;
-    if (command.type === "ADD_MESH_ASSET") {
-      const { asset } = command.payload;
-      const assetId = command.payload.node.meshSource.kind === "asset" ? command.payload.node.meshSource.assetId : "";
-      if (asset === null) {
-        if (!project.assets.some((entry) => entry.id === assetId && entry.mediaType === "model/gltf-binary"))
-          return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Ресурс GLB не найден.");
-      } else {
-        if (entityIds(project).has(asset.id) || asset.id === node.id || project.assets.some((entry) => entry.path === asset.path))
-          return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
-        project.assets.push(structuredClone(asset));
-      }
-    }
-    const parent = project.nodes.find((entry) => entry.id === parentId);
-    if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
-    const block = blocked(project, parent);
-    if (block) return failure(command.commandId, block, "Родительский узел недоступен для редактирования.");
-    if (node.parentId !== parentId || node.children.length !== 0 || node.modifierIds.length !== 0)
-      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Добавляемый узел должен быть согласованным листом без модификаторов.");
-    if (project.nodes.some((entry) => entry.id === node.id) || entityIds(project).has(node.id))
-      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
-    project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
-    project.nodes.push(structuredClone(node));
-    return null;
-  }
-  const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
-  if (!current) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Целевой узел не найден.");
-  const block = blocked(project, current, command.type === "SET_NODE_FLAGS");
-  if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
-  if (command.type === "SET_NODE_FLAGS") {
-    if (current.locked && command.payload.locked !== false)
-      return failure(command.commandId, CommandErrorCode.NODE_LOCKED, "Для изменения узла сначала снимите его блокировку.");
-    if (!current.visible && command.payload.visible !== true)
-      return failure(command.commandId, CommandErrorCode.NODE_HIDDEN, "Для изменения узла сначала восстановите его видимость.");
-  }
-  let next: Node;
-  switch (command.type) {
-    case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
-    case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
-    case "SET_NODE_FLAGS": next = { ...current,
-      visible: command.payload.visible ?? current.visible,
-      locked: command.payload.locked ?? current.locked }; break;
-  }
-  project.nodes = project.nodes.map((entry) => entry.id === current.id ? next : entry);
-  return null;
-}
-
-function entityIds(project: Project): Set<string> {
-  return new Set([project.id, project.model.id, project.scene.id,
-    ...project.nodes.map((item) => item.id), ...project.modifiers.map((item) => item.id),
-    ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
-    ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
-    ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
-    ...project.keyframes.map((item) => item.id)]);
-}
-
-function diff(before: Project, after: Project): ProjectPatch {
-  const changes: PatchChange[] = [];
-  for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
-  for (const node of after.nodes) {
-    const old = before.nodes.find((entry) => entry.id === node.id);
-    if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
-    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
-      if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
-        before: structuredClone(old[field]), after: structuredClone(node[field]) });
-    }
-  }
-  if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
-  return { changes };
-}
-
-function inverse(patch: ProjectPatch): ProjectPatch {
-  return { changes: [...patch.changes].reverse().map((change): PatchChange => {
-    if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
-    if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
-    if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
-    if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
-    if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
-    return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
-  }) };
-}
-
-/** Replays a patch against a matching semantic base; throws on stale or invalid input. */
-export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
-  const result = structuredClone(project);
-  for (const change of patch.changes) {
-    if (change.kind === "addAsset") {
-      if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
-      result.assets.push(structuredClone(change.asset));
-    } else if (change.kind === "removeAsset") {
-      const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
-      if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
-      result.assets.splice(index, 1);
-    } else if (change.kind === "addNode") {
-      if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
-      result.nodes.push(structuredClone(change.node));
-    } else if (change.kind === "removeNode") {
-      const index = result.nodes.findIndex((node) => node.id === change.node.id);
-      if (index < 0 || !same(result.nodes[index], change.node)) throw new Error("Patch node conflict");
-      result.nodes.splice(index, 1);
-    } else if (change.kind === "modelRevision") {
-      if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
-      result.model.revision = change.after;
-    } else {
-      const node = result.nodes.find((entry) => entry.id === change.nodeId);
-      if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
-      Object.assign(node, { [change.field]: structuredClone(change.after) });
-    }
-  }
-  if (validateProject(result).length) throw new Error("Patch produces invalid project");
-  return result;
-}
-
-export function createCommandBus(initialProject: Project): CommandBus {
-  const initial = structuredClone(initialProject);
-  const issues = validateProject(initial);
-  if (issues.length) throw new Error(`Invalid initial project: ${issues[0]?.message}`);
-  let committed = initial;
-  let revision = 0;
-  const executeTransaction = (commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult => {
-    const resultId = transactionId ?? (Array.isArray(commands) && commands.length === 1 && id(commands[0]?.commandId)
-      ? commands[0].commandId : "transaction");
-    if (expectedRevision !== revision) return failure(resultId, CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
-    if (!Array.isArray(commands) || commands.length === 0 || !commands.every(validCommand)
-      || new Set(commands.map((command) => command.commandId)).size !== commands.length)
-      return failure(resultId, CommandErrorCode.INVALID_COMMAND, "Некорректная команда или транзакция.");
-    try {
-      const candidate = structuredClone(committed);
-      for (const command of commands) {
-        const error = applyCommand(candidate, command);
-        if (error) return error;
-      }
-      const contentPatch = diff(committed, candidate);
-      if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
-        patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
-      candidate.model.revision += 1;
-      const validationIssues = validateProject(candidate);
-      if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
-      const patch = diff(committed, candidate);
-      const undoPatch = inverse(patch);
-      committed = candidate;
-      revision += 1;
-      return { ok: true, id: resultId, project: structuredClone(committed), revision,
-        patch: structuredClone(patch), undoPatch: structuredClone(undoPatch), changed: true };
-    } catch {
-      return failure(resultId, CommandErrorCode.INTERNAL_ERROR, "Не удалось выполнить транзакцию.");
-    }
-  };
-  return {
-    getRevision: () => revision,
-    getSnapshot: () => structuredClone(committed),
-    executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
-    executeTransaction,
-    applyHistoryPatch(patch, expectedRevision) {
-      if (expectedRevision !== revision) return failure("history", CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
-      try {
-        if (!patch || !Array.isArray(patch.changes) || patch.changes.length === 0)
-          return failure("history", CommandErrorCode.INVALID_COMMAND, "Пустой патч истории.");
-        const candidate = applyProjectPatch(committed, patch);
-        if (same(candidate, committed))
-          return failure("history", CommandErrorCode.INVALID_COMMAND, "Патч истории не изменяет документ.");
-        const issues = validateProject(candidate);
-        if (issues.length) return failure("history", CommandErrorCode.VALIDATION_FAILED, "Результат истории не прошёл проверку.", issues);
-        const project = structuredClone(candidate);
-        const forward = structuredClone(patch);
-        const undoPatch = inverse(forward);
-        committed = candidate;
-        revision += 1;
-        return { ok: true, id: "history", project, revision, patch: forward, undoPatch, changed: true };
-      } catch {
-        return failure("history", CommandErrorCode.VALIDATION_FAILED, "Патч истории не соответствует документу.");
-      }
-    },
-  };
-}
-</file>
-
 <file path="src/domain/index.ts">
 export { createProject } from "./create-project";
 export type { IdFactory } from "./create-project";
@@ -7752,6 +7408,212 @@ export { serializeProjectDocument, deserializeProjectDocument, validateNativeMan
 export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
 export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
+<file path="src/domain/validate-project.ts">
+import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+import { validatePrimitiveSource } from "../geometry/primitives";
+
+export type ValidationCode =
+  | "DUPLICATE_ID"
+  | "MISSING_REFERENCE"
+  | "INVALID_HIERARCHY"
+  | "HIERARCHY_CYCLE"
+  | "INVALID_NUMBER"
+  | "INVALID_STRUCTURE";
+
+export interface ValidationIssue {
+  code: ValidationCode;
+  path: string;
+  message: string;
+}
+
+export function validateProject(project: Project): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const entities = new Map<EntityId, string>();
+  const register = (id: EntityId, path: string): void => {
+    const previous = entities.get(id);
+    if (previous !== undefined) {
+      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
+    } else {
+      entities.set(id, path);
+    }
+  };
+  const finite = (value: number, path: string): void => {
+    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
+  };
+  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
+    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
+  };
+
+  register(project.id, "id");
+  register(project.model.id, "model.id");
+  finite(project.model.revision, "model.revision");
+  register(project.scene.id, "scene.id");
+  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
+  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
+  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
+  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
+  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
+  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
+  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
+  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
+
+  const nodeIds = new Set(project.nodes.map((node) => node.id));
+  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
+  const materialIds = new Set(project.materials.map((material) => material.id));
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const trackIds = new Set(project.tracks.map((track) => track.id));
+  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
+
+  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
+  if (root === undefined) {
+    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
+  } else if (root.parentId !== null) {
+    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
+  }
+
+  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  for (const node of project.nodes) {
+    if (node.id !== project.model.rootNodeId && node.parentId === null) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
+    }
+    const childSet = new Set<EntityId>();
+    for (const childId of node.children) {
+      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
+      childSet.add(childId);
+      const child = nodesById.get(childId);
+      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
+      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
+    }
+    if (node.parentId !== null) {
+      const parent = nodesById.get(node.parentId);
+      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
+      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
+    }
+    checkTransform(node, finite, `nodes.${node.id}.transform`);
+    if (node.kind === "mesh") {
+      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
+      else {
+        const message = validatePrimitiveSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      }
+    }
+    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
+      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
+      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
+    }
+    const orderedModifiers = node.modifierIds
+      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
+      .filter((modifier) => modifier !== undefined);
+    for (let index = 1; index < orderedModifiers.length; index += 1) {
+      const previous = orderedModifiers[index - 1];
+      const current = orderedModifiers[index];
+      if (previous && current && previous.order >= current.order) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
+        break;
+      }
+    }
+  }
+
+  if (root !== undefined) {
+    const visited = new Set<EntityId>();
+    const active = new Set<EntityId>();
+    const visit = (node: Node): void => {
+      if (active.has(node.id)) {
+        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
+        return;
+      }
+      if (visited.has(node.id)) return;
+      active.add(node.id);
+      visited.add(node.id);
+      for (const childId of node.children) {
+        const child = nodesById.get(childId);
+        if (child) visit(child);
+      }
+      active.delete(node.id);
+    };
+    visit(root);
+    for (const node of project.nodes) {
+      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
+    }
+  }
+
+  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
+  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
+  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
+  finite(project.scene.camera.near, "scene.camera.near");
+  finite(project.scene.camera.far, "scene.camera.far");
+  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
+  finite(project.scene.background.intensity, "scene.background.intensity");
+  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
+  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
+  project.scene.instances.forEach((instance, index) => {
+    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
+    checkTransform(instance, finite, `scene.instances[${index}].transform`);
+  });
+
+  for (const modifier of project.modifiers) {
+    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
+    finite(modifier.order, `modifiers.${modifier.id}.order`);
+    finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
+    }
+    for (const [name, value] of Object.entries(modifier.parameters)) {
+      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
+      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+  }
+  for (const material of project.materials) {
+    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
+      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
+    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
+    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
+    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+  }
+  for (const clip of project.animations) {
+    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
+    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
+  }
+  for (const track of project.tracks) {
+    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
+    const usedKeys = new Set<EntityId>();
+    for (const keyframeId of track.keyframeIds) {
+      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
+      usedKeys.add(keyframeId);
+      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
+    }
+  }
+  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
+  return issues;
+}
+
+function checkTransform(
+  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
+  finite: (value: number, path: string) => void,
+  path: string,
+): void {
+  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
+  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
+  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
+}
+
+function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
+  finite(light.intensity, `scene.lights[${index}].intensity`);
+  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
+  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
+  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
+}
+
+function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
+  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
+  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
+  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
+}
 </file>
 
 <file path="tsconfig.json">
@@ -7830,6 +7692,329 @@ The earlier illustrative example used `formatVersion`, `projectId`, and `scene.m
 ## Error codes
 
 FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+</file>
+
+<file path="src/domain/command-bus.ts">
+import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
+import { validateProject, type ValidationIssue } from "./validate-project";
+import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
+
+export type ProjectCommand =
+  | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
+  | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
+  | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
+  | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
+  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } }
+  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } };
+
+export const CommandErrorCode = {
+  REVISION_CONFLICT: "REVISION_CONFLICT",
+  INVALID_COMMAND: "INVALID_COMMAND",
+  INVALID_REFERENCE: "INVALID_REFERENCE",
+  NODE_LOCKED: "NODE_LOCKED",
+  NODE_HIDDEN: "NODE_HIDDEN",
+  VALIDATION_FAILED: "VALIDATION_FAILED",
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+} as const;
+export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
+
+export type PatchChange =
+  | { kind: "addNode"; node: Node }
+  | { kind: "removeNode"; node: Node }
+  | { kind: "addAsset"; asset: Asset }
+  | { kind: "removeAsset"; asset: Asset }
+  | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
+  | { kind: "modelRevision"; before: number; after: number };
+export interface ProjectPatch { changes: PatchChange[] }
+
+export type CommandResult =
+  | { ok: true; id: string; project: Project; revision: number; patch: ProjectPatch; undoPatch: ProjectPatch; changed: boolean }
+  | { ok: false; id: string; code: CommandErrorCode; message: string; issues?: ValidationIssue[] };
+
+export interface CommandBus {
+  /** Session revision starts at 0, regardless of the serialized model revision. */
+  getRevision(): number;
+  getSnapshot(): Project;
+  executeCommand(command: ProjectCommand, expectedRevision: number): CommandResult;
+  executeTransaction(commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult;
+  applyHistoryPatch(patch: ProjectPatch, expectedRevision: number): CommandResult;
+}
+
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const id = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+const idList = (value: unknown): value is string[] => Array.isArray(value) && value.every(id);
+const numbers = (value: unknown, count: number): value is number[] =>
+  Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
+const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+const samePrimitive = (left: PrimitiveSource, right: PrimitiveSource): boolean => left.primitive === right.primitive
+  && Object.keys(left.parameters).length === Object.keys(right.parameters).length
+  && Object.keys(left.parameters).every(key => Object.hasOwn(right.parameters, key) && left.parameters[key] === right.parameters[key]);
+const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key));
+
+function validTransform(value: unknown): value is Transform {
+  return record(value) && ownKeys(value, ["position", "rotationQuat", "scale"])
+    && numbers(value.position, 3) && numbers(value.rotationQuat, 4) && numbers(value.scale, 3);
+}
+
+function validNode(value: unknown): value is Node {
+  if (!record(value) || !id(value.id) || !["group", "mesh"].includes(String(value.kind))) return false;
+  const keys = ["id", "kind", "name", "parentId", "children", "transform", "visible", "locked", "materialSlots", "modifierIds"];
+  if (!ownKeys(value, value.kind === "mesh" ? [...keys, "meshSource"] : keys)) return false;
+  if (typeof value.name !== "string" || !value.name.trim() || !id(value.parentId) || !idList(value.children)
+    || !validTransform(value.transform) || typeof value.visible !== "boolean" || typeof value.locked !== "boolean"
+    || !Array.isArray(value.materialSlots) || !value.materialSlots.every((slot: unknown) =>
+      record(slot) && ownKeys(slot, ["name", "materialId"]) && typeof slot.name === "string" && id(slot.materialId))
+    || !idList(value.modifierIds)) return false;
+  if (value.kind === "group") return true;
+  const source = value.meshSource;
+  if (!record(source)) return false;
+  if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
+  return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
+    && validatePrimitiveSource(source) === null;
+}
+
+function validCommand(value: unknown): value is ProjectCommand {
+  if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
+  const payload = value.payload;
+  if (value.type === "ADD_MESH_ASSET") {
+    const asset = payload.asset;
+    const node = payload.node;
+    return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+      && ownKeys(payload, ["parentId", "node", "asset"]) && id(payload.parentId)
+      && validNode(node) && node.kind === "mesh" && node.meshSource.kind === "asset"
+      && (asset === null || (record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+        && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
+        && asset.path === `assets/${asset.hash}.glb` && asset.mediaType === "model/gltf-binary" && asset.colorSpace === "none"))
+      && value.targetIds.length === 3 && value.targetIds[0] === payload.parentId
+      && value.targetIds[1] === node.id && value.targetIds[2] === node.meshSource.assetId
+      && (asset === null || asset.id === node.meshSource.assetId);
+  }
+  if (value.type === "ADD_NODE") return ownKeys(value, ["commandId", "type", "targetIds", "payload"])
+    && ownKeys(payload, ["parentId", "node"]) && id(payload.parentId) && validNode(payload.node)
+    && value.targetIds.length === 2 && value.targetIds[0] === payload.parentId && value.targetIds[1] === payload.node.id;
+  if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
+    || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  switch (value.type) {
+    case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
+    case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
+    case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
+      && ownKeys(payload.source, ["kind", "primitive", "parameters"]) && validatePrimitiveSource(payload.source) === null;
+    case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
+      && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
+      && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
+      && (!Object.hasOwn(payload, "locked") || typeof payload.locked === "boolean");
+    default: return false;
+  }
+}
+
+function failure(idValue: string, code: CommandErrorCode, message: string, issues?: ValidationIssue[]): CommandResult {
+  return { ok: false, id: idValue, code, message, ...(issues ? { issues } : {}) };
+}
+
+function blocked(project: Project, node: Node, flags = false): CommandErrorCode | null {
+  let current: Node | undefined = node;
+  while (current) {
+    if (current.locked && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_LOCKED;
+    if (!current.visible && (!flags || current.id !== node.id)) return CommandErrorCode.NODE_HIDDEN;
+    current = current.parentId === null ? undefined : project.nodes.find((entry) => entry.id === current?.parentId);
+  }
+  return null;
+}
+
+function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_NODE" || command.type === "ADD_MESH_ASSET") {
+    const { parentId, node } = command.payload;
+    if (command.type === "ADD_MESH_ASSET") {
+      const { asset } = command.payload;
+      const assetId = command.payload.node.meshSource.kind === "asset" ? command.payload.node.meshSource.assetId : "";
+      if (asset === null) {
+        if (!project.assets.some((entry) => entry.id === assetId && entry.mediaType === "model/gltf-binary"))
+          return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Ресурс GLB не найден.");
+      } else {
+        if (entityIds(project).has(asset.id) || asset.id === node.id || project.assets.some((entry) => entry.path === asset.path))
+          return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
+        project.assets.push(structuredClone(asset));
+      }
+    }
+    const parent = project.nodes.find((entry) => entry.id === parentId);
+    if (!parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Родительский узел не найден.");
+    const block = blocked(project, parent);
+    if (block) return failure(command.commandId, block, "Родительский узел недоступен для редактирования.");
+    if (node.parentId !== parentId || node.children.length !== 0 || node.modifierIds.length !== 0)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Добавляемый узел должен быть согласованным листом без модификаторов.");
+    if (project.nodes.some((entry) => entry.id === node.id) || entityIds(project).has(node.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
+    project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
+    project.nodes.push(structuredClone(node));
+    return null;
+  }
+  const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
+  if (!current) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Целевой узел не найден.");
+  const block = blocked(project, current, command.type === "SET_NODE_FLAGS");
+  if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
+  if (command.type === "SET_NODE_FLAGS") {
+    if (current.locked && command.payload.locked !== false)
+      return failure(command.commandId, CommandErrorCode.NODE_LOCKED, "Для изменения узла сначала снимите его блокировку.");
+    if (!current.visible && command.payload.visible !== true)
+      return failure(command.commandId, CommandErrorCode.NODE_HIDDEN, "Для изменения узла сначала восстановите его видимость.");
+  }
+  let next: Node;
+  switch (command.type) {
+    case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
+    case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
+    case "SET_PRIMITIVE_PARAMETERS":
+      if (current.kind !== "mesh" || current.meshSource.kind !== "primitive")
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел не является параметрическим примитивом.");
+      if (current.meshSource.primitive !== command.payload.source.primitive)
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Тип примитива нельзя изменить командой параметров.");
+      next = samePrimitive(current.meshSource, command.payload.source) ? current
+        : { ...current, meshSource: structuredClone(command.payload.source) }; break;
+    case "SET_NODE_FLAGS": next = { ...current,
+      visible: command.payload.visible ?? current.visible,
+      locked: command.payload.locked ?? current.locked }; break;
+  }
+  project.nodes = project.nodes.map((entry) => entry.id === current.id ? next : entry);
+  return null;
+}
+
+function entityIds(project: Project): Set<string> {
+  return new Set([project.id, project.model.id, project.scene.id,
+    ...project.nodes.map((item) => item.id), ...project.modifiers.map((item) => item.id),
+    ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
+    ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
+    ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
+    ...project.keyframes.map((item) => item.id)]);
+}
+
+function diff(before: Project, after: Project): ProjectPatch {
+  const changes: PatchChange[] = [];
+  for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
+  for (const node of after.nodes) {
+    const old = before.nodes.find((entry) => entry.id === node.id);
+    if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
+    for (const field of ["name", "transform", "visible", "locked", "children"] as const) {
+      if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
+        before: structuredClone(old[field]), after: structuredClone(node[field]) });
+    }
+    if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
+      changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
+  }
+  if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
+  return { changes };
+}
+
+function inverse(patch: ProjectPatch): ProjectPatch {
+  return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
+    if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
+    if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    if (change.kind === "setPrimitiveSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+  }) };
+}
+
+/** Replays a patch against a matching semantic base; throws on stale or invalid input. */
+export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
+  const result = structuredClone(project);
+  for (const change of patch.changes) {
+    if (change.kind === "addAsset") {
+      if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
+      result.assets.push(structuredClone(change.asset));
+    } else if (change.kind === "removeAsset") {
+      const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
+      if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
+      result.assets.splice(index, 1);
+    } else if (change.kind === "addNode") {
+      if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
+      result.nodes.push(structuredClone(change.node));
+    } else if (change.kind === "removeNode") {
+      const index = result.nodes.findIndex((node) => node.id === change.node.id);
+      if (index < 0 || !same(result.nodes[index], change.node)) throw new Error("Patch node conflict");
+      result.nodes.splice(index, 1);
+    } else if (change.kind === "modelRevision") {
+      if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
+      result.model.revision = change.after;
+    } else if (change.kind === "setPrimitiveSource") {
+      const node = result.nodes.find((entry) => entry.id === change.nodeId);
+      if (!node || node.kind !== "mesh" || node.meshSource.kind !== "primitive" || !same(node.meshSource, change.before)) throw new Error("Patch primitive conflict");
+      node.meshSource = structuredClone(change.after);
+    } else {
+      const node = result.nodes.find((entry) => entry.id === change.nodeId);
+      if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
+      Object.assign(node, { [change.field]: structuredClone(change.after) });
+    }
+  }
+  if (validateProject(result).length) throw new Error("Patch produces invalid project");
+  return result;
+}
+
+export function createCommandBus(initialProject: Project): CommandBus {
+  const initial = structuredClone(initialProject);
+  const issues = validateProject(initial);
+  if (issues.length) throw new Error(`Invalid initial project: ${issues[0]?.message}`);
+  let committed = initial;
+  let revision = 0;
+  const executeTransaction = (commands: ProjectCommand[], expectedRevision: number, transactionId?: string): CommandResult => {
+    const resultId = transactionId ?? (Array.isArray(commands) && commands.length === 1 && id(commands[0]?.commandId)
+      ? commands[0].commandId : "transaction");
+    if (expectedRevision !== revision) return failure(resultId, CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+    if (!Array.isArray(commands) || commands.length === 0 || !commands.every(validCommand)
+      || new Set(commands.map((command) => command.commandId)).size !== commands.length)
+      return failure(resultId, CommandErrorCode.INVALID_COMMAND, "Некорректная команда или транзакция.");
+    try {
+      const candidate = structuredClone(committed);
+      for (const command of commands) {
+        const error = applyCommand(candidate, command);
+        if (error) return error;
+      }
+      const contentPatch = diff(committed, candidate);
+      if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
+      candidate.model.revision += 1;
+      const validationIssues = validateProject(candidate);
+      if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
+      const patch = diff(committed, candidate);
+      const undoPatch = inverse(patch);
+      committed = candidate;
+      revision += 1;
+      return { ok: true, id: resultId, project: structuredClone(committed), revision,
+        patch: structuredClone(patch), undoPatch: structuredClone(undoPatch), changed: true };
+    } catch {
+      return failure(resultId, CommandErrorCode.INTERNAL_ERROR, "Не удалось выполнить транзакцию.");
+    }
+  };
+  return {
+    getRevision: () => revision,
+    getSnapshot: () => structuredClone(committed),
+    executeCommand: (command, expectedRevision) => executeTransaction([command], expectedRevision),
+    executeTransaction,
+    applyHistoryPatch(patch, expectedRevision) {
+      if (expectedRevision !== revision) return failure("history", CommandErrorCode.REVISION_CONFLICT, "Ревизия документа изменилась.");
+      try {
+        if (!patch || !Array.isArray(patch.changes) || patch.changes.length === 0)
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Пустой патч истории.");
+        const candidate = applyProjectPatch(committed, patch);
+        if (same(candidate, committed))
+          return failure("history", CommandErrorCode.INVALID_COMMAND, "Патч истории не изменяет документ.");
+        const issues = validateProject(candidate);
+        if (issues.length) return failure("history", CommandErrorCode.VALIDATION_FAILED, "Результат истории не прошёл проверку.", issues);
+        const project = structuredClone(candidate);
+        const forward = structuredClone(patch);
+        const undoPatch = inverse(forward);
+        committed = candidate;
+        revision += 1;
+        return { ok: true, id: "history", project, revision, patch: forward, undoPatch, changed: true };
+      } catch {
+        return failure("history", CommandErrorCode.VALIDATION_FAILED, "Патч истории не соответствует документу.");
+      }
+    },
+  };
+}
 </file>
 
 <file path="tests/app/editor-store.test.ts">
@@ -8421,6 +8606,14 @@ body { margin: 0; }
 .renderer-toolbar button:not(:disabled):hover { border-color: var(--color-primary-accent-strong); }
 .renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
 .renderer-status [role="alert"] { color: var(--color-state-danger); }
+.primitive-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.primitive-editor { display: grid; gap: 10px; margin-bottom: 18px; }
+.primitive-editor h3 { margin: 0; font-size: 14px; }
+.primitive-editor label { display: grid; gap: 4px; font-size: 12px; }
+.primitive-editor input { width: 100%; box-sizing: border-box; }
+.primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
+button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
+button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 </file>
 
 <file path="package.json">
@@ -8473,6 +8666,8 @@ import { AssetBytes } from "../assets/asset-bytes";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
 import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
+import { createPrimitiveNode, primitiveDefinitions, validatePrimitiveSource, type PrimitiveKind, type PrimitiveSource } from "../geometry/primitives";
+import type { DeepReadonly } from "../app/editor-store";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -8688,6 +8883,25 @@ function EditorShell() {
     setPendingGlb(null);
     notice(result.ok ? "success" : "error", result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
   }
+  const root = project.nodes.find(node => node.id === project.model.rootNodeId);
+  const canEditModel = !blocked && state.tool.mode === "model" && !!root?.visible && !root?.locked;
+  const selected = project.nodes.find(node => node.id === state.selection.activeId);
+  let selectedUnavailable = "";
+  if (selected) {
+    let ancestor: typeof selected | undefined = selected;
+    while (ancestor) {
+      if (ancestor.locked) { selectedUnavailable = "Объект или его родитель заблокирован."; break; }
+      if (!ancestor.visible) { selectedUnavailable = "Объект или его родитель скрыт."; break; }
+      ancestor = ancestor.parentId ? project.nodes.find(node => node.id === ancestor?.parentId) : undefined;
+    }
+  }
+  function addPrimitive(kind: PrimitiveKind) {
+    if (!canEditModel) return;
+    const node = createPrimitiveNode(kind, project.model.rootNodeId, crypto.randomUUID());
+    const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, state.document.revision);
+    if (!result.ok) notice("error", result.message);
+    else { editorStore.setSelection([node.id], node.id); notice("success", `${node.name} добавлен в модель.`); }
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -8723,10 +8937,10 @@ function EditorShell() {
             <p className="eyebrow">Текущий проект</p>
             <div className="project-name">{project.name}</div>
             <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
+            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <button type="button" className="tree-row" key={node.id} aria-pressed={state.selection.activeId === node.id} onClick={() => editorStore.setSelection([node.id], node.id)}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></button>)}
             <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
             <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
-          </div> : <div className="panel-content"><p className="panel-hint">Библиотека ресурсов появится в следующих задачах. Импортированный GLB сохраняется в проекте.</p></div>}
+          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
@@ -8736,13 +8950,41 @@ function EditorShell() {
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
         <aside className="dock right-dock" aria-label="Инспектор">
           <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><p className="eyebrow">{state.tool.mode === "scene" ? "Окружение" : "Свойства"}</p><p className="panel-hint">{state.selection.activeId ? "Редактирование свойств выбранного объекта появится в следующих задачах." : state.tool.mode === "scene" ? "Объект не выделен. Настройки окружения сцены появятся в следующих задачах." : "Объект не выделен. Инспектор свойств появится в следующих задачах."}</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
+          <div className="panel-content"><p className="eyebrow">{state.tool.mode === "scene" ? "Окружение" : "Свойства"}</p>{selected?.kind === "mesh" && selected.meshSource.kind === "primitive" ? <PrimitiveEditor key={`${selected.id}:${JSON.stringify(selected.meshSource)}`} source={selected.meshSource} disabled={!canEditModel || !!selectedUnavailable} reason={blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : selectedUnavailable} onApply={source => { const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [selected.id], payload: { nodeId: selected.id, source } }, editorStore.getSnapshot().document.revision); if (!result.ok) notice("error", result.message); else if (result.changed) notice("success", "Параметры обновлены."); }} /> : <p className="panel-hint">{state.selection.activeId ? "Параметры выбранного объекта пока недоступны." : "Выберите примитив в структуре или viewport."}</p>}<div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
         </aside>
       </div>
       <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
       <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
     </div>
   );
+}
+
+function PrimitiveEditor({ source, disabled, reason, onApply }: { source: DeepReadonly<PrimitiveSource>; disabled: boolean; reason: string; onApply: (source: PrimitiveSource) => void }) {
+  const specs = primitiveDefinitions[source.primitive].parameters;
+  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
+    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
+  const [draft, setDraft] = useState<Record<string, string>>(() => Object.fromEntries(keys.map(key => [key, String(source.parameters[key] ?? specs[key]!.defaultValue)])));
+  const [error, setError] = useState("");
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    const parameters: Record<string, number> = { ...source.parameters };
+    for (const key of keys) {
+      if (!draft[key]?.trim()) { setError(`Введите значение «${specs[key]!.label}».`); return; }
+      parameters[key] = Number(draft[key]);
+    }
+    const next: PrimitiveSource = { kind: "primitive", primitive: source.primitive, parameters };
+    const issue = validatePrimitiveSource(next);
+    if (issue) { setError(issue); return; }
+    setError("");
+    onApply(next);
+  }
+  return <form className="primitive-editor" onSubmit={submit}>
+    <h3>{primitiveDefinitions[source.primitive].label}</h3>
+    {keys.map(key => <label key={key}>{specs[key]!.label}<input type="number" step={specs[key]!.integer ? 1 : "any"} min={specs[key]!.min === Number.MIN_VALUE ? "0" : specs[key]!.min} max={specs[key]!.max} value={draft[key] ?? ""} disabled={disabled} onChange={event => { setDraft(previous => ({ ...previous, [key]: event.target.value })); setError(""); }} /></label>)}
+    <button type="submit" disabled={disabled}>Применить параметры</button>
+    {reason && <p className="panel-hint">{reason}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </form>;
 }
 </file>
 
@@ -8823,6 +9065,13 @@ function EditorShell() {
 - `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
 - TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
 - Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+
+## TASK-016 — Параметрическая библиотека примитивов (FR-012, FR-024)
+
+- Добавлены единые определения и валидация шести примитивов в `src/geometry/primitives.ts`; фабрика Three.js использует их для вычисления геометрии по изменению source. Доменная проверка отклоняет неверные размеры, сегменты, неизвестные ключи и вырожденный цилиндр до фиксации проекта.
+- Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
+- Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
+- Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
 </file>
 
 </files>

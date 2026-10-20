@@ -10,6 +10,7 @@ import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/impor
 import packageInfo from "../../package.json";
 import { createPrimitiveNode, primitiveDefinitions, validatePrimitiveSource, type PrimitiveKind, type PrimitiveSource } from "../geometry/primitives";
 import type { DeepReadonly } from "../app/editor-store";
+import { ObjectTree } from "./ObjectTree";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -276,12 +277,7 @@ function EditorShell() {
           <div className="dock-tabs" role="group" aria-label="Левая панель"><button type="button" aria-pressed={state.view.leftTab === "structure"} onClick={() => editorStore.setView({ leftTab: "structure" })}>Структура</button><button type="button" aria-pressed={state.view.leftTab === "assets"} onClick={() => editorStore.setView({ leftTab: "assets" })}>Библиотека</button></div>
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
-            <p className="eyebrow">Текущий проект</p>
-            <div className="project-name">{project.name}</div>
-            <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <button type="button" className="tree-row" key={node.id} aria-pressed={state.selection.activeId === node.id} onClick={() => editorStore.setSelection([node.id], node.id)}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></button>)}
-            <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
-            <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
+            <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
           </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />

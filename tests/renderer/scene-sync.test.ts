@@ -5,6 +5,25 @@ import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
 
 const noAssets = () => undefined;
 describe("domain scene synchronization", () => {
+  it("keeps wrapper and geometry identity while reparenting and reordering", () => {
+    const project = createNestedMeshProject();
+    const root = project.nodes[0]!;
+    const group = project.nodes.find(node => node.id === "nested-group")!;
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const wrapper = sync.objects.get(mesh.id)!.object;
+    const content = sync.objects.get(mesh.id)!.content;
+    root.children = [mesh.id, group.id]; group.children = []; mesh.parentId = root.id;
+    sync.sync(project, noAssets);
+    expect(sync.objects.get(mesh.id)!.object).toBe(wrapper);
+    expect(sync.objects.get(mesh.id)!.content).toBe(content);
+    expect(wrapper.parent).toBe(sync.objects.get(root.id)!.object);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([wrapper, sync.objects.get(group.id)!.object]);
+    root.children = [group.id, mesh.id]; sync.sync(project, noAssets);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([sync.objects.get(group.id)!.object, wrapper]);
+    sync.dispose();
+  });
   it("preserves stable objects and local hierarchy while transforms and visibility change", () => {
     const project = createNestedMeshProject();
     const states = [] as unknown[];

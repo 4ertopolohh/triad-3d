@@ -98,3 +98,22 @@ body { margin: 0; }
 .primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
 button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
 button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
+.object-tree { display: grid; gap: 8px; font-size: var(--font-size-sm); }
+.tree-search { width: 100%; box-sizing: border-box; min-height: 30px; border: var(--border-default); border-radius: var(--radius-sm); padding: 4px 8px; background: var(--color-surface-base); color: var(--color-text-primary); }
+.tree-tools, .tree-edit { display: flex; flex-wrap: wrap; gap: 4px; }
+.tree-tools button, .tree-edit button, .tree-edit select { border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); min-height: 26px; cursor: pointer; }
+.tree-tools button:disabled, .tree-edit button:disabled { opacity: .45; cursor: not-allowed; }
+.tree-scroll { height: 300px; overflow: auto; border: var(--border-default); border-radius: var(--radius-sm); }
+.object-row { position: absolute; left: 0; right: 0; height: 30px; box-sizing: border-box; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.object-row:hover { background: var(--color-state-info-surface); }
+.object-row.is-selected { background: var(--color-state-info-surface); }
+.object-row.is-active { outline: 1px solid var(--color-primary-accent-strong); outline-offset: -1px; }
+.object-row.is-drop-inside { box-shadow: inset 0 0 0 2px var(--color-primary-accent-strong); }
+.object-row.is-drop-before { box-shadow: inset 0 2px 0 var(--color-primary-accent-strong); }
+.object-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--color-primary-accent-strong); }
+.object-row button { border: 0; background: transparent; color: var(--color-text-primary); cursor: pointer; }
+.object-row button:focus-visible, .tree-tools button:focus-visible, .tree-edit button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); }
+.object-row .tree-toggle { width: 18px; padding: 0; }
+.object-row .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.object-row .tree-icon { width: 24px; padding: 0; }
+.tree-measure { display: none; }

@@ -125,6 +125,15 @@ export class SceneSync {
       const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
       if (parent && object.parent !== parent) parent.add(object);
     }
+    for (const node of project.nodes) {
+      const parent = this.objects.get(node.id)?.object;
+      if (!parent) continue;
+      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
+      if (ordered.some((item, i) => parent.children[i] !== item)) {
+        for (const item of ordered) parent.remove(item);
+        for (const item of ordered) parent.add(item);
+      }
+    }
     this.scene.updateMatrixWorld(true);
     for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
     this.emit();
