@@ -152,6 +152,7 @@ tests/
     production.test.ts
     service.test.ts
   domain/
+    boolean-commands.test.ts
     commands.test.ts
     hierarchy.test.ts
     project.test.ts
@@ -6640,6 +6641,141 @@ it("fails a silently stalled Worker and releases it", async () => {
 });
 </file>
 
+<file path="tests/domain/boolean-commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { applyProjectPatch, createCommandBus, type ProjectCommand } from "../../src/domain/command-bus";
+import { validateProject } from "../../src/domain/validate-project";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+function fixture() {
+  const project = createNestedMeshProject();
+  const target = project.nodes.find(node => node.id === "mesh-node")!;
+  const root = project.nodes.find(node => node.id === "nested-group")!;
+  for (const id of ["cutter", "third"]) {
+    project.nodes.push({ ...structuredClone(target), id, name: id, modifierIds: [] });
+    root.children.push(id);
+  }
+  return project;
+}
+const add = (modifierId: string, nodeId = "mesh-node", cutterNodeId = "cutter"): ProjectCommand => ({
+  commandId: `add-${modifierId}`, type: "ADD_BOOLEAN_MODIFIER", targetIds: [nodeId, modifierId, cutterNodeId],
+  payload: { nodeId, modifierId, cutterNodeId, operation: "subtract" },
+});
+const update = (modifierId: string, cutterNodeId: string): ProjectCommand => ({
+  commandId: `update-${modifierId}`, type: "UPDATE_BOOLEAN_MODIFIER", targetIds: [modifierId, cutterNodeId],
+  payload: { modifierId, cutterNodeId, operation: "union" },
+});
+const enabled = (modifierId: string, value: boolean): ProjectCommand => ({
+  commandId: `enabled-${modifierId}`, type: "SET_MODIFIER_ENABLED", targetIds: [modifierId], payload: { modifierId, enabled: value },
+});
+const move = (modifierId: string, toIndex: number): ProjectCommand => ({
+  commandId: `move-${modifierId}`, type: "MOVE_MODIFIER", targetIds: [modifierId], payload: { modifierId, toIndex },
+});
+const remove = (modifierId: string): ProjectCommand => ({
+  commandId: `remove-${modifierId}`, type: "REMOVE_MODIFIER", targetIds: [modifierId], payload: { modifierId },
+});
+
+describe("transactional Boolean commands", () => {
+  it.each(["subtract", "union", "intersect"] as const)("creates %s operation", operation => {
+    const bus = createCommandBus(fixture());
+    const command = add("boolean");
+    if (command.type !== "ADD_BOOLEAN_MODIFIER") throw new Error("Invalid test command");
+    command.payload.operation = operation;
+    const result = bus.executeCommand(command, 0);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.project.modifiers[0]).toMatchObject({ id: "boolean", kind: "boolean", enabled: true, version: 0, parameters: { operation, cutterNodeId: "cutter" } });
+  });
+
+  it("adds, updates, toggles, reorders and removes with reversible patches", () => {
+    const bus = createCommandBus(fixture());
+    const commands = [add("a"), add("b"), update("a", "third"), enabled("a", false), move("b", 0), remove("a")];
+    for (const command of commands) {
+      const before = bus.getSnapshot();
+      const result = bus.executeCommand(command, bus.getRevision());
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) return;
+      expect(validateProject(result.project)).toEqual([]);
+      expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+      expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(before);
+    }
+    const project = bus.getSnapshot();
+    expect(project.modifiers).toMatchObject([{ id: "b", order: 0, version: 1 }]);
+    expect(project.nodes.find(node => node.id === "mesh-node")?.modifierIds).toEqual(["b"]);
+    const saved = serializeProjectDocument(project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toEqual({ ok: true, value: project });
+  });
+
+  it("rejects cycles, bad payloads and cutter deletion without changing the document", () => {
+    const bus = createCommandBus(fixture());
+    expect(bus.executeCommand(add("a"), 0).ok).toBe(true);
+    const before = bus.getSnapshot();
+    const bad = [
+      add("cycle", "cutter", "mesh-node"),
+      add("a"),
+      add("self", "mesh-node", "mesh-node"),
+      { ...add("bad"), payload: { nodeId: "mesh-node", modifierId: "bad", cutterNodeId: "cutter", operation: "xor" } } as unknown as ProjectCommand,
+      move("a", 1),
+      { commandId: "delete", type: "DELETE_NODE", targetIds: ["cutter"], payload: { nodeId: "cutter" } } as ProjectCommand,
+    ];
+    for (const command of bad) {
+      expect(bus.executeCommand(command, 1).ok).toBe(false);
+      expect(bus.getSnapshot()).toEqual(before);
+      expect(bus.getRevision()).toBe(1);
+    }
+    expect(bus.executeCommand(enabled("a", false), 1).ok).toBe(true);
+    expect(bus.executeCommand(add("cycle", "cutter", "mesh-node"), 2).ok).toBe(false);
+  });
+
+  it("commits one revision and history step; failed transactions and no-ops remain clean", () => {
+    const store = createEditorStore(fixture());
+    const initial = store.getSnapshot().document.project;
+    expect(store.executeTransaction([add("a"), add("b")], 0).ok).toBe(true);
+    expect(store.getSnapshot().document.revision).toBe(1);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().derived.generation).toBe(1);
+    const after = structuredClone(store.getSnapshot().document.project);
+    expect(store.executeCommand(enabled("a", true), 1)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.executeTransaction([update("a", "third"), add("cycle", "cutter", "mesh-node")], 1).ok).toBe(false);
+    expect(store.getSnapshot().document.project).toEqual(after);
+    expect(store.getSnapshot().document.revision).toBe(1);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project).toEqual(initial);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.redo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.project).toEqual(after);
+  });
+
+  it("replays removal of multiple modifiers and permits a locked cutter", () => {
+    const project = fixture();
+    project.nodes.find(node => node.id === "cutter")!.locked = true;
+    const bus = createCommandBus(project);
+    const added = bus.executeTransaction([add("a"), add("b"), add("c")], 0);
+    expect(added.ok).toBe(true);
+    if (!added.ok) return;
+    const result = bus.executeTransaction([remove("a"), remove("c")], 1);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    if (!result.ok) return;
+    expect(applyProjectPatch(added.project, result.patch)).toEqual(result.project);
+    expect(applyProjectPatch(result.project, result.undoPatch)).toEqual(added.project);
+  });
+
+  it("rejects an indirect dependency cycle and a locked target", () => {
+    const bus = createCommandBus(fixture());
+    expect(bus.executeTransaction([add("a", "mesh-node", "cutter"), add("b", "cutter", "third")], 0).ok).toBe(true);
+    const before = bus.getSnapshot();
+    expect(bus.executeCommand(add("c", "third", "mesh-node"), 1)).toMatchObject({ ok: false, code: "VALIDATION_FAILED" });
+    expect(bus.getSnapshot()).toEqual(before);
+    const locked = fixture();
+    locked.nodes.find(node => node.id === "mesh-node")!.locked = true;
+    expect(createCommandBus(locked).executeCommand(add("a"), 0)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+  });
+});
+</file>
+
 <file path="tests/domain/hierarchy.test.ts">
 import { describe, expect, it } from "vitest";
 import { applyProjectPatch, createCommandBus } from "../../src/domain/command-bus";
@@ -9188,212 +9324,6 @@ export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
 </file>
 
-<file path="src/domain/validate-project.ts">
-import type { EntityId, Keyframe, Light, Node, Project } from "./types";
-import { validatePrimitiveSource } from "../geometry/primitives";
-
-export type ValidationCode =
-  | "DUPLICATE_ID"
-  | "MISSING_REFERENCE"
-  | "INVALID_HIERARCHY"
-  | "HIERARCHY_CYCLE"
-  | "INVALID_NUMBER"
-  | "INVALID_STRUCTURE";
-
-export interface ValidationIssue {
-  code: ValidationCode;
-  path: string;
-  message: string;
-}
-
-export function validateProject(project: Project): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const entities = new Map<EntityId, string>();
-  const register = (id: EntityId, path: string): void => {
-    const previous = entities.get(id);
-    if (previous !== undefined) {
-      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
-    } else {
-      entities.set(id, path);
-    }
-  };
-  const finite = (value: number, path: string): void => {
-    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
-  };
-  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
-    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
-  };
-
-  register(project.id, "id");
-  register(project.model.id, "model.id");
-  finite(project.model.revision, "model.revision");
-  register(project.scene.id, "scene.id");
-  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
-  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
-  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
-  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
-  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
-  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
-  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
-  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
-  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
-
-  const nodeIds = new Set(project.nodes.map((node) => node.id));
-  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
-  const materialIds = new Set(project.materials.map((material) => material.id));
-  const assetIds = new Set(project.assets.map((asset) => asset.id));
-  const trackIds = new Set(project.tracks.map((track) => track.id));
-  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
-
-  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
-  if (root === undefined) {
-    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
-  } else if (root.parentId !== null) {
-    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
-  }
-
-  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
-  for (const node of project.nodes) {
-    if (node.id !== project.model.rootNodeId && node.parentId === null) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
-    }
-    const childSet = new Set<EntityId>();
-    for (const childId of node.children) {
-      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
-      childSet.add(childId);
-      const child = nodesById.get(childId);
-      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
-      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
-    }
-    if (node.parentId !== null) {
-      const parent = nodesById.get(node.parentId);
-      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
-      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
-    }
-    checkTransform(node, finite, `nodes.${node.id}.transform`);
-    if (node.kind === "mesh") {
-      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else {
-        const message = validatePrimitiveSource(node.meshSource);
-        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
-      }
-    }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
-    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
-      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
-      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
-      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
-    }
-    const orderedModifiers = node.modifierIds
-      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
-      .filter((modifier) => modifier !== undefined);
-    for (let index = 1; index < orderedModifiers.length; index += 1) {
-      const previous = orderedModifiers[index - 1];
-      const current = orderedModifiers[index];
-      if (previous && current && previous.order >= current.order) {
-        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
-        break;
-      }
-    }
-  }
-
-  if (root !== undefined) {
-    const visited = new Set<EntityId>();
-    const active = new Set<EntityId>();
-    const visit = (node: Node): void => {
-      if (active.has(node.id)) {
-        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
-        return;
-      }
-      if (visited.has(node.id)) return;
-      active.add(node.id);
-      visited.add(node.id);
-      for (const childId of node.children) {
-        const child = nodesById.get(childId);
-        if (child) visit(child);
-      }
-      active.delete(node.id);
-    };
-    visit(root);
-    for (const node of project.nodes) {
-      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
-    }
-  }
-
-  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
-  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
-  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
-  finite(project.scene.camera.near, "scene.camera.near");
-  finite(project.scene.camera.far, "scene.camera.far");
-  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
-  finite(project.scene.background.intensity, "scene.background.intensity");
-  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
-  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
-  project.scene.instances.forEach((instance, index) => {
-    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
-    checkTransform(instance, finite, `scene.instances[${index}].transform`);
-  });
-
-  for (const modifier of project.modifiers) {
-    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
-    finite(modifier.order, `modifiers.${modifier.id}.order`);
-    finite(modifier.version, `modifiers.${modifier.id}.version`);
-    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
-    }
-    for (const [name, value] of Object.entries(modifier.parameters)) {
-      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
-      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
-    }
-  }
-  for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
-  }
-  for (const clip of project.animations) {
-    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
-    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
-  }
-  for (const track of project.tracks) {
-    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
-    const usedKeys = new Set<EntityId>();
-    for (const keyframeId of track.keyframeIds) {
-      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
-      usedKeys.add(keyframeId);
-      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
-    }
-  }
-  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
-  return issues;
-}
-
-function checkTransform(
-  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
-  finite: (value: number, path: string) => void,
-  path: string,
-): void {
-  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
-  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
-  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
-}
-
-function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
-  finite(light.intensity, `scene.lights[${index}].intensity`);
-  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
-  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
-  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
-}
-
-function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
-  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
-  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
-  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
-}
-</file>
-
 <file path="src/renderer/viewport-interactions.ts">
 import * as T from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -9784,6 +9714,260 @@ describe("domain scene synchronization", () => {
     "lib": ["ES2022", "DOM"]
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
+<file path="src/domain/validate-project.ts">
+import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+import { validatePrimitiveSource } from "../geometry/primitives";
+
+export type ValidationCode =
+  | "DUPLICATE_ID"
+  | "MISSING_REFERENCE"
+  | "INVALID_HIERARCHY"
+  | "HIERARCHY_CYCLE"
+  | "DEPENDENCY_CYCLE"
+  | "INVALID_NUMBER"
+  | "INVALID_STRUCTURE";
+
+export interface ValidationIssue {
+  code: ValidationCode;
+  path: string;
+  message: string;
+}
+
+export function validateProject(project: Project): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const entities = new Map<EntityId, string>();
+  const register = (id: EntityId, path: string): void => {
+    const previous = entities.get(id);
+    if (previous !== undefined) {
+      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
+    } else {
+      entities.set(id, path);
+    }
+  };
+  const finite = (value: number, path: string): void => {
+    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
+  };
+  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
+    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
+  };
+
+  register(project.id, "id");
+  register(project.model.id, "model.id");
+  finite(project.model.revision, "model.revision");
+  register(project.scene.id, "scene.id");
+  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
+  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
+  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
+  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
+  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
+  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
+  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
+  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
+
+  const nodeIds = new Set(project.nodes.map((node) => node.id));
+  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
+  const materialIds = new Set(project.materials.map((material) => material.id));
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const trackIds = new Set(project.tracks.map((track) => track.id));
+  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
+
+  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
+  if (root === undefined) {
+    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
+  } else if (root.parentId !== null) {
+    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
+  }
+
+  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  const booleanEdges = new Map<EntityId, EntityId[]>();
+  for (const node of project.nodes) {
+    if (node.id !== project.model.rootNodeId && node.parentId === null) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
+    }
+    const childSet = new Set<EntityId>();
+    for (const childId of node.children) {
+      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
+      childSet.add(childId);
+      const child = nodesById.get(childId);
+      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
+      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
+    }
+    if (node.parentId !== null) {
+      const parent = nodesById.get(node.parentId);
+      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
+      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
+    }
+    checkTransform(node, finite, `nodes.${node.id}.transform`);
+    if (node.kind === "mesh") {
+      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
+      else {
+        const message = validatePrimitiveSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      }
+    }
+    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    const seenModifiers = new Set<EntityId>();
+    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
+      seenModifiers.add(modifierId);
+      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
+      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
+      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
+    }
+    const orderedModifiers = node.modifierIds
+      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
+      .filter((modifier) => modifier !== undefined);
+    for (let index = 1; index < orderedModifiers.length; index += 1) {
+      const previous = orderedModifiers[index - 1];
+      const current = orderedModifiers[index];
+      if (previous && current && previous.order >= current.order) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
+        break;
+      }
+    }
+  }
+
+  if (root !== undefined) {
+    const visited = new Set<EntityId>();
+    const active = new Set<EntityId>();
+    const visit = (node: Node): void => {
+      if (active.has(node.id)) {
+        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
+        return;
+      }
+      if (visited.has(node.id)) return;
+      active.add(node.id);
+      visited.add(node.id);
+      for (const childId of node.children) {
+        const child = nodesById.get(childId);
+        if (child) visit(child);
+      }
+      active.delete(node.id);
+    };
+    visit(root);
+    for (const node of project.nodes) {
+      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
+    }
+  }
+
+  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
+  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
+  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
+  finite(project.scene.camera.near, "scene.camera.near");
+  finite(project.scene.camera.far, "scene.camera.far");
+  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
+  finite(project.scene.background.intensity, "scene.background.intensity");
+  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
+  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
+  project.scene.instances.forEach((instance, index) => {
+    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
+    checkTransform(instance, finite, `scene.instances[${index}].transform`);
+  });
+
+  for (const modifier of project.modifiers) {
+    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
+    finite(modifier.order, `modifiers.${modifier.id}.order`);
+    finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!Number.isSafeInteger(modifier.order) || modifier.order < 0 || !Number.isSafeInteger(modifier.version) || modifier.version < 0)
+      issues.push({ code: "INVALID_NUMBER", path: `modifiers.${modifier.id}`, message: "Порядок и версия должны быть неотрицательными целыми числами." });
+    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
+    }
+    for (const [name, value] of Object.entries(modifier.parameters)) {
+      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
+      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+    if (modifier.kind === "boolean") {
+      const params = modifier.parameters;
+      const keys = Object.keys(params);
+      if (keys.length !== 2 || !keys.includes("operation") || !keys.includes("cutterNodeId")
+        || !["subtract", "union", "intersect"].includes(String(params.operation))
+        || typeof params.cutterNodeId !== "string" || !params.cutterNodeId.trim()) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: "Некорректные параметры Boolean." });
+      } else {
+        const owner = nodesById.get(modifier.nodeId);
+        const cutter = nodesById.get(params.cutterNodeId);
+        if (owner?.kind !== "mesh" || (owner.meshSource.kind === "primitive" && owner.meshSource.primitive === "plane"))
+          issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.nodeId`, message: "Boolean target должен быть замкнутым mesh." });
+        if (!cutter || cutter.kind !== "mesh" || (cutter.meshSource.kind === "primitive" && cutter.meshSource.primitive === "plane"))
+          issues.push({ code: "MISSING_REFERENCE", path: `modifiers.${modifier.id}.parameters.cutterNodeId`, message: "Boolean cutter должен быть существующим замкнутым mesh." });
+        if (owner?.kind === "mesh" && cutter?.kind === "mesh")
+          booleanEdges.set(owner.id, [...booleanEdges.get(owner.id) ?? [], cutter.id]);
+      }
+    }
+  }
+  const visitedBoolean = new Set<EntityId>();
+  const activeBoolean = new Set<EntityId>();
+  for (const start of booleanEdges.keys()) {
+    if (visitedBoolean.has(start)) continue;
+    const stack: { id: EntityId; next: number }[] = [{ id: start, next: 0 }];
+    activeBoolean.add(start);
+    while (stack.length) {
+      const frame = stack[stack.length - 1]!;
+      const edges = booleanEdges.get(frame.id) ?? [];
+      if (frame.next === edges.length) {
+        activeBoolean.delete(frame.id);
+        visitedBoolean.add(frame.id);
+        stack.pop();
+        continue;
+      }
+      const next = edges[frame.next++]!;
+      if (activeBoolean.has(next)) {
+        issues.push({ code: "DEPENDENCY_CYCLE", path: `nodes.${frame.id}.modifierIds`, message: "Обнаружен цикл зависимостей Boolean." });
+        continue;
+      }
+      if (!visitedBoolean.has(next)) { activeBoolean.add(next); stack.push({ id: next, next: 0 }); }
+    }
+  }
+  for (const material of project.materials) {
+    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
+      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
+    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
+    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
+    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+  }
+  for (const clip of project.animations) {
+    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
+    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
+  }
+  for (const track of project.tracks) {
+    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
+    const usedKeys = new Set<EntityId>();
+    for (const keyframeId of track.keyframeIds) {
+      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
+      usedKeys.add(keyframeId);
+      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
+    }
+  }
+  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
+  return issues;
+}
+
+function checkTransform(
+  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
+  finite: (value: number, path: string) => void,
+  path: string,
+): void {
+  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
+  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
+  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
+}
+
+function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
+  finite(light.intensity, `scene.lights[${index}].intensity`);
+  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
+  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
+  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
+}
+
+function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
+  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
+  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
+  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
 }
 </file>
 
@@ -10284,8 +10468,9 @@ describe("editor store", () => {
 </file>
 
 <file path="src/domain/command-bus.ts">
-import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
+import type { Asset, EntityId, MeshNode, Modifier, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
+import type { BooleanParameters } from "../geometry/modifiers/types";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
@@ -10299,7 +10484,12 @@ export type ProjectCommand =
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
-  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } };
+  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
+  | { commandId: string; type: "ADD_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "UPDATE_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
+  | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
+  | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
 
 export const CommandErrorCode = {
   REVISION_CONFLICT: "REVISION_CONFLICT",
@@ -10318,6 +10508,10 @@ export type PatchChange =
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
   | { kind: "removeAsset"; asset: Asset }
+  | { kind: "addModifier"; modifier: Modifier; index: number }
+  | { kind: "removeModifier"; modifier: Modifier; index: number }
+  | { kind: "setModifier"; modifierId: EntityId; before: Modifier; after: Modifier }
+  | { kind: "setModifierIds"; nodeId: EntityId; before: EntityId[]; after: EntityId[] }
   | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children" | "parentId"; before: Node["name"] | Transform | boolean | EntityId[] | EntityId | null; after: Node["name"] | Transform | boolean | EntityId[] | EntityId | null }
   | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
   | { kind: "modelRevision"; before: number; after: number };
@@ -10375,6 +10569,19 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_BOOLEAN_MODIFIER") return ownKeys(payload, ["nodeId", "modifierId", "operation", "cutterNodeId"])
+    && id(payload.nodeId) && id(payload.modifierId) && id(payload.cutterNodeId)
+    && booleanOperation(payload.operation) && same(value.targetIds, [payload.nodeId, payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "UPDATE_BOOLEAN_MODIFIER") return ownKeys(payload, ["modifierId", "operation", "cutterNodeId"])
+    && id(payload.modifierId) && id(payload.cutterNodeId) && booleanOperation(payload.operation)
+    && same(value.targetIds, [payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "SET_MODIFIER_ENABLED") return ownKeys(payload, ["modifierId", "enabled"])
+    && id(payload.modifierId) && typeof payload.enabled === "boolean" && same(value.targetIds, [payload.modifierId]);
+  if (value.type === "MOVE_MODIFIER") return ownKeys(payload, ["modifierId", "toIndex"])
+    && id(payload.modifierId) && Number.isSafeInteger(payload.toIndex) && (payload.toIndex as number) >= 0
+    && same(value.targetIds, [payload.modifierId]);
+  if (value.type === "REMOVE_MODIFIER") return ownKeys(payload, ["modifierId"])
+    && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
   if (value.type === "GROUP_NODES") return ownKeys(payload, ["nodeIds", "group"]) && idList(payload.nodeIds)
     && payload.nodeIds.length > 0 && new Set(payload.nodeIds).size === payload.nodeIds.length
     && validNode(payload.group) && payload.group.kind === "group" && payload.group.children.length === 0
@@ -10414,6 +10621,9 @@ function validCommand(value: unknown): value is ProjectCommand {
     default: return false;
   }
 }
+
+const booleanOperation = (value: unknown): value is BooleanParameters["operation"] =>
+  value === "subtract" || value === "union" || value === "intersect";
 
 const nodeById = (project: Project, nodeId: string): Node | undefined => project.nodes.find(node => node.id === nodeId);
 function matrix(transform: Transform): Matrix4 {
@@ -10469,6 +10679,29 @@ function blocked(project: Project, node: Node, flags = false): CommandErrorCode 
   return null;
 }
 
+function bump(modifier: Modifier): boolean {
+  if (!Number.isSafeInteger(modifier.version) || modifier.version >= Number.MAX_SAFE_INTEGER) return false;
+  modifier.version += 1;
+  return true;
+}
+
+function normalizeOrders(project: Project, node: MeshNode): boolean {
+  for (const [index, modifierId] of node.modifierIds.entries()) {
+    const modifier = project.modifiers.find(item => item.id === modifierId);
+    if (!modifier) return false;
+    if (modifier.order !== index) {
+      modifier.order = index;
+      if (!bump(modifier)) return false;
+    }
+  }
+  return true;
+}
+
+function meshOperand(project: Project, nodeId: string): MeshNode | undefined {
+  const node = nodeById(project, nodeId);
+  return node?.kind === "mesh" && !(node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane") ? node : undefined;
+}
+
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
   if (command.type === "MOVE_NODE") {
     const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
@@ -10513,6 +10746,8 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     if (!node || !parent || node.id === project.model.rootNodeId || guarded(project, node) || guarded(project, parent))
       return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел нельзя удалить.");
     const removed = descendants(project, node); const ids = new Set(removed.map(item => item.id));
+    if (project.modifiers.some(item => item.kind === "boolean" && ids.has(String(item.parameters.cutterNodeId)) && !ids.has(item.nodeId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел используется как Boolean cutter оставшимся модификатором.");
     if (removed.some(item => item.modifierIds.length) || project.modifiers.some(item => ids.has(item.nodeId))
       || project.tracks.some(item => ids.has(item.nodeId)))
       return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "У структуры есть зависимые дорожки или модификаторы.");
@@ -10544,6 +10779,59 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
     project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
     project.nodes.push(structuredClone(node));
+    return null;
+  }
+  if (command.type === "ADD_BOOLEAN_MODIFIER") {
+    const { nodeId, modifierId, operation, cutterNodeId } = command.payload;
+    const target = meshOperand(project, nodeId);
+    if (!target || !meshOperand(project, cutterNodeId)) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Boolean требует существующие замкнутые mesh-операнды.");
+    if (nodeId === cutterNodeId || entityIds(project).has(modifierId)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Boolean не может ссылаться на себя; ID модификатора должен быть уникальным.");
+    const block = blocked(project, target);
+    if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
+    const last = project.modifiers.find(item => item.id === target.modifierIds.at(-1));
+    const order = last ? last.order + 1 : 0;
+    if (!Number.isSafeInteger(order)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок стека переполнен.");
+    project.modifiers.push({ id: modifierId, nodeId, kind: "boolean", order, enabled: true, version: 0, parameters: { operation, cutterNodeId } });
+    target.modifierIds.push(modifierId);
+    return null;
+  }
+  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
+    || command.type === "MOVE_MODIFIER" || command.type === "REMOVE_MODIFIER") {
+    const modifier = project.modifiers.find(item => item.id === command.payload.modifierId);
+    if (!modifier) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор не найден.");
+    const target = nodeById(project, modifier.nodeId);
+    if (!target || target.kind !== "mesh" || !target.modifierIds.includes(modifier.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Стек модификатора не найден.");
+    const block = blocked(project, target);
+    if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
+    if (command.type === "UPDATE_BOOLEAN_MODIFIER") {
+      if (modifier.kind !== "boolean") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является Boolean.");
+      const { operation, cutterNodeId } = command.payload;
+      if (!meshOperand(project, cutterNodeId)) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Boolean cutter не является замкнутым mesh.");
+      if (cutterNodeId === target.id) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Boolean не может ссылаться на свой mesh.");
+      if (modifier.parameters.operation !== operation || modifier.parameters.cutterNodeId !== cutterNodeId) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.parameters = { operation, cutterNodeId };
+      }
+    } else if (command.type === "SET_MODIFIER_ENABLED") {
+      if (modifier.enabled !== command.payload.enabled) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.enabled = command.payload.enabled;
+      }
+    } else if (command.type === "MOVE_MODIFIER") {
+      const { toIndex } = command.payload;
+      if (toIndex >= target.modifierIds.length) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Индекс модификатора вне стека.");
+      const oldIndex = target.modifierIds.indexOf(modifier.id);
+      if (oldIndex !== toIndex) {
+        target.modifierIds.splice(oldIndex, 1);
+        target.modifierIds.splice(toIndex, 0, modifier.id);
+        if (!normalizeOrders(project, target)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок или версия модификатора недопустимы.");
+      }
+    } else {
+      target.modifierIds = target.modifierIds.filter(item => item !== modifier.id);
+      project.modifiers = project.modifiers.filter(item => item.id !== modifier.id);
+      if (!normalizeOrders(project, target)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок или версия модификатора недопустимы.");
+    }
     return null;
   }
   const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
@@ -10590,12 +10878,21 @@ function diff(before: Project, after: Project): ProjectPatch {
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
+    if (!same(old.modifierIds, node.modifierIds)) changes.push({ kind: "setModifierIds", nodeId: node.id,
+      before: structuredClone(old.modifierIds), after: structuredClone(node.modifierIds) });
     for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
     if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
       changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
+  }
+  for (const [index, modifier] of [...before.modifiers.entries()].reverse()) if (!after.modifiers.some(item => item.id === modifier.id))
+    changes.push({ kind: "removeModifier", modifier: structuredClone(modifier), index });
+  for (const [index, modifier] of after.modifiers.entries()) {
+    const old = before.modifiers.find(item => item.id === modifier.id);
+    if (!old) changes.push({ kind: "addModifier", modifier: structuredClone(modifier), index });
+    else if (!same(old, modifier)) changes.push({ kind: "setModifier", modifierId: modifier.id, before: structuredClone(old), after: structuredClone(modifier) });
   }
   for (const node of before.nodes) if (!after.nodes.some(entry => entry.id === node.id)) changes.push({ kind: "removeNode", node: structuredClone(node) });
   if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
@@ -10608,7 +10905,11 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
     if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "addModifier") return { kind: "removeModifier", modifier: structuredClone(change.modifier), index: change.index };
+    if (change.kind === "removeModifier") return { kind: "addModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    if (change.kind === "setModifier") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    if (change.kind === "setModifierIds") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setPrimitiveSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
   }) };
@@ -10625,6 +10926,22 @@ export function applyProjectPatch(project: Project, patch: ProjectPatch): Projec
       const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
       if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
       result.assets.splice(index, 1);
+    } else if (change.kind === "addModifier") {
+      if (entityIds(result).has(change.modifier.id)) throw new Error("Patch modifier ID conflict");
+      if (change.index < 0 || change.index > result.modifiers.length) throw new Error("Patch modifier index conflict");
+      result.modifiers.splice(change.index, 0, structuredClone(change.modifier));
+    } else if (change.kind === "removeModifier") {
+      const index = result.modifiers.findIndex(item => item.id === change.modifier.id);
+      if (index !== change.index || !same(result.modifiers[index], change.modifier)) throw new Error("Patch modifier conflict");
+      result.modifiers.splice(index, 1);
+    } else if (change.kind === "setModifier") {
+      const index = result.modifiers.findIndex(item => item.id === change.modifierId);
+      if (index < 0 || !same(result.modifiers[index], change.before)) throw new Error("Patch modifier conflict");
+      result.modifiers[index] = structuredClone(change.after);
+    } else if (change.kind === "setModifierIds") {
+      const node = result.nodes.find(item => item.id === change.nodeId);
+      if (!node || !same(node.modifierIds, change.before)) throw new Error("Patch modifier stack conflict");
+      node.modifierIds = structuredClone(change.after);
     } else if (change.kind === "addNode") {
       if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
       result.nodes.push(structuredClone(change.node));
@@ -11482,6 +11799,12 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-022A — Boolean modifier commands (часть TASK-022)
+
+- CommandBus поддерживает добавление, изменение, включение, перестановку и удаление Boolean-модификаторов через атомарные транзакции и обратимые патчи. Существующий EditorStore публикует изменения в истории и инвалидирует derived generation.
+- Доменная проверка контролирует точные Boolean-параметры, владельца и порядок стека, ссылки на mesh и циклы зависимостей, включая отключённые модификаторы. Удаление используемого cutter отклоняется. Сохранение использует прежний документ v1.
+- Boolean UI и подключение ModifierEvaluator к SceneSync остаются следующими частями TASK-022.
 
 ## TASK-027 — Transactional Heavy Job Controller (MVP)
 

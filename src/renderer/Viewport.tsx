@@ -4,6 +4,7 @@ import { useEditorStore } from "../app/use-editor-store";
 import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
 import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable } from "./viewport-interactions";
+import { ModifierPreview } from "./modifier-preview";
 
 export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
   const host = useRef<HTMLDivElement>(null);
@@ -27,12 +28,14 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
         interactions.current?.dispose(); interactions.current = null;
       }
     }, setScene);
+    const preview = new ModifierPreview(store, adapter.graph);
     let generation = -1;
     const sync = () => {
       const state = store.getSnapshot();
       if (generation === state.derived.generation) return;
       generation = state.derived.generation;
       adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
+      preview.sync();
     };
     let disposed = false;
     void adapter.initialize(host.current, backendMode).then(() => {
@@ -45,7 +48,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
     });
     sync();
     const unsubscribe = store.subscribe(sync);
-    return () => { disposed = true; unsubscribe(); interactions.current?.dispose(); interactions.current = null;
+    return () => { disposed = true; unsubscribe(); preview.dispose(); interactions.current?.dispose(); interactions.current = null;
       adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);

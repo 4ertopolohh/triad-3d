@@ -5,6 +5,7 @@ import { decodeStaticGlb } from "../importers/gltf/import-glb";
 import { disposeObject } from "../assets/three-resources";
 import { primitiveGeometry } from "./primitive";
 import { SurfaceQuery } from "../geometry/surface-query";
+import { validateMesh, type MeshData } from "../geometry/csg";
 
 export type RenderProject = DeepReadonly<Project>;
 export type AssetReader = (id: string) => Uint8Array | undefined;
@@ -58,6 +59,9 @@ export class SceneSync {
   private lightKey = "";
   private cameraKey = "";
   private diagnostics: string[] = [];
+  private modifierDiagnostics = new Map<string, string[]>();
+  private derived = new Set<string>();
+  private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
   private closed = false;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
@@ -78,7 +82,6 @@ export class SceneSync {
     this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
     if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
     if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
-    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
     const lightKey = JSON.stringify(project.scene.lights);
     if (lightKey !== this.lightKey) {
       this.lights.clear(); this.lightKey = lightKey;
@@ -92,12 +95,13 @@ export class SceneSync {
       }
     }
     const ids = new Set(project.nodes.map(n => n.id));
-    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
+    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); this.derived.delete(id); this.modifierDiagnostics.delete(id); this.nodeMaterials.delete(id); }
     for (const node of project.nodes) {
       let entry = this.objects.get(node.id);
       if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
       entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
       const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
+      this.nodeMaterials.set(node.id, materials[0]);
       if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
       const source = node.kind === "mesh" ? node.meshSource : null;
       const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
@@ -151,10 +155,45 @@ export class SceneSync {
     for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
     this.emit();
   }
+  /** Derived buffers belong to the renderer and are never attached to the domain document. */
+  setDerived(nodeId: string, mesh: MeshData, empty: boolean, diagnostics: string[] = []): void {
+    if (this.closed) return;
+    const entry = this.objects.get(nodeId);
+    if (!entry) return;
+    validateMesh(mesh, empty);
+    if (empty !== (mesh.indices.length === 0)) throw new Error("Некорректный пустой результат Boolean.");
+    const geometry = new T.BufferGeometry();
+    let content: T.Mesh | undefined;
+    try {
+      if (!empty) {
+        geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
+        geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
+        geometry.computeVertexNormals();
+        content = new T.Mesh(geometry, material(this.nodeMaterials.get(nodeId)));
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
+      else geometry.dispose();
+      this.derived.add(nodeId);
+      this.setModifierDiagnostics(nodeId, diagnostics);
+    } catch (error) { if (content) disposeObject(content); else geometry.dispose(); throw error; }
+  }
+  setModifierDiagnostics(nodeId: string, diagnostics: string[]): void {
+    if (this.closed || !this.objects.has(nodeId)) return;
+    if (diagnostics.length) this.modifierDiagnostics.set(nodeId, diagnostics.map(message => `${nodeId}: ${message}`));
+    else this.modifierDiagnostics.delete(nodeId);
+    this.emit();
+  }
+  resetDerived(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    for (const id of this.derived) { const entry = this.objects.get(id); if (entry) { entry.key = ""; entry.sourceKey = ""; } }
+    this.derived.clear(); this.modifierDiagnostics.clear();
+    this.sync(project, readAsset, epoch);
+  }
   private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
     errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
   private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.surfaces.clear(); }
+  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
   dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
 }
