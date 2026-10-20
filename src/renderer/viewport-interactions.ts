@@ -141,17 +141,8 @@ export class ViewportInteractions {
     if (rect.width <= 0 || rect.height <= 0) return;
     this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
       -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
-    const candidates: T.Object3D[] = [];
-    for (const entry of this.graph.objects.values()) if (entry.content && entry.object.visible) candidates.push(entry.content);
-    const hit = this.raycaster.intersectObjects(candidates, true).find(item => {
-      let current: T.Object3D | null = item.object;
-      while (current) { if (!current.visible) return false; current = current.parent; }
-      return true;
-    });
-    const wrappers = new Map<T.Object3D, string>([...this.graph.objects].map(([id, entry]) => [entry.object, id]));
-    let parent = hit?.object;
-    while (parent && !wrappers.has(parent)) parent = parent.parent ?? undefined;
-    const id = parent ? wrappers.get(parent) : undefined;
+    const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
+    const id = hit?.nodeId;
     if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
       const ids = this.store.getSnapshot().selection.ids;
       const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];

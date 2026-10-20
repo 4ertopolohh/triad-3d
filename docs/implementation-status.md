@@ -88,3 +88,10 @@
 - Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
 - Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
 - Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
+
+## TASK-019 — BVH и Surface Picking (MVP)
+
+- Добавлен runtime `SurfaceQuery`: ближайшее пересечение мирового луча с видимым статическим Mesh, координаты world/mesh-local/node-local, геометрическая нормаль, faceIndex и UV при наличии. Viewport использует этот API для выбора узлов.
+- `three-mesh-bvh@0.9.16` подключён локально к поддерживаемым Mesh без изменения прототипов Three.js. Для сеток от 20 000 треугольников BVH строится одним переиспользуемым Worker; проверка и копирование входных буферов выполняются порциями. Порог является начальной эвристикой. Пока BVH не готов или построение завершилось ошибкой, используется штатный raycast; ошибка отражается в диагностике viewport.
+- Индексы живут только в runtime. SceneSync освобождает их при замене геометрии, удалении узла, смене проекта и dispose. Изменение transform или материала не перестраивает BVH. Skinned/morph Mesh, повреждённые сетки и сетки более 2 млн треугольников не индексируются; повреждённые сетки не участвуют в запросе.
+- Целевые тесты покрывают indexed/non-indexed, шесть примитивов, вложенные трансформации, normal matrix, видимость предков, locked selection, worker success/failure/late result и жизненный цикл геометрии. Browser smoke и замер ускорения отдельно не подтверждены.

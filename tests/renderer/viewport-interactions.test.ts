@@ -71,4 +71,37 @@ describe("viewport transform safeguards", () => {
     expect(messages.some(message => message?.includes("отменено"))).toBe(true);
     interaction.dispose(); unsubscribe(); graph.dispose();
   });
+  it("selects a locked visible node, supports modifier selection and ignores hidden parents", () => {
+    const document = new EventTarget();
+    const canvas = Object.assign(new EventTarget(), { style: {}, ownerDocument: document, getRootNode: () => document,
+      setPointerCapture: () => {}, releasePointerCapture: () => {},
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 600, height: 400 }) }) as unknown as HTMLCanvasElement;
+    vi.stubGlobal("window", new EventTarget()); vi.stubGlobal("document", document);
+    const store = createEditorStore(createNestedMeshProject());
+    const graph = new SceneSync(() => {});
+    const sync = () => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    sync(); const unsubscribe = store.subscribe(sync);
+    const interaction = new ViewportInteractions(graph, canvas, store, () => {}, false);
+    const handlers = interaction as unknown as { onPointerDown(event: PointerEvent): void; onPointerUp(event: PointerEvent): void };
+    const click = (shiftKey = false) => {
+      const event = { button: 0, pointerId: 1, clientX: 300, clientY: 200, ctrlKey: false, metaKey: false, shiftKey } as PointerEvent;
+      handlers.onPointerDown(event); handlers.onPointerUp(event);
+    };
+    const revision = store.getSnapshot().document.revision;
+    store.executeCommand({ commandId: "lock", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", locked: true } }, revision);
+    click();
+    expect(store.getSnapshot().selection.ids).toEqual(["mesh-node"]);
+    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
+    click(true);
+    expect(store.getSnapshot().selection.ids).toEqual([]);
+    const hidden = store.executeCommand({ commandId: "hide-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"],
+      payload: { nodeId: "nested-group", visible: false } }, store.getSnapshot().document.revision);
+    expect(hidden.ok).toBe(true);
+    expect(graph.objects.get("nested-group")?.object.visible).toBe(false);
+    expect(graph.surfaces.nearest(new T.Ray(graph.camera.position.clone(), new T.Vector3().sub(graph.camera.position).normalize()))).toBeNull();
+    click();
+    expect(store.getSnapshot().selection.ids).toEqual([]);
+    interaction.dispose(); unsubscribe(); graph.dispose();
+  });
 });
