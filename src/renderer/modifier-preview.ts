@@ -33,11 +33,11 @@ export class ModifierPreview {
         if (!this.current(token, epoch)) return;
         if (node.kind !== "mesh") continue;
         if (node.meshSource.kind === "asset") {
-          this.scene.setModifierDiagnostics(node.id, ["Boolean для GLB пока недоступен; показана исходная геометрия."]);
+          this.scene.setModifierDiagnostics(node.id, ["Модификаторы для GLB пока недоступны; показана исходная геометрия."]);
           continue;
         }
         try { await this.evaluate(project as Project, node.id, token, epoch); }
-        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра Boolean."]); }
+        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра модификатора."]); }
       }
     });
   }
@@ -51,7 +51,7 @@ export class ModifierPreview {
     this.active = true;
     try {
     const outcome = await this.store.jobs.run({
-      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление Boolean", cancellable: true,
+      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление модификаторов", cancellable: true,
       validate: () => null,
       compute: async (_input, signal) => {
         computation = this.evaluator.evaluate(project, nodeId, signal);

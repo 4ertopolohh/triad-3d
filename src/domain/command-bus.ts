@@ -1,6 +1,8 @@
 import type { Asset, EntityId, MeshNode, Modifier, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import type { BooleanParameters } from "../geometry/modifiers/types";
+import type { ArrayParameters } from "../geometry/modifiers/types";
+import { parseArrayParameters } from "../geometry/modifiers/array";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
@@ -17,6 +19,8 @@ export type ProjectCommand =
   | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "ADD_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
   | { commandId: string; type: "UPDATE_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "ADD_ARRAY_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: ArrayParameters } }
+  | { commandId: string; type: "UPDATE_ARRAY_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: ArrayParameters } }
   | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
   | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
   | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
@@ -105,6 +109,12 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (value.type === "UPDATE_BOOLEAN_MODIFIER") return ownKeys(payload, ["modifierId", "operation", "cutterNodeId"])
     && id(payload.modifierId) && id(payload.cutterNodeId) && booleanOperation(payload.operation)
     && same(value.targetIds, [payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "ADD_ARRAY_MODIFIER" || value.type === "UPDATE_ARRAY_MODIFIER") {
+    try { parseArrayParameters(payload.parameters); } catch { return false; }
+    return value.type === "ADD_ARRAY_MODIFIER"
+      ? ownKeys(payload, ["nodeId", "modifierId", "parameters"]) && id(payload.nodeId) && id(payload.modifierId) && same(value.targetIds, [payload.nodeId, payload.modifierId])
+      : ownKeys(payload, ["modifierId", "parameters"]) && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
+  }
   if (value.type === "SET_MODIFIER_ENABLED") return ownKeys(payload, ["modifierId", "enabled"])
     && id(payload.modifierId) && typeof payload.enabled === "boolean" && same(value.targetIds, [payload.modifierId]);
   if (value.type === "MOVE_MODIFIER") return ownKeys(payload, ["modifierId", "toIndex"])
@@ -311,6 +321,20 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     project.nodes.push(structuredClone(node));
     return null;
   }
+  if (command.type === "ADD_ARRAY_MODIFIER") {
+    const { nodeId, modifierId, parameters } = command.payload;
+    const target = nodeById(project, nodeId);
+    if (!target || target.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Массив требует существующий mesh.");
+    if (entityIds(project).has(modifierId)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID модификатора уже используется.");
+    const block = blocked(project, target);
+    if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
+    const last = project.modifiers.find(item => item.id === target.modifierIds.at(-1));
+    const order = last ? last.order + 1 : 0;
+    if (!Number.isSafeInteger(order)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок стека переполнен.");
+    project.modifiers.push({ id: modifierId, nodeId, kind: "array", order, enabled: true, version: 0, parameters: structuredClone(parseArrayParameters(parameters)) });
+    target.modifierIds.push(modifierId);
+    return null;
+  }
   if (command.type === "ADD_BOOLEAN_MODIFIER") {
     const { nodeId, modifierId, operation, cutterNodeId } = command.payload;
     const target = meshOperand(project, nodeId);
@@ -325,7 +349,7 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     target.modifierIds.push(modifierId);
     return null;
   }
-  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
+  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "UPDATE_ARRAY_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
     || command.type === "MOVE_MODIFIER" || command.type === "REMOVE_MODIFIER") {
     const modifier = project.modifiers.find(item => item.id === command.payload.modifierId);
     if (!modifier) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор не найден.");
@@ -334,7 +358,14 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Стек модификатора не найден.");
     const block = blocked(project, target);
     if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
-    if (command.type === "UPDATE_BOOLEAN_MODIFIER") {
+    if (command.type === "UPDATE_ARRAY_MODIFIER") {
+      if (modifier.kind !== "array") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является массивом.");
+      const parameters = parseArrayParameters(command.payload.parameters);
+      if (!same(parseArrayParameters(modifier.parameters), parameters)) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.parameters = structuredClone(parameters);
+      }
+    } else if (command.type === "UPDATE_BOOLEAN_MODIFIER") {
       if (modifier.kind !== "boolean") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является Boolean.");
       const { operation, cutterNodeId } = command.payload;
       if (!meshOperand(project, cutterNodeId)) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Boolean cutter не является замкнутым mesh.");

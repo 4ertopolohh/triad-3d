@@ -3,6 +3,7 @@ import { BlobReader, BlobWriter, TextReader, TextWriter, ZipReader, ZipWriter } 
 import { AssetBytes } from "../../src/assets/asset-bytes";
 import { ARCHIVE_LIMITS, createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
 import { createProject } from "../../src/domain";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
 import { createNestedMeshProject } from "../fixtures/projects";
 
 async function zip(entries: readonly [string, string][]): Promise<Blob> {
@@ -12,6 +13,22 @@ async function zip(entries: readonly [string, string][]): Promise<Blob> {
 }
 
 describe("native project archive", () => {
+  it("round-trips Array parameters, order, enabled state and version", async () => {
+    const project = createProject();
+    const root = project.nodes[0]!;
+    const node = createPrimitiveNode("cube", root.id, "array-target");
+    root.children.push(node.id); project.nodes.push(node);
+    node.modifierIds.push("array-1", "array-2");
+    project.modifiers.push(
+      { id: "array-1", nodeId: node.id, kind: "array", order: 0, enabled: true, version: 3, parameters: { mode: "linear", count: 6, axis: "x", step: -2, offset: [0, 1, 0] } },
+      { id: "array-2", nodeId: node.id, kind: "array", order: 1, enabled: false, version: 1, parameters: { mode: "radial", count: 4, axis: "z", angleStepDegrees: 90, pivot: [1, 0, 0], offset: [0, 0, 1] } },
+    );
+    const saved = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    const loaded = await openNativeProjectArchive(saved.value);
+    expect(loaded.ok && loaded.value.project).toEqual(project);
+  });
   it("round-trips an empty project", async () => {
     const project = createProject();
     const saved = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");

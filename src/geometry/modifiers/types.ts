@@ -2,6 +2,9 @@ import type { Project, MeshNode } from "../../domain/types";
 import type { CsgErrorCode, CsgOperation, CsgWarning, MeshData } from "../csg";
 
 export type BooleanParameters = { operation: CsgOperation; cutterNodeId: string };
+export type ArrayParameters =
+  | { mode: "linear"; count: number; axis: "x" | "y" | "z"; step: number; offset: readonly [number, number, number] }
+  | { mode: "radial"; count: number; axis: "x" | "y" | "z"; angleStepDegrees: number; pivot: readonly [number, number, number]; offset: readonly [number, number, number] };
 export type ModifierErrorCode = CsgErrorCode | "INVALID_REFERENCE" | "DEPENDENCY_CYCLE" | "INVALID_MODIFIER" | "UNSUPPORTED_MODIFIER" | "ASSET_DECODE_FAILED" | "STALE_PROJECT";
 export type ModifierDiagnostic = { code: ModifierErrorCode; message: string; nodeId?: string; modifierId?: string };
 export type ModifierWarning = CsgWarning;

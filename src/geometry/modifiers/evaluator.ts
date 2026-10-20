@@ -3,6 +3,7 @@ import type { MeshNode, Modifier, Node, Project } from "../../domain/types";
 import { primitiveGeometry } from "../../renderer/primitive";
 import { CsgError, CsgService, fromThree, validateMesh, type MeshData } from "../csg";
 import type { AssetGeometryResolver, BooleanParameters, EvaluationResult, GeometryAttributes, ModifierDiagnostic, ModifierErrorCode, ModifierWarning } from "./types";
+import { ArrayError, evaluateArray, parseArrayParameters } from "./array";
 
 type CsgRunner = Pick<CsgService, "run" | "cancel">;
 type Stage = { mesh: MeshData; key: string; attributes: GeometryAttributes; warnings: ModifierWarning[]; applied: string[]; empty: boolean };
@@ -102,7 +103,7 @@ export class ModifierEvaluator {
       this.checkProject(ctx, nodeId);
       return { ok: true, mesh: cloneMesh(stage.mesh), empty: stage.empty, warnings: [...stage.warnings], appliedModifierIds: [...stage.applied], fallback: false };
     } catch (error) {
-      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError ? error.code : "WORKER_FAILED";
+      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError || error instanceof ArrayError ? error.code : "WORKER_FAILED";
       const message = error instanceof Error ? error.message : String(error);
       const diagnostic: ModifierDiagnostic = { code, message, ...(error instanceof EvaluationFailure && error.nodeId ? { nodeId: error.nodeId } : { nodeId }), ...(error instanceof EvaluationFailure && error.modifierId ? { modifierId: error.modifierId } : {}) };
       return fail(diagnostic, code === "JOB_CANCELLED" || code === "STALE_PROJECT" ? undefined : last);
@@ -152,6 +153,23 @@ export class ModifierEvaluator {
       for (const modifier of modifiers) {
         this.check(ctx.signal, ctx.epoch);
         if (!modifier.enabled) continue;
+        if (modifier.kind === "array") {
+          let params;
+          try { params = parseArrayParameters(modifier.parameters); }
+          catch (error) { throw new EvaluationFailure(error instanceof ArrayError ? error.code : "INVALID_MODIFIER", error instanceof Error ? error.message : "Некорректный массив.", nodeId, modifier.id); }
+          const key = stable([stage.key, modifier.id, modifier.kind, modifier.version, modifier.order, modifier.parameters]);
+          const hit = this.read(key);
+          if (hit) { stage = hit; progress?.(stage); continue; }
+          let output;
+          try { output = await evaluateArray(stage.mesh, params, ctx.signal); }
+          catch (error) { throw new EvaluationFailure(error instanceof ArrayError ? error.code : "WORKER_FAILED", error instanceof Error ? error.message : "Ошибка массива.", nodeId, modifier.id); }
+          this.check(ctx.signal, ctx.epoch);
+          this.checkProject(ctx, nodeId);
+          validateMesh(output, stage.empty);
+          stage = { ...stage, mesh: output, key, applied: [...stage.applied, modifier.id] };
+          this.write(stage); progress?.(stage);
+          continue;
+        }
         if (modifier.kind !== "boolean") throw new EvaluationFailure("UNSUPPORTED_MODIFIER", `Модификатор ${modifier.kind} пока не поддерживается.`, nodeId, modifier.id);
         const params = booleanParameters(modifier);
         if (params.cutterNodeId === node.id) throw new EvaluationFailure("DEPENDENCY_CYCLE", "Boolean не может ссылаться на свой mesh.", nodeId, modifier.id);

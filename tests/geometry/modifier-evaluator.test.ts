@@ -28,6 +28,26 @@ function fake() {
 }
 
 describe("ModifierEvaluator", () => {
+  it("evaluates Array after Boolean and Boolean after Array in global order", async () => {
+    const p = fixture(), csg = fake(), evaluator = new ModifierEvaluator({ csg });
+    const boolean = add(p, "a", "bool", "b");
+    const array: Modifier = { id: "array", nodeId: "a", kind: "array", order: 1, enabled: true, version: 0, parameters: { mode: "linear", count: 3, axis: "x", step: 2, offset: [0, 0, 0] } };
+    p.modifiers.push(array); p.nodes.find(n => n.id === "a")!.modifierIds.push(array.id);
+    const first = await evaluator.evaluate(p, "a");
+    expect(first.ok && first.appliedModifierIds).toEqual(["bool", "array"]);
+    if (!first.ok) return;
+    expect(first.mesh.indices.length).toBe(csg.calls[0]!.target.mesh.indices.length * 3);
+    p.nodes.find(n => n.id === "a")!.modifierIds.reverse(); boolean.order = 1; array.order = 0;
+    const second = await evaluator.evaluate(p, "a");
+    expect(second.ok && second.appliedModifierIds).toEqual(["array", "bool"]);
+    expect(csg.calls[1]!.target.mesh.indices.length).toBe(csg.calls[0]!.target.mesh.indices.length * 3);
+    array.enabled = false;
+    const disabled = await evaluator.evaluate(p, "a");
+    expect(disabled.ok && disabled.appliedModifierIds).toEqual(["bool"]);
+    array.enabled = true; array.parameters.step = 3; array.version++;
+    await evaluator.evaluate(p, "a");
+    expect(csg.calls).toHaveLength(4);
+  });
   it("returns source geometry, leaves Project untouched and protects cached buffers", async () => {
     const p = fixture(), before = JSON.stringify(p), csg = fake(), evaluator = new ModifierEvaluator({ csg });
     const first = await evaluator.evaluate(p, "a");

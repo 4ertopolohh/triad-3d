@@ -1,5 +1,6 @@
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
+import { parseArrayParameters } from "../geometry/modifiers/array";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -160,6 +161,10 @@ export function validateProject(project: Project): ValidationIssue[] {
     for (const [name, value] of Object.entries(modifier.parameters)) {
       if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
       else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+    if (modifier.kind === "array") {
+      try { parseArrayParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры массива." }); }
     }
     if (modifier.kind === "boolean") {
       const params = modifier.parameters;

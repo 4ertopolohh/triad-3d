@@ -4,6 +4,7 @@ import type { DeepReadonly, EditorStore } from "../app/editor-store";
 import type { MeshNode, Project } from "../domain/types";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import { accessReason } from "./inspector-logic";
+import { ArrayAdd, ArrayItem } from "./ArrayEditor";
 
 const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
 type Operation = BooleanParameters["operation"];
@@ -24,7 +25,7 @@ export function BooleanEditor({ store, project, target, disabled, reason }: { st
     const outcome = await applyBooleanChange(store, change);
     setMessage(outcome.ok ? "Boolean применён." : `${outcome.error.code}: ${outcome.error.message}`);
   }
-  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier?.kind === "boolean");
+  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier !== undefined);
   return <section aria-label="Модификаторы" className="boolean-editor">
     <h4>Булевы операции</h4>
     <p className="panel-hint">Выберите второй замкнутый mesh. Геометрия резака остаётся редактируемой; результат пересчитывается при его перемещении.</p>
@@ -36,10 +37,12 @@ export function BooleanEditor({ store, project, target, disabled, reason }: { st
     <label className="boolean-check"><input type="checkbox" checked={hideCutter} disabled={disabled || !canHide} onChange={event => setHideCutter(event.target.checked)} />Скрыть резак после применения</label>
     {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
     <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
+    <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
     <h4>Стек модификаторов</h4>
-    {!stack.length && <p className="panel-hint">Булевых модификаторов пока нет.</p>}
+    {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
     {stack.map((modifier, index) => {
       if (!modifier) return null;
+      if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
       const params = modifier.parameters;
       const linked = project.nodes.find(node => node.id === params.cutterNodeId);
       return <div className="boolean-stack-item" key={modifier.id}>
