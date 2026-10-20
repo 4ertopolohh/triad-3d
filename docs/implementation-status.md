@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-021 — Modifier Graph Evaluator (MVP)
+
+- `src/geometry/modifiers/` evaluates primitive and locally resolved asset meshes through ordered Boolean stacks using the existing CSG service. Dependencies, hierarchy transforms, self and indirect cycles, invalid references and parameters receive typed diagnostics. Unsupported modifier kinds remain explicit errors.
+- Derived stages live only in a configurable byte-bounded LRU cache. Keys include source content, modifier identity/version/order/parameters, cutter stages and influencing world matrices. Results are copied at API boundaries. Errors can return the last valid stage as a marked fallback; cancellation and stale Project detection do not publish a result.
+- `SceneSync` still renders source geometry. Boolean UI, modifier editing commands, and general modifier algorithms remain later tasks. CSG output retains XYZ/triangles only; UV and material groups/slots are lost and normals need recomputation for display.
+
 ## TASK-018 — Inspector трансформаций и параметров примитивов
 
 - Правая панель показывает числовые Position/Rotation/Scale в local/world, mixed values, reset, видимость/блокировку и контекстную геометрию. Редактирование нескольких узлов проходит одной атомарной транзакцией; числовой ввод использует короткий preview debounce и один Undo-шаг на сеанс поля. Esc и отклонённый ввод удаляют предпросмотр и его запись истории через `cancelGesture`.

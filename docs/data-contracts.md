@@ -52,3 +52,9 @@ The earlier illustrative example used `formatVersion`, `projectId`, and `scene.m
 ## Error codes
 
 FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+
+## TASK-021 modifier evaluation
+
+Enabled Boolean modifiers use `parameters: { operation: "subtract" | "union" | "intersect", cutterNodeId: string }`. This fits the existing document v1 parameter map without a schema change. `node.modifierIds` defines stack order; the corresponding `Modifier.order` values must be strictly increasing.
+
+`ModifierEvaluator.evaluate(project, meshNodeId, signal?)` returns a discriminated success/error result with detached local-space `MeshData`, `empty`, CSG warnings, applied modifier IDs and an optional fallback after failure. Asset-backed meshes require a local `assetResolver` that supplies detached geometry and a content fingerprint. The evaluator never writes Project or history. It owns an in-memory, byte-bounded LRU stage cache; `clearCache()` and `dispose()` release cached buffers. A single evaluator accepts one active job at a time. Boolean uses `CsgService`; UV, authored normals, material groups and slots are not preserved by CSG. SceneSync is not yet connected to this service.

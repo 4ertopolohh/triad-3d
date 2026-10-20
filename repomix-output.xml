@@ -91,6 +91,14 @@ src/
     types.ts
     validate-project.ts
   geometry/
+    csg/
+      core.ts
+      csg.worker.ts
+      index.ts
+      prepare.ts
+      protocol.ts
+      service.ts
+      types.ts
     primitives.ts
     surface-query.ts
   importers/
@@ -106,9 +114,7 @@ src/
     csg/
       client.ts
       core.ts
-      csg.worker.ts
       CsgSpike.tsx
-      protocol.ts
     export/
       generate-tsx.ts
     renderer/
@@ -136,6 +142,8 @@ tests/
     benchmark.test.ts
     client.test.ts
     csg.test.ts
+    production.test.ts
+    service.test.ts
   domain/
     commands.test.ts
     hierarchy.test.ts
@@ -269,46 +277,6 @@ Why: Высокое качество preview и экспорт для обычн
 Decision: Draft/Quality/Final для редактора, Max/Balanced/Lite для экспорта.
 Consequences: Визуальная эквивалентность не обещается для всех эффектов.
 Alternatives: Единый quality toggle для всего.
-</file>
-
-<file path="docs/csg-feasibility.md">
-# TASK-003 — пригодность Manifold WASM для CSG
-
-## Проверенная конфигурация
-
-- Локальный Windows, Node/Vitest 5, TypeScript 5.9, Vite 8.3.4, Three 0.186.1, `manifold-3d` 3.5.4 (Apache-2.0). Пакет содержит `manifold.wasm`, JS и типы TS. Версия закреплена в lockfile.
-- Изолированный код: `src/spikes/csg/`. Dev-маршрут: `/?spike=csg`. Доменный документ и renderer spike не изменены.
-- Использованы документированные `Mesh`, `Mesh.merge()`, `Manifold`, `getMesh()`, `status()` и `delete()`. [API Manifold](https://github.com/elalish/manifold/blob/master/bindings/wasm/documents/bindings.md), [пример Three](https://github.com/elalish/manifold/blob/master/bindings/wasm/examples/three/three.ts).
-
-## Подтверждённые результаты
-
-- Subtract: тор и отдельный цилиндрический cutter, расположенный в теле тора поперёк трубки; исходное центральное отверстие не используется как свидетельство вычитания. Union и intersect: две пересекающиеся сферы. Все три операции вернули непустую сетку и `NoError` в Vitest.
-- Конвертер принимает indexed и non-indexed `BufferGeometry`, проверяет индексы, конечность координат и невырожденность треугольников. `Mesh.merge()` восстанавливает связь совпадающих позиций на швах, не меняя исходные буферы. Открытая сетка даёт структурированную ошибку `GEOMETRY_NON_MANIFOLD`; NaN и вырожденный треугольник отклоняются до WASM. Пересечение непересекающихся тел возвращает пустой результат со статусом `NoError`.
-- На выходе выполняется повторная проверка чисел, индексов и площади каждого треугольника. Сетка отображается через Three. Встроенный браузер фактически выполнил subtract в Worker (`NoError`, 4224 входных и 4232 выходных треугольника, 21.0 мс CSG) и отобразил результат. Узкий viewport ограничил визуальную оценку поверхности.
-- Клиент отменяет синхронную WASM-операцию через `Worker.terminate()`, отвергает текущий Promise с `JOB_CANCELLED` и создаёт новый Worker для следующего задания. Тест с управляемым Worker подтвердил отсутствие принятия позднего ответа и восстановление после отмены. В браузере на высокой детализации получен `JOB_CANCELLED`, затем повторное задание завершилось (`NoError`, 16640 → 16512 треугольников, 110.3 мс CSG). Точный момент отмены относительно входа в синхронный WASM-вызов инструментально не измерен.
-
-## Атрибуты и ограничения
-
-- Прототип передаёт в Manifold только XYZ. UV исходной развёртки **не сохраняются**; на новых cut-поверхностях UV также отсутствуют. Выходные нормали пересчитываются `computeVertexNormals()`; это пригодно для просмотра, но не гарантирует сохранение исходных жёстких граней и пользовательских нормалей. Заглушки UV не создаются.
-- `Mesh.merge()` — best effort; совпадение пространственных координат само по себе не доказывает корректную топологию. Входная ориентация треугольников должна быть согласованной: произвольное исправление winding не выполняется. Проверка закрытости поручена Manifold.
-- Каждый созданный объект Manifold удаляется в `finally`. Отмена уничтожает весь Worker и его WASM heap. Прямое измерение peak WASM/браузерной памяти не выполнено; производственный лимит памяти не установлен.
-- Отсутствует preservation материалов, UV, исходных нормалей и provenance по граням. Для TASK-020 нужны семантика атрибутов и материалов, протокол результата/ошибок и реальные браузерные cancel tests. TASK-021 потребует стабильной идентификации входов, порядка модификаторов и invalidation; данный spike этого не реализует.
-
-## Измерения
-
-Один прогон `npx vitest run tests/csg/benchmark.test.ts --reporter=verbose --silent=false` на этом Windows-хосте. Время `computeMs` включает вызов CSG и `status()`, но не конвертацию и валидацию. Это наблюдения, не гарантии.
-
-| Детализация | Входных треугольников | Выходных | CSG, мс | Статус |
-| --- | ---: | ---: | ---: | --- |
-| low | 1088 | 1104 | 15.6 | NoError |
-| medium | 4224 | 4232 | 12.4 | NoError |
-| high | 16640 | 16512 | 75.2 | NoError |
-
-Инициализация WASM отдельно: 17.7 мс. Разброс low/medium показывает влияние однократного прогрева и среды; нужны повторы для статистики. Потребление памяти не измерено.
-
-## Решение по ADR-003
-
-Manifold 3.5.4 пригоден как основа будущего CSG Worker для закрытых тел: реальные операции и базовая геометрическая валидация прошли, Vite dev-маршрут запущен. **ADR-003 остаётся PROPOSED** до проверки UV/материалов, отмены во время тяжёлого вычисления, устойчивости на сложных импортированных сетках и памяти. Блокирующей ошибки в проверенных простых телах нет; для production-интеграции эти риски существенны.
 </file>
 
 <file path="docs/implementation-plan.md">
@@ -4082,6 +4050,320 @@ export interface Keyframe {
 }
 </file>
 
+<file path="src/geometry/csg/core.ts">
+import Module, { type ManifoldToplevel } from "manifold-3d";
+import { BufferAttribute, BufferGeometry, CylinderGeometry, SphereGeometry, TorusGeometry } from "three";
+import { CsgError, type CsgOperand, type CsgOperation, type MeshData } from "./types";
+
+export type Operation = CsgOperation;
+export type Detail = "low" | "medium" | "high";
+export { CsgError, type MeshData } from "./types";
+
+// Defensive input cap, not a measured performance guarantee.
+export const MAX_CSG_INPUT_BYTES = 64 * 1024 * 1024;
+
+let initialized: Promise<ManifoldToplevel> | undefined;
+export function manifoldModule() {
+  return initialized ??= Module().then((api) => { api.setup(); return api; }).catch((error) => {
+    initialized = undefined;
+    throw new CsgError("WORKER_FAILED", `WASM initialization failed: ${String(error)}`);
+  });
+}
+
+export function fromThree(geometry: BufferGeometry): MeshData {
+  const position = geometry.getAttribute("position");
+  if (!position || position.itemSize !== 3) throw new CsgError("FILE_INVALID", "Ожидается атрибут position из трёх координат");
+  const positions = new Float32Array(position.count * 3);
+  for (let i = 0; i < position.count; i++) {
+    positions[i * 3] = position.getX(i);
+    positions[i * 3 + 1] = position.getY(i);
+    positions[i * 3 + 2] = position.getZ(i);
+  }
+  const sourceIndex = geometry.getIndex();
+  const indices = sourceIndex ? Uint32Array.from(sourceIndex.array) : Uint32Array.from({ length: position.count }, (_, i) => i);
+  const data = { positions, indices };
+  validateMesh(data);
+  return data;
+}
+
+/** Copies numeric data and records attribute availability without promising preservation. */
+export function operandFromThree(geometry: BufferGeometry, worldMatrix?: readonly number[]): CsgOperand {
+  const operand: CsgOperand = { mesh: fromThree(geometry), attributes: {
+    uv: geometry.hasAttribute("uv"), normals: geometry.hasAttribute("normal"),
+    materialGroups: geometry.groups.length > 0,
+    materialSlots: geometry.groups.length ? new Set(geometry.groups.map((group) => group.materialIndex)).size : 1,
+  } };
+  if (worldMatrix) operand.worldMatrix = [...worldMatrix];
+  return operand;
+}
+
+export function toThree(data: MeshData): BufferGeometry {
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(data.positions.slice(), 3));
+  geometry.setIndex(new BufferAttribute(data.indices.slice(), 1));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+export function validateMesh(data: MeshData, allowEmpty = false): void {
+  const { positions, indices } = data;
+  if (!(positions instanceof Float32Array) || !(indices instanceof Uint32Array)) throw new CsgError("FILE_INVALID", "Ожидаются Float32Array positions и Uint32Array indices");
+  if (positions.byteLength + indices.byteLength > MAX_CSG_INPUT_BYTES) throw new CsgError("RESOURCE_TOO_LARGE", "Буферы CSG превышают защитный лимит 64 MiB");
+  if (positions.length % 3 || indices.length % 3 || (!allowEmpty && !indices.length)) throw new CsgError("FILE_INVALID", "Некорректная длина буфера сетки");
+  if (positions.some((v) => !Number.isFinite(v))) throw new CsgError("FILE_INVALID", "Координаты содержат NaN или Infinity");
+  for (let i = 0; i < indices.length; i += 3) {
+    const a = indices[i]!, b = indices[i + 1]!, c = indices[i + 2]!;
+    if (a >= positions.length / 3 || b >= positions.length / 3 || c >= positions.length / 3) throw new CsgError("FILE_INVALID", "Индекс вне диапазона");
+    const ax = positions[3 * b]! - positions[3 * a]!, ay = positions[3 * b + 1]! - positions[3 * a + 1]!, az = positions[3 * b + 2]! - positions[3 * a + 2]!;
+    const bx = positions[3 * c]! - positions[3 * a]!, by = positions[3 * c + 1]! - positions[3 * a + 1]!, bz = positions[3 * c + 2]! - positions[3 * a + 2]!;
+    const x = ay * bz - az * by, y = az * bx - ax * bz, z = ax * by - ay * bx;
+    if (x * x + y * y + z * z < 1e-20) throw new CsgError("GEOMETRY_DEGENERATE", `Вырожденный треугольник ${i / 3}`);
+  }
+}
+
+export function makeInputs(operation: Operation, detail: Detail): [MeshData, MeshData] {
+  const segments = { low: 16, medium: 32, high: 64 }[detail];
+  const first = operation === "subtract"
+    ? new TorusGeometry(1.4, 0.48, segments, segments * 2)
+    : new SphereGeometry(1, segments * 2, segments);
+  const second = operation === "subtract"
+    ? new CylinderGeometry(0.27, 0.27, 1.5, segments, 1, false)
+    : new SphereGeometry(1, segments * 2, segments);
+  second.translate(operation === "subtract" ? 1.4 : 0.65, 0, 0);
+  if (operation === "subtract") second.rotateX(Math.PI / 2);
+  try { return [fromThree(first), fromThree(second)]; }
+  finally { first.dispose(); second.dispose(); }
+}
+
+export async function compute(operation: Operation, first: MeshData, second: MeshData) {
+  validateMesh(first); validateMesh(second);
+  const api = await manifoldModule();
+  const owned: InstanceType<typeof api.Manifold>[] = [];
+  try {
+    const importMesh = (data: MeshData) => {
+      const mesh = new api.Mesh({ numProp: 3, vertProperties: data.positions.slice(), triVerts: data.indices.slice() });
+      mesh.merge(); // Connect coincident seam vertices; Manifold still validates solid topology.
+      const solid = new api.Manifold(mesh);
+      owned.push(solid);
+      if (solid.status() !== "NoError" || solid.isEmpty()) throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold input: ${solid.status()}`);
+      return solid;
+    };
+    const sourceA = importMesh(first), sourceB = importMesh(second);
+    const a = sourceA.asOriginal(), b = sourceB.asOriginal();
+    owned.push(a, b);
+    const start = performance.now();
+    const result = operation === "subtract" ? a.subtract(b) : operation === "union" ? a.add(b) : a.intersect(b);
+    owned.push(result);
+    const status = result.status();
+    const computeMs = performance.now() - start;
+    if (status !== "NoError") throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold output: ${status}`);
+    const mesh = result.getMesh();
+    const output = { positions: new Float32Array(mesh.vertProperties), indices: new Uint32Array(mesh.triVerts) };
+    validateMesh(output, result.isEmpty());
+    const faceOrigins = new Uint8Array(output.indices.length / 3);
+    for (let run = 0; run < mesh.runOriginalID.length; run++) {
+      const id = mesh.runOriginalID[run];
+      if (id !== a.originalID() && id !== b.originalID()) throw new CsgError("WORKER_FAILED", "Unknown CSG face source");
+      const origin = id === a.originalID() ? 0 : operation === "subtract" && (mesh.runFlags[run]! & 1) ? 2 : 1;
+      for (let face = mesh.runIndex[run]! / 3; face < mesh.runIndex[run + 1]! / 3; face++) faceOrigins[face] = origin;
+    }
+    return { output, faceOrigins, status, computeMs, empty: result.isEmpty(), inputTriangles: (first.indices.length + second.indices.length) / 3, outputTriangles: output.indices.length / 3 };
+  } catch (error) {
+    if (error instanceof CsgError) throw error;
+    if (error instanceof Error && /^(Not manifold|Merge vectors wrong length)/i.test(error.message)) throw new CsgError("GEOMETRY_NON_MANIFOLD", error.message);
+    throw new CsgError("WORKER_FAILED", error instanceof Error ? error.message : String(error));
+  } finally { for (const item of owned.reverse()) item.delete(); }
+}
+</file>
+
+<file path="src/geometry/csg/csg.worker.ts">
+import { compute } from "./core";
+import { CsgError } from "./types";
+import type { WorkerRequest, WorkerResponse } from "./protocol";
+
+self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  const request = event.data;
+  try {
+    const computed = await compute(request.operation, request.first, request.second);
+    const response: WorkerResponse = { jobId: request.jobId, ok: true, result: {
+      jobId: request.jobId, output: computed.output, faceOrigins: computed.faceOrigins, coordinateSpace: "target-local", empty: computed.empty,
+      stats: { inputTriangles: computed.inputTriangles, outputTriangles: computed.outputTriangles, computeMs: computed.computeMs }, warnings: request.warnings,
+    } };
+    self.postMessage(response, { transfer: [computed.output.positions.buffer, computed.output.indices.buffer, computed.faceOrigins.buffer] });
+  } catch (error) {
+    const response: WorkerResponse = { jobId: request.jobId, ok: false, code: error instanceof CsgError ? error.code : "WORKER_FAILED", message: error instanceof Error ? error.message : String(error) };
+    self.postMessage(response);
+  }
+};
+</file>
+
+<file path="src/geometry/csg/index.ts">
+export { CsgService } from "./service";
+export { fromThree, operandFromThree, toThree, validateMesh, MAX_CSG_INPUT_BYTES } from "./core";
+export { prepareCsgRequest } from "./prepare";
+export { CsgError } from "./types";
+export type { CsgErrorCode, CsgOperand, CsgOperation, CsgRequest, CsgResult, CsgWarning, MeshData } from "./types";
+</file>
+
+<file path="src/geometry/csg/prepare.ts">
+import { Matrix4, Vector3 } from "three";
+import { validateMesh } from "./core";
+import { CsgError, type CsgOperand, type CsgRequest, type CsgWarning, type MeshData } from "./types";
+
+const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+function matrix(values?: readonly number[]): Matrix4 {
+  const elements = values ?? identity;
+  if (elements.length !== 16 || elements.some((n) => !Number.isFinite(n))) throw new CsgError("FILE_INVALID", "Некорректная матрица преобразования CSG");
+  const result = new Matrix4().fromArray(elements);
+  const det = result.determinant();
+  if (!Number.isFinite(det) || Math.abs(det) < 1e-12) throw new CsgError("GEOMETRY_DEGENERATE", "Вырожденная матрица преобразования CSG");
+  // Projective transforms are not supported by the solid mesh contract.
+  if (Math.abs(elements[3]!) > 1e-10 || Math.abs(elements[7]!) > 1e-10 || Math.abs(elements[11]!) > 1e-10 || Math.abs(elements[15]! - 1) > 1e-10)
+    throw new CsgError("FILE_INVALID", "Проективное преобразование CSG не поддерживается");
+  return result;
+}
+
+function transformed(source: MeshData, transform: Matrix4): MeshData {
+  const positions = source.positions.slice();
+  const indices = source.indices.slice();
+  const point = new Vector3();
+  for (let i = 0; i < positions.length; i += 3) {
+    point.set(positions[i]!, positions[i + 1]!, positions[i + 2]!).applyMatrix4(transform);
+    positions[i] = point.x; positions[i + 1] = point.y; positions[i + 2] = point.z;
+  }
+  if (transform.determinant() < 0) for (let i = 0; i < indices.length; i += 3) [indices[i + 1], indices[i + 2]] = [indices[i + 2]!, indices[i + 1]!];
+  const output = { positions, indices };
+  validateMesh(output);
+  return output;
+}
+
+function warnings(operands: CsgOperand[]): CsgWarning[] {
+  const result: CsgWarning[] = [];
+  if (operands.some((o) => o.attributes?.uv)) result.push({ code: "UV_DROPPED", message: "Исходные UV не переносятся на CSG-результат" });
+  if (operands.some((o) => o.attributes?.normals)) result.push({ code: "NORMALS_RECOMPUTED", message: "Авторские нормали не сохраняются; отображение может пересчитать их" });
+  if (operands.some((o) => o.attributes?.materialGroups || (o.attributes?.materialSlots ?? 0) > 1)) result.push({ code: "MATERIALS_DROPPED", message: "Группы и слоты материалов не сохраняются" });
+  return result;
+}
+
+export function prepareCsgRequest(request: CsgRequest) {
+  if (!request.jobId || !["subtract", "union", "intersect"].includes(request.operation)) throw new CsgError("FILE_INVALID", "Некорректное задание CSG");
+  validateMesh(request.target.mesh); validateMesh(request.cutter.mesh);
+  const targetWorld = matrix(request.target.worldMatrix);
+  const cutterWorld = matrix(request.cutter.worldMatrix);
+  const relative = targetWorld.clone().invert().multiply(cutterWorld);
+  if (!Number.isFinite(relative.determinant()) || Math.abs(relative.determinant()) < 1e-12) throw new CsgError("GEOMETRY_DEGENERATE", "Недопустимое относительное преобразование CSG");
+  return { jobId: request.jobId, operation: request.operation, first: { positions: request.target.mesh.positions.slice(), indices: request.target.mesh.indices.slice() }, second: transformed(request.cutter.mesh, relative), warnings: warnings([request.target, request.cutter]) };
+}
+</file>
+
+<file path="src/geometry/csg/protocol.ts">
+import type { CsgErrorCode, CsgOperation, CsgResult, CsgWarning, MeshData } from "./types";
+export type WorkerRequest = { jobId: string; operation: CsgOperation; first: MeshData; second: MeshData; warnings: CsgWarning[] };
+export type WorkerResponse = { jobId: string; ok: true; result: CsgResult } | { jobId: string; ok: false; code: CsgErrorCode; message: string };
+</file>
+
+<file path="src/geometry/csg/service.ts">
+import { MAX_CSG_INPUT_BYTES, validateMesh } from "./core";
+import { prepareCsgRequest } from "./prepare";
+import { CsgError, type CsgErrorCode, type CsgRequest, type CsgResult } from "./types";
+import type { WorkerResponse } from "./protocol";
+
+export class CsgService {
+  private active: { worker: Worker; jobId: string; reject: (error: CsgError) => void; cleanup: () => void } | undefined;
+  private disposed = false;
+
+  run(request: CsgRequest, signal?: AbortSignal): Promise<CsgResult> {
+    if (this.disposed) return Promise.reject(new CsgError("WORKER_FAILED", "CSG service disposed"));
+    if (this.active) return Promise.reject(new CsgError("JOB_BUSY", "CSG job already running"));
+    if (signal?.aborted) return Promise.reject(new CsgError("JOB_CANCELLED", "Вычисление отменено"));
+    let prepared: ReturnType<typeof prepareCsgRequest>;
+    try { prepared = prepareCsgRequest(request); }
+    catch (error) { return Promise.reject(error); }
+    const inputBytes = prepared.first.positions.byteLength + prepared.first.indices.byteLength + prepared.second.positions.byteLength + prepared.second.indices.byteLength;
+    if (inputBytes > MAX_CSG_INPUT_BYTES) return Promise.reject(new CsgError("RESOURCE_TOO_LARGE", "Общий объём буферов CSG превышает защитный лимит 64 MiB"));
+    let worker: Worker;
+    try { worker = new Worker(new URL("./csg.worker.ts", import.meta.url), { type: "module" }); }
+    catch (error) { return Promise.reject(new CsgError("WORKER_FAILED", String(error))); }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      // A silent worker exit has no reliable browser event. This is a liveness guard, not a compute budget.
+      const watchdog = setTimeout(() => fail(new CsgError("WORKER_FAILED", "CSG worker stopped responding")), 5 * 60 * 1000);
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(watchdog);
+        signal?.removeEventListener("abort", abort);
+        worker.onmessage = null; worker.onerror = null; worker.onmessageerror = null;
+        worker.terminate();
+        if (this.active?.worker === worker) this.active = undefined;
+      };
+      const fail = (error: CsgError) => { cleanup(); reject(error); };
+      const abort = () => fail(new CsgError("JOB_CANCELLED", "Вычисление отменено"));
+      this.active = { worker, jobId: request.jobId, reject: fail, cleanup };
+      signal?.addEventListener("abort", abort, { once: true });
+      worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+        if (this.active?.worker !== worker) return;
+        const response = event.data;
+        if (!response || typeof response.jobId !== "string") { fail(new CsgError("WORKER_FAILED", "Malformed CSG worker response")); return; }
+        if (response.jobId !== request.jobId) { fail(new CsgError("WORKER_FAILED", "Unexpected CSG worker jobId")); return; }
+        if (typeof response.ok !== "boolean") { fail(new CsgError("WORKER_FAILED", "Malformed CSG worker response")); return; }
+        if (!response.ok) {
+          const codes: CsgErrorCode[] = ["FILE_INVALID", "GEOMETRY_NON_MANIFOLD", "GEOMETRY_DEGENERATE", "RESOURCE_TOO_LARGE", "JOB_CANCELLED", "WORKER_FAILED", "JOB_BUSY"];
+          if (!codes.includes(response.code) || typeof response.message !== "string") fail(new CsgError("WORKER_FAILED", "Malformed CSG worker error"));
+          else fail(new CsgError(response.code, response.message));
+          return;
+        }
+        try {
+          if (response.result?.jobId !== request.jobId || response.result.coordinateSpace !== "target-local") throw new Error("Invalid result contract");
+          validateMesh(response.result.output, response.result.empty);
+          if (!(response.result.faceOrigins instanceof Uint8Array) || response.result.faceOrigins.length !== response.result.output.indices.length / 3 || response.result.faceOrigins.some((value) => value > 2)) throw new Error("Invalid face provenance");
+          if (response.result.empty !== (response.result.output.indices.length === 0)) throw new Error("Invalid empty result");
+          cleanup(); resolve(response.result);
+        } catch (error) { fail(new CsgError("WORKER_FAILED", `Malformed CSG result: ${String(error)}`)); }
+      };
+      worker.onerror = (event) => fail(new CsgError("WORKER_FAILED", event.message || "CSG worker failed"));
+      worker.onmessageerror = () => fail(new CsgError("WORKER_FAILED", "CSG worker message decoding failed"));
+      try { worker.postMessage(prepared, [prepared.first.positions.buffer, prepared.first.indices.buffer, prepared.second.positions.buffer, prepared.second.indices.buffer]); }
+      catch (error) { fail(new CsgError("WORKER_FAILED", `CSG worker dispatch failed: ${String(error)}`)); }
+    });
+  }
+
+  cancel(jobId?: string): void {
+    if (this.active && (!jobId || this.active.jobId === jobId)) this.active.reject(new CsgError("JOB_CANCELLED", "Вычисление отменено"));
+  }
+  dispose(): void { this.disposed = true; this.cancel(); }
+}
+</file>
+
+<file path="src/geometry/csg/types.ts">
+export type CsgOperation = "subtract" | "union" | "intersect";
+export type MeshData = { positions: Float32Array; indices: Uint32Array };
+export type CsgErrorCode = "FILE_INVALID" | "GEOMETRY_NON_MANIFOLD" | "GEOMETRY_DEGENERATE" | "RESOURCE_TOO_LARGE" | "JOB_CANCELLED" | "WORKER_FAILED" | "JOB_BUSY";
+export class CsgError extends Error {
+  constructor(public readonly code: CsgErrorCode, message: string) { super(`${code}: ${message}`); this.name = "CsgError"; }
+}
+
+/** Column-major local-to-world matrices. The result is always in target local coordinates. */
+export type CsgOperand = {
+  mesh: MeshData;
+  worldMatrix?: readonly number[];
+  attributes?: { uv?: boolean; normals?: boolean; materialGroups?: boolean; materialSlots?: number };
+};
+export type CsgRequest = { jobId: string; operation: CsgOperation; target: CsgOperand; cutter: CsgOperand };
+export type CsgWarning = { code: "UV_DROPPED" | "NORMALS_RECOMPUTED" | "MATERIALS_DROPPED"; message: string };
+export type CsgResult = {
+  jobId: string;
+  /** XYZ and triangles only. No UV, normals, material groups, or face provenance. */
+  output: MeshData;
+  /** Per output triangle: 0 target surface, 1 cutter surface, 2 new subtract cut surface. */
+  faceOrigins: Uint8Array;
+  coordinateSpace: "target-local";
+  empty: boolean;
+  stats: { inputTriangles: number; outputTriangles: number; computeMs: number };
+  warnings: CsgWarning[];
+};
+</file>
+
 <file path="src/geometry/primitives.ts">
 import type { MeshNode, MeshSource } from "../domain/types";
 
@@ -4368,247 +4650,6 @@ export class SurfaceQuery {
     this.active = false;
   }
 }
-</file>
-
-<file path="src/spikes/csg/client.ts">
-import type { MeshData, Operation } from "./core";
-import type { Request, Response } from "./protocol";
-
-export class CsgClient {
-  private worker: Worker | undefined;
-  private sequence = 0;
-  private rejectPending: ((error: Error) => void) | undefined;
-
-  run(operation: Operation, first: MeshData, second: MeshData): Promise<Response & { ok: true }> {
-    this.cancel();
-    const id = ++this.sequence;
-    const worker = new Worker(new URL("./csg.worker.ts", import.meta.url), { type: "module" });
-    this.worker = worker;
-    return new Promise((resolve, reject) => {
-      this.rejectPending = reject;
-      worker.onmessage = (event: MessageEvent<Response>) => {
-        if (this.worker !== worker || event.data.id !== id) return;
-        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
-        if (event.data.ok) resolve(event.data);
-        else reject(new Error(`${event.data.code}: ${event.data.message}`));
-      };
-      worker.onerror = (event) => {
-        if (this.worker !== worker) return;
-        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
-        reject(new Error(event.message));
-      };
-      const request: Request = { id, operation, first, second };
-      worker.postMessage(request); // structured clone preserves caller-owned buffers
-    });
-  }
-
-  cancel() {
-    ++this.sequence;
-    this.worker?.terminate();
-    this.worker = undefined;
-    this.rejectPending?.(new Error("JOB_CANCELLED: Вычисление отменено"));
-    this.rejectPending = undefined;
-  }
-
-  dispose() { this.cancel(); }
-}
-</file>
-
-<file path="src/spikes/csg/core.ts">
-import Module, { type ManifoldToplevel } from "manifold-3d";
-import { BufferAttribute, BufferGeometry, CylinderGeometry, SphereGeometry, TorusGeometry } from "three";
-
-export type Operation = "subtract" | "union" | "intersect";
-export type Detail = "low" | "medium" | "high";
-export type MeshData = { positions: Float32Array; indices: Uint32Array };
-export type CsgErrorCode = "GEOMETRY_NON_MANIFOLD" | "GEOMETRY_DEGENERATE" | "FILE_INVALID" | "JOB_CANCELLED";
-export class CsgError extends Error {
-  constructor(public readonly code: CsgErrorCode, message: string) { super(message); }
-}
-
-let initialized: Promise<ManifoldToplevel> | undefined;
-export function manifoldModule() {
-  return initialized ??= Module().then((api) => { api.setup(); return api; });
-}
-
-export function fromThree(geometry: BufferGeometry): MeshData {
-  const position = geometry.getAttribute("position");
-  if (!position || position.itemSize !== 3) throw new CsgError("FILE_INVALID", "Ожидается атрибут position из трёх координат");
-  const positions = new Float32Array(position.count * 3);
-  for (let i = 0; i < position.count; i++) {
-    positions[i * 3] = position.getX(i);
-    positions[i * 3 + 1] = position.getY(i);
-    positions[i * 3 + 2] = position.getZ(i);
-  }
-  const sourceIndex = geometry.getIndex();
-  const indices = sourceIndex ? Uint32Array.from(sourceIndex.array) : Uint32Array.from({ length: position.count }, (_, i) => i);
-  const data = { positions, indices };
-  validateMesh(data);
-  return data;
-}
-
-export function toThree(data: MeshData): BufferGeometry {
-  const geometry = new BufferGeometry();
-  geometry.setAttribute("position", new BufferAttribute(data.positions.slice(), 3));
-  geometry.setIndex(new BufferAttribute(data.indices.slice(), 1));
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-export function validateMesh(data: MeshData, allowEmpty = false): void {
-  const { positions, indices } = data;
-  if (positions.length % 3 || indices.length % 3 || (!allowEmpty && !indices.length)) throw new CsgError("FILE_INVALID", "Некорректная длина буфера сетки");
-  if (positions.some((v) => !Number.isFinite(v))) throw new CsgError("FILE_INVALID", "Координаты содержат NaN или Infinity");
-  for (let i = 0; i < indices.length; i += 3) {
-    const a = indices[i]!, b = indices[i + 1]!, c = indices[i + 2]!;
-    if (a >= positions.length / 3 || b >= positions.length / 3 || c >= positions.length / 3) throw new CsgError("FILE_INVALID", "Индекс вне диапазона");
-    const ax = positions[3 * b]! - positions[3 * a]!, ay = positions[3 * b + 1]! - positions[3 * a + 1]!, az = positions[3 * b + 2]! - positions[3 * a + 2]!;
-    const bx = positions[3 * c]! - positions[3 * a]!, by = positions[3 * c + 1]! - positions[3 * a + 1]!, bz = positions[3 * c + 2]! - positions[3 * a + 2]!;
-    const x = ay * bz - az * by, y = az * bx - ax * bz, z = ax * by - ay * bx;
-    if (x * x + y * y + z * z < 1e-20) throw new CsgError("GEOMETRY_DEGENERATE", `Вырожденный треугольник ${i / 3}`);
-  }
-}
-
-export function makeInputs(operation: Operation, detail: Detail): [MeshData, MeshData] {
-  const segments = { low: 16, medium: 32, high: 64 }[detail];
-  const first = operation === "subtract"
-    ? new TorusGeometry(1.4, 0.48, segments, segments * 2)
-    : new SphereGeometry(1, segments * 2, segments);
-  const second = operation === "subtract"
-    ? new CylinderGeometry(0.27, 0.27, 1.5, segments, 1, false)
-    : new SphereGeometry(1, segments * 2, segments);
-  second.translate(operation === "subtract" ? 1.4 : 0.65, 0, 0);
-  if (operation === "subtract") second.rotateX(Math.PI / 2);
-  try { return [fromThree(first), fromThree(second)]; }
-  finally { first.dispose(); second.dispose(); }
-}
-
-export async function compute(operation: Operation, first: MeshData, second: MeshData) {
-  validateMesh(first); validateMesh(second);
-  const api = await manifoldModule();
-  const owned: InstanceType<typeof api.Manifold>[] = [];
-  try {
-    const importMesh = (data: MeshData) => {
-      const mesh = new api.Mesh({ numProp: 3, vertProperties: data.positions.slice(), triVerts: data.indices.slice() });
-      mesh.merge(); // Weld only coincident open-edge positions; no source attributes are altered.
-      const solid = new api.Manifold(mesh);
-      owned.push(solid);
-      if (solid.status() !== "NoError" || solid.isEmpty()) throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold input: ${solid.status()}`);
-      return solid;
-    };
-    const a = importMesh(first), b = importMesh(second);
-    const start = performance.now();
-    const result = operation === "subtract" ? a.subtract(b) : operation === "union" ? a.add(b) : a.intersect(b);
-    owned.push(result);
-    const status = result.status();
-    const computeMs = performance.now() - start;
-    if (status !== "NoError") throw new CsgError("GEOMETRY_NON_MANIFOLD", `Manifold output: ${status}`);
-    const mesh = result.getMesh();
-    const output = { positions: new Float32Array(mesh.vertProperties), indices: new Uint32Array(mesh.triVerts) };
-    validateMesh(output, result.isEmpty());
-    return { output, status, computeMs, empty: result.isEmpty(), inputTriangles: (first.indices.length + second.indices.length) / 3, outputTriangles: output.indices.length / 3 };
-  } catch (error) {
-    if (error instanceof CsgError) throw error;
-    throw new CsgError("GEOMETRY_NON_MANIFOLD", error instanceof Error ? error.message : String(error));
-  } finally { for (const item of owned.reverse()) item.delete(); }
-}
-</file>
-
-<file path="src/spikes/csg/csg.worker.ts">
-import { compute, CsgError } from "./core";
-import type { Request, Response } from "./protocol";
-
-self.onmessage = async (event: MessageEvent<Request>) => {
-  const { id, operation, first, second } = event.data;
-  try {
-    const result = await compute(operation, first, second);
-    const response: Response = { id, ok: true, result };
-    self.postMessage(response, { transfer: [result.output.positions.buffer, result.output.indices.buffer] });
-  } catch (error) {
-    const response: Response = { id, ok: false, code: error instanceof CsgError ? error.code : "FILE_INVALID", message: error instanceof Error ? error.message : String(error) };
-    self.postMessage(response);
-  }
-};
-</file>
-
-<file path="src/spikes/csg/CsgSpike.tsx">
-import { useEffect, useRef, useState } from "react";
-import { AmbientLight, Color, DirectionalLight, DoubleSide, Mesh, MeshStandardMaterial, PerspectiveCamera, Scene, WebGLRenderer } from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { CsgClient } from "./client";
-import { makeInputs, toThree, type Detail, type MeshData, type Operation } from "./core";
-
-export default function CsgSpike() {
-  const mount = useRef<HTMLDivElement>(null);
-  const client = useRef(new CsgClient());
-  const [operation, setOperation] = useState<Operation>("subtract");
-  const [detail, setDetail] = useState<Detail>("medium");
-  const [view, setView] = useState<"input" | "result">("result");
-  const [data, setData] = useState<{ inputs: [MeshData, MeshData]; output: MeshData; metrics: string }>();
-  const [status, setStatus] = useState("Готово к запуску");
-
-  useEffect(() => () => client.current.dispose(), []);
-  useEffect(() => {
-    const host = mount.current;
-    if (!host) return;
-    const renderer = new WebGLRenderer({ antialias: true });
-    renderer.setSize(host.clientWidth, 480);
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    host.appendChild(renderer.domElement);
-    const scene = new Scene(); scene.background = new Color("#141a24");
-    const camera = new PerspectiveCamera(45, host.clientWidth / 480, 0.1, 100);
-    camera.position.set(3.5, 3, 5);
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    scene.add(new AmbientLight("white", 1.8));
-    const light = new DirectionalLight("white", 3); light.position.set(3, 4, 6); scene.add(light);
-    const meshes: Mesh[] = [];
-    const add = (meshData: MeshData, color: string, opacity = 1) => {
-      const mesh = new Mesh(toThree(meshData), new MeshStandardMaterial({ color, metalness: 0.25, roughness: 0.35, transparent: opacity < 1, opacity, side: DoubleSide }));
-      scene.add(mesh); meshes.push(mesh);
-    };
-    if (data) {
-      if (view === "result") add(data.output, "#65d8e5");
-      else { add(data.inputs[0], "#73a7fa", 0.68); add(data.inputs[1], "#f5a75c", 0.68); }
-    }
-    let frame = 0;
-    const animate = () => { frame = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); };
-    animate();
-    return () => { cancelAnimationFrame(frame); controls.dispose(); for (const mesh of meshes) { mesh.geometry.dispose(); (mesh.material as MeshStandardMaterial).dispose(); } renderer.dispose(); renderer.domElement.remove(); };
-  }, [data, view]);
-
-  async function run() {
-    const inputs = makeInputs(operation, detail);
-    setStatus("Вычисление…");
-    try {
-      const response = await client.current.run(operation, ...inputs);
-      const result = response.result;
-      setData({ inputs, output: result.output, metrics: `Вход: ${result.inputTriangles} треугольников · Выход: ${result.outputTriangles} · CSG: ${result.computeMs.toFixed(1)} мс · ${result.status}` });
-      setStatus(result.empty ? "Пустое пересечение" : "Готово");
-    } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); }
-  }
-
-  return <main style={{ padding: 24, color: "#e8eef6", background: "#141a24", minHeight: "100vh", fontFamily: "sans-serif" }}>
-    <h1>CSG · TASK-003</h1>
-    <p>Эксперимент Manifold WASM. Вращайте камеру мышью.</p>
-    <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
-      <select aria-label="Операция" value={operation} onChange={(event) => setOperation(event.target.value as Operation)}><option value="subtract">Вычитание</option><option value="union">Объединение</option><option value="intersect">Пересечение</option></select>
-      <select aria-label="Детализация" value={detail} onChange={(event) => setDetail(event.target.value as Detail)}><option value="low">Низкая</option><option value="medium">Средняя</option><option value="high">Высокая</option></select>
-      <button onClick={run}>Запустить</button><button onClick={() => { client.current.cancel(); setStatus("JOB_CANCELLED: Вычисление отменено"); }}>Отменить</button>
-      <button onClick={() => setView(view === "input" ? "result" : "input")}>Показать {view === "input" ? "результат" : "исходные тела"}</button>
-    </div>
-    <div ref={mount} style={{ width: "100%", maxWidth: 1000, height: 480 }} />
-    <p>{status}</p><p>{data?.metrics}</p>
-  </main>;
-}
-</file>
-
-<file path="src/spikes/csg/protocol.ts">
-import type { MeshData, Operation } from "./core";
-export type Request = { id: number; operation: Operation; first: MeshData; second: MeshData };
-export type Response =
-  | { id: number; ok: true; result: Awaited<ReturnType<typeof import("./core").compute>> }
-  | { id: number; ok: false; code: string; message: string };
 </file>
 
 <file path="src/spikes/export/generate-tsx.ts">
@@ -5815,46 +5856,6 @@ it("records repeatable CSG measurements", async () => {
 });
 </file>
 
-<file path="tests/csg/client.test.ts">
-import { afterEach, expect, it, vi } from "vitest";
-import { CsgClient } from "../../src/spikes/csg/client";
-import { makeInputs } from "../../src/spikes/csg/core";
-import type { Response } from "../../src/spikes/csg/protocol";
-
-class FakeWorker {
-  static all: FakeWorker[] = [];
-  onmessage: ((event: MessageEvent<Response>) => void) | null = null;
-  onerror: ((event: ErrorEvent) => void) | null = null;
-  terminated = false;
-  requestId = 0;
-  constructor() { FakeWorker.all.push(this); }
-  postMessage(request: { id: number }) { this.requestId = request.id; }
-  terminate() { this.terminated = true; }
-  respond() { this.onmessage?.({ data: { id: this.requestId, ok: true, result: { output: { positions: new Float32Array(), indices: new Uint32Array() }, status: "NoError", computeMs: 0, empty: true, inputTriangles: 0, outputTriangles: 0 } } } as MessageEvent<Response>); }
-}
-
-afterEach(() => { vi.unstubAllGlobals(); FakeWorker.all = []; });
-
-it("cancels the active worker, ignores late results and runs again", async () => {
-  vi.stubGlobal("Worker", FakeWorker);
-  const client = new CsgClient();
-  const [a, b] = makeInputs("union", "low");
-  const snapshot = a.positions.slice();
-  const pending = client.run("union", a, b);
-  const old = FakeWorker.all[0]!;
-  client.cancel();
-  await expect(pending).rejects.toThrow("JOB_CANCELLED");
-  expect(old.terminated).toBe(true);
-  const next = client.run("union", a, b);
-  old.respond();
-  const current = FakeWorker.all[1]!;
-  current.respond();
-  await expect(next).resolves.toMatchObject({ ok: true });
-  expect(a.positions).toEqual(snapshot);
-  client.dispose();
-});
-</file>
-
 <file path="tests/csg/csg.test.ts">
 import { describe, expect, it } from "vitest";
 import { BufferGeometry, Float32BufferAttribute, TorusGeometry } from "three";
@@ -5905,6 +5906,185 @@ describe("Manifold CSG spike", () => {
     expect(result.empty).toBe(true);
     expect(result.outputTriangles).toBe(0);
   });
+});
+</file>
+
+<file path="tests/csg/production.test.ts">
+import { describe, expect, it } from "vitest";
+import { BoxGeometry, Matrix4, SphereGeometry, TorusGeometry } from "three";
+import { compute, makeInputs, manifoldModule } from "../../src/geometry/csg/core";
+import { fromThree, operandFromThree, prepareCsgRequest, validateMesh } from "../../src/geometry/csg";
+import type { MeshData } from "../../src/geometry/csg";
+
+async function volume(mesh: MeshData) {
+  const api = await manifoldModule();
+  const input = new api.Mesh({ numProp: 3, vertProperties: mesh.positions.slice(), triVerts: mesh.indices.slice() });
+  input.merge();
+  const solid = new api.Manifold(input);
+  try { return solid.volume(); } finally { solid.delete(); }
+}
+
+describe("production CSG geometry", () => {
+  it("cuts the torus body and is repeatable", async () => {
+    const [torus, cutter] = makeInputs("subtract", "low");
+    const before = await volume(torus);
+    const first = await compute("subtract", torus, cutter);
+    const again = await compute("subtract", torus, cutter);
+    expect(first.empty).toBe(false);
+    expect(await volume(first.output)).toBeLessThan(before - 0.01);
+    expect(first.faceOrigins).toContain(2);
+    expect(first.output.positions).toEqual(again.output.positions);
+    expect(first.output.indices).toEqual(again.output.indices);
+  });
+
+  it("unions and intersects overlapping solids with expected volumes", async () => {
+    const [a, b] = makeInputs("union", "low");
+    const va = await volume(a), vb = await volume(b);
+    const union = await compute("union", a, b);
+    const intersection = await compute("intersect", a, b);
+    const vu = await volume(union.output), vi = await volume(intersection.output);
+    expect(vi).toBeGreaterThan(0.1);
+    expect(vi).toBeLessThan(Math.min(va, vb));
+    expect(vu).toBeGreaterThan(Math.max(va, vb));
+    expect(vu).toBeCloseTo(va + vb - vi, 2);
+  });
+
+  it("applies cutter world transform into target local space without mutating inputs", async () => {
+    const targetGeometry = new BoxGeometry(2, 2, 2);
+    const cutterGeometry = new SphereGeometry(0.6, 16, 12);
+    const target = operandFromThree(targetGeometry, Array.from(new Matrix4().makeTranslation(5, 0, 0).elements));
+    const cutter = operandFromThree(cutterGeometry, Array.from(new Matrix4().makeTranslation(5.8, 0, 0).elements));
+    const original = cutter.mesh.positions.slice();
+    const prepared = prepareCsgRequest({ jobId: "transformed", operation: "subtract", target, cutter });
+    const result = await compute(prepared.operation, prepared.first, prepared.second);
+    expect(await volume(result.output)).toBeLessThan(await volume(target.mesh) - 0.05);
+    expect(cutter.mesh.positions).toEqual(original);
+    expect(prepared.warnings.map((warning) => warning.code)).toContain("UV_DROPPED");
+    expect(prepared.warnings.map((warning) => warning.code)).toContain("NORMALS_RECOMPUTED");
+    expect(target.attributes?.materialGroups).toBe(true);
+    expect(prepared.warnings.map((warning) => warning.code)).toContain("MATERIALS_DROPPED");
+    expect(result.faceOrigins.length).toBe(result.output.indices.length / 3);
+    expect(result.output).toEqual({ positions: result.output.positions, indices: result.output.indices });
+    targetGeometry.dispose(); cutterGeometry.dispose();
+  });
+
+  it("rejects invalid transforms, indices, coordinates, and oversized buffers", () => {
+    const [a, b] = makeInputs("union", "low");
+    const base = { jobId: "bad", operation: "union" as const, target: { mesh: a }, cutter: { mesh: b } };
+    expect(() => prepareCsgRequest({ ...base, cutter: { mesh: b, worldMatrix: Array(16).fill(0) } })).toThrowError(/GEOMETRY_DEGENERATE/);
+    expect(() => prepareCsgRequest({ ...base, cutter: { mesh: b, worldMatrix: Array(16).fill(Infinity) } })).toThrowError(/FILE_INVALID/);
+    const invalid = { positions: a.positions.slice(), indices: a.indices.slice() };
+    invalid.indices[0] = invalid.positions.length;
+    expect(() => validateMesh(invalid)).toThrowError(/FILE_INVALID/);
+    invalid.indices[0] = a.indices[0]!; invalid.positions[0] = Infinity;
+    expect(() => validateMesh(invalid)).toThrowError(/FILE_INVALID/);
+    expect(() => validateMesh({ positions: new Float32Array(17_000_000), indices: new Uint32Array([0, 1, 2]) })).toThrowError(/RESOURCE_TOO_LARGE/);
+  });
+
+  it("reverses winding for a reflected cutter transform", async () => {
+    const targetGeometry = new BoxGeometry(2, 2, 2);
+    const cutterGeometry = new BoxGeometry(1, 1, 1);
+    const target = operandFromThree(targetGeometry);
+    const cutter = operandFromThree(cutterGeometry, Array.from(new Matrix4().makeScale(-1, 1, 1).elements));
+    const originalIndices = cutter.mesh.indices.slice();
+    const prepared = prepareCsgRequest({ jobId: "mirror", operation: "subtract", target, cutter });
+    expect(prepared.second.indices[1]).toBe(originalIndices[2]);
+    const result = await compute("subtract", prepared.first, prepared.second);
+    expect(result.empty).toBe(false);
+    expect(await volume(result.output)).toBeLessThan(await volume(target.mesh));
+    expect(cutter.mesh.indices).toEqual(originalIndices);
+    targetGeometry.dispose(); cutterGeometry.dispose();
+  });
+
+  it("computes a non-indexed closed mesh and leaves failed inputs intact", async () => {
+    const indexed = new TorusGeometry(1.4, 0.48, 12, 24);
+    const nonIndexed = indexed.toNonIndexed();
+    const source = fromThree(nonIndexed);
+    const [, cutter] = makeInputs("subtract", "low");
+    const result = await compute("subtract", source, cutter);
+    expect(result.empty).toBe(false);
+    const bad = { positions: source.positions.slice(), indices: source.indices.slice() };
+    bad.indices[1] = bad.indices[0]!;
+    const snapshot = bad.positions.slice();
+    await expect(compute("subtract", bad, cutter)).rejects.toMatchObject({ code: "GEOMETRY_DEGENERATE" });
+    expect(bad.positions).toEqual(snapshot);
+    indexed.dispose(); nonIndexed.dispose();
+  });
+});
+</file>
+
+<file path="tests/csg/service.test.ts">
+import { afterEach, expect, it, vi } from "vitest";
+import { CsgService } from "../../src/geometry/csg";
+import { makeInputs } from "../../src/geometry/csg/core";
+import type { WorkerResponse } from "../../src/geometry/csg/protocol";
+
+class FakeWorker {
+  static all: FakeWorker[] = [];
+  onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  onmessageerror: (() => void) | null = null;
+  terminated = false;
+  requestId = "";
+  constructor() { FakeWorker.all.push(this); }
+  postMessage(request: { jobId: string }, transfer: ArrayBuffer[]) { this.requestId = request.jobId; expect(transfer).toHaveLength(4); }
+  terminate() { this.terminated = true; }
+  respond(data: unknown) { this.onmessage?.({ data } as MessageEvent<WorkerResponse>); }
+  success() { this.respond({ jobId: this.requestId, ok: true, result: { jobId: this.requestId, coordinateSpace: "target-local", empty: true, output: { positions: new Float32Array(), indices: new Uint32Array() }, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] } }); }
+}
+
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); FakeWorker.all = []; });
+
+function fixture(id: string) {
+  const [a, b] = makeInputs("union", "low");
+  return { jobId: id, operation: "union" as const, target: { mesh: a }, cutter: { mesh: b } };
+}
+
+it("refuses concurrent work, cancels by signal, ignores late responses and retries", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const service = new CsgService();
+  const request = fixture("one");
+  const source = request.target.mesh.positions.slice();
+  const abort = new AbortController();
+  const pending = service.run(request, abort.signal);
+  await expect(service.run(fixture("two"))).rejects.toMatchObject({ code: "JOB_BUSY" });
+  const old = FakeWorker.all[0]!;
+  abort.abort();
+  await expect(pending).rejects.toMatchObject({ code: "JOB_CANCELLED" });
+  expect(old.terminated).toBe(true);
+  const next = service.run(fixture("two"));
+  old.success();
+  FakeWorker.all[1]!.success();
+  await expect(next).resolves.toMatchObject({ jobId: "two", empty: true });
+  expect(request.target.mesh.positions).toEqual(source);
+  service.dispose();
+});
+
+it("rejects malformed responses and Worker errors without leaving the service busy", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const service = new CsgService();
+  const first = service.run(fixture("bad"));
+  FakeWorker.all[0]!.respond({ nonsense: true });
+  await expect(first).rejects.toMatchObject({ code: "WORKER_FAILED" });
+  const second = service.run(fixture("error"));
+  FakeWorker.all[1]!.onerror?.({ message: "crash" } as ErrorEvent);
+  await expect(second).rejects.toMatchObject({ code: "WORKER_FAILED" });
+  const third = service.run(fixture("dispose"));
+  service.dispose();
+  await expect(third).rejects.toMatchObject({ code: "JOB_CANCELLED" });
+  expect(FakeWorker.all.every((worker) => worker.terminated)).toBe(true);
+});
+
+it("fails a silently stalled Worker and releases it", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const request = fixture("stalled");
+  vi.useFakeTimers();
+  const service = new CsgService();
+  const pending = service.run(request);
+  const assertion = expect(pending).rejects.toMatchObject({ code: "WORKER_FAILED" });
+  await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+  await assertion;
+  expect(FakeWorker.all[0]!.terminated).toBe(true);
 });
 </file>
 
@@ -7112,6 +7292,50 @@ export default defineConfig({
 });
 </file>
 
+<file path="docs/csg-feasibility.md">
+# TASK-003 — пригодность Manifold WASM для CSG
+
+## Проверенная конфигурация
+
+- Локальный Windows, Node/Vitest 5, TypeScript 5.9, Vite 8.3.4, Three 0.186.1, `manifold-3d` 3.5.4 (Apache-2.0). Пакет содержит `manifold.wasm`, JS и типы TS. Версия закреплена в lockfile.
+- Изолированный код: `src/spikes/csg/`. Dev-маршрут: `/?spike=csg`. Доменный документ и renderer spike не изменены.
+- Использованы документированные `Mesh`, `Mesh.merge()`, `Manifold`, `getMesh()`, `status()` и `delete()`. [API Manifold](https://github.com/elalish/manifold/blob/master/bindings/wasm/documents/bindings.md), [пример Three](https://github.com/elalish/manifold/blob/master/bindings/wasm/examples/three/three.ts).
+
+## Подтверждённые результаты
+
+- Subtract: тор и отдельный цилиндрический cutter, расположенный в теле тора поперёк трубки; исходное центральное отверстие не используется как свидетельство вычитания. Union и intersect: две пересекающиеся сферы. Все три операции вернули непустую сетку и `NoError` в Vitest.
+- Конвертер принимает indexed и non-indexed `BufferGeometry`, проверяет индексы, конечность координат и невырожденность треугольников. `Mesh.merge()` восстанавливает связь совпадающих позиций на швах, не меняя исходные буферы. Открытая сетка даёт структурированную ошибку `GEOMETRY_NON_MANIFOLD`; NaN и вырожденный треугольник отклоняются до WASM. Пересечение непересекающихся тел возвращает пустой результат со статусом `NoError`.
+- На выходе выполняется повторная проверка чисел, индексов и площади каждого треугольника. Сетка отображается через Three. Встроенный браузер фактически выполнил subtract в Worker (`NoError`, 4224 входных и 4232 выходных треугольника, 21.0 мс CSG) и отобразил результат. Узкий viewport ограничил визуальную оценку поверхности.
+- Клиент отменяет синхронную WASM-операцию через `Worker.terminate()`, отвергает текущий Promise с `JOB_CANCELLED` и создаёт новый Worker для следующего задания. Тест с управляемым Worker подтвердил отсутствие принятия позднего ответа и восстановление после отмены. В браузере на высокой детализации получен `JOB_CANCELLED`, затем повторное задание завершилось (`NoError`, 16640 → 16512 треугольников, 110.3 мс CSG). Точный момент отмены относительно входа в синхронный WASM-вызов инструментально не измерен.
+
+## Атрибуты и ограничения
+
+- Прототип передаёт в Manifold только XYZ. UV исходной развёртки **не сохраняются**; на новых cut-поверхностях UV также отсутствуют. Выходные нормали пересчитываются `computeVertexNormals()`; это пригодно для просмотра, но не гарантирует сохранение исходных жёстких граней и пользовательских нормалей. Заглушки UV не создаются.
+- `Mesh.merge()` — best effort; совпадение пространственных координат само по себе не доказывает корректную топологию. Входная ориентация треугольников должна быть согласованной: произвольное исправление winding не выполняется. Проверка закрытости поручена Manifold.
+- Каждый созданный объект Manifold удаляется в `finally`. Отмена уничтожает весь Worker и его WASM heap. Прямое измерение peak WASM/браузерной памяти не выполнено; производственный лимит памяти не установлен.
+- Отсутствует preservation материалов, UV, исходных нормалей и provenance по граням. Для TASK-020 нужны семантика атрибутов и материалов, протокол результата/ошибок и реальные браузерные cancel tests. TASK-021 потребует стабильной идентификации входов, порядка модификаторов и invalidation; данный spike этого не реализует.
+
+## Измерения
+
+Один прогон `npx vitest run tests/csg/benchmark.test.ts --reporter=verbose --silent=false` на этом Windows-хосте. Время `computeMs` включает вызов CSG и `status()`, но не конвертацию и валидацию. Это наблюдения, не гарантии.
+
+| Детализация | Входных треугольников | Выходных | CSG, мс | Статус |
+| --- | ---: | ---: | ---: | --- |
+| low | 1088 | 1104 | 15.6 | NoError |
+| medium | 4224 | 4232 | 12.4 | NoError |
+| high | 16640 | 16512 | 75.2 | NoError |
+
+Инициализация WASM отдельно: 17.7 мс. Разброс low/medium показывает влияние однократного прогрева и среды; нужны повторы для статистики. Потребление памяти не измерено.
+
+## Решение по ADR-003
+
+Manifold 3.5.4 пригоден как основа будущего CSG Worker для закрытых тел: реальные операции и базовая геометрическая валидация прошли, Vite dev-маршрут запущен. **ADR-003 остаётся PROPOSED** до проверки UV/материалов, отмены во время тяжёлого вычисления, устойчивости на сложных импортированных сетках и памяти. Блокирующей ошибки в проверенных простых телах нет; для production-интеграции эти риски существенны.
+
+## TASK-020 update
+
+Production API теперь находится в `src/geometry/csg/`; spike делегирует ему вычисление. Отмена и повторный запуск проверены в браузере, а принадлежность выходных граней определяется через Manifold `runOriginalID`/`runFlags`. UV, авторские нормали и material groups по-прежнему не переносятся; результат явно сообщает о потере. Исходные измерения выше относятся только к TASK-003 и не являются бюджетом production service.
+</file>
+
 <file path="src/assets/asset-bytes.ts">
 export class AssetBytes {
   private readonly values = new Map<string, Uint8Array>();
@@ -7522,6 +7746,140 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
     </div>
   </section>;
 }
+</file>
+
+<file path="src/spikes/csg/client.ts">
+import { CsgService } from "../../geometry/csg";
+import type { MeshData, Operation } from "./core";
+
+/** Compatibility adapter for the TASK-003 demonstration. */
+export class CsgClient {
+  private service = new CsgService();
+  private id = 0;
+  async run(operation: Operation, first: MeshData, second: MeshData) {
+    const result = await this.service.run({ jobId: String(++this.id), operation, target: { mesh: first }, cutter: { mesh: second } });
+    return { ok: true as const, result: { output: result.output, status: "NoError", computeMs: result.stats.computeMs, empty: result.empty, inputTriangles: result.stats.inputTriangles, outputTriangles: result.stats.outputTriangles } };
+  }
+  cancel() { this.service.cancel(); }
+  dispose() { this.service.dispose(); }
+}
+</file>
+
+<file path="src/spikes/csg/core.ts">
+export { compute, fromThree, toThree, validateMesh, makeInputs, manifoldModule, CsgError } from "../../geometry/csg/core";
+export type { Operation, Detail, MeshData } from "../../geometry/csg/core";
+</file>
+
+<file path="src/spikes/csg/CsgSpike.tsx">
+import { useEffect, useRef, useState } from "react";
+import { AmbientLight, Color, DirectionalLight, DoubleSide, Mesh, MeshStandardMaterial, PerspectiveCamera, Scene, WebGLRenderer } from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { CsgClient } from "./client";
+import { makeInputs, toThree, type Detail, type MeshData, type Operation } from "./core";
+
+export default function CsgSpike() {
+  const mount = useRef<HTMLDivElement>(null);
+  const client = useRef<CsgClient | null>(null);
+  const [operation, setOperation] = useState<Operation>("subtract");
+  const [detail, setDetail] = useState<Detail>("medium");
+  const [view, setView] = useState<"input" | "result">("result");
+  const [data, setData] = useState<{ inputs: [MeshData, MeshData]; output: MeshData; metrics: string }>();
+  const [status, setStatus] = useState("Готово к запуску");
+
+  useEffect(() => { client.current = new CsgClient(); return () => { client.current?.dispose(); client.current = null; }; }, []);
+  useEffect(() => {
+    const host = mount.current;
+    if (!host) return;
+    const renderer = new WebGLRenderer({ antialias: true });
+    renderer.setSize(host.clientWidth, 480);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    host.appendChild(renderer.domElement);
+    const scene = new Scene(); scene.background = new Color("#141a24");
+    const camera = new PerspectiveCamera(45, host.clientWidth / 480, 0.1, 100);
+    camera.position.set(3.5, 3, 5);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    scene.add(new AmbientLight("white", 1.8));
+    const light = new DirectionalLight("white", 3); light.position.set(3, 4, 6); scene.add(light);
+    const meshes: Mesh[] = [];
+    const add = (meshData: MeshData, color: string, opacity = 1) => {
+      const mesh = new Mesh(toThree(meshData), new MeshStandardMaterial({ color, metalness: 0.25, roughness: 0.35, transparent: opacity < 1, opacity, side: DoubleSide }));
+      scene.add(mesh); meshes.push(mesh);
+    };
+    if (data) {
+      if (view === "result") add(data.output, "#65d8e5");
+      else { add(data.inputs[0], "#73a7fa", 0.68); add(data.inputs[1], "#f5a75c", 0.68); }
+    }
+    let frame = 0;
+    const animate = () => { frame = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); };
+    animate();
+    return () => { cancelAnimationFrame(frame); controls.dispose(); for (const mesh of meshes) { mesh.geometry.dispose(); (mesh.material as MeshStandardMaterial).dispose(); } renderer.dispose(); renderer.domElement.remove(); };
+  }, [data, view]);
+
+  async function run() {
+    const inputs = makeInputs(operation, detail);
+    setStatus("Вычисление…");
+    try {
+      const response = await client.current!.run(operation, ...inputs);
+      const result = response.result;
+      setData({ inputs, output: result.output, metrics: `Вход: ${result.inputTriangles} треугольников · Выход: ${result.outputTriangles} · CSG: ${result.computeMs.toFixed(1)} мс · ${result.status}` });
+      setStatus(result.empty ? "Пустое пересечение" : "Готово");
+    } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); }
+  }
+
+  return <main style={{ padding: 24, color: "#e8eef6", background: "#141a24", minHeight: "100vh", fontFamily: "sans-serif" }}>
+    <h1>CSG · TASK-003</h1>
+    <p>Эксперимент Manifold WASM. Вращайте камеру мышью.</p>
+    <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+      <select aria-label="Операция" value={operation} onChange={(event) => setOperation(event.target.value as Operation)}><option value="subtract">Вычитание</option><option value="union">Объединение</option><option value="intersect">Пересечение</option></select>
+      <select aria-label="Детализация" value={detail} onChange={(event) => setDetail(event.target.value as Detail)}><option value="low">Низкая</option><option value="medium">Средняя</option><option value="high">Высокая</option></select>
+      <button onClick={run}>Запустить</button><button onClick={() => { client.current?.cancel(); setStatus("JOB_CANCELLED: Вычисление отменено"); }}>Отменить</button>
+      <button onClick={() => setView(view === "input" ? "result" : "input")}>Показать {view === "input" ? "результат" : "исходные тела"}</button>
+    </div>
+    <div ref={mount} style={{ width: "100%", maxWidth: 1000, height: 480 }} />
+    <p>{status}</p><p>{data?.metrics}</p>
+  </main>;
+}
+</file>
+
+<file path="tests/csg/client.test.ts">
+import { afterEach, expect, it, vi } from "vitest";
+import { CsgClient } from "../../src/spikes/csg/client";
+import { makeInputs } from "../../src/spikes/csg/core";
+import type { WorkerResponse } from "../../src/geometry/csg/protocol";
+
+class FakeWorker {
+  static all: FakeWorker[] = [];
+  onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null;
+  onerror: ((event: ErrorEvent) => void) | null = null;
+  terminated = false;
+  requestId = "";
+  constructor() { FakeWorker.all.push(this); }
+  postMessage(request: { jobId: string }) { this.requestId = request.jobId; }
+  terminate() { this.terminated = true; }
+  respond() { this.onmessage?.({ data: { jobId: this.requestId, ok: true, result: { jobId: this.requestId, output: { positions: new Float32Array(), indices: new Uint32Array() }, faceOrigins: new Uint8Array(), coordinateSpace: "target-local", empty: true, stats: { computeMs: 0, inputTriangles: 0, outputTriangles: 0 }, warnings: [] } } } as unknown as MessageEvent<WorkerResponse>); }
+}
+
+afterEach(() => { vi.unstubAllGlobals(); FakeWorker.all = []; });
+
+it("cancels the active worker, ignores late results and runs again", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const client = new CsgClient();
+  const [a, b] = makeInputs("union", "low");
+  const snapshot = a.positions.slice();
+  const pending = client.run("union", a, b);
+  const old = FakeWorker.all[0]!;
+  client.cancel();
+  await expect(pending).rejects.toThrow("JOB_CANCELLED");
+  expect(old.terminated).toBe(true);
+  const next = client.run("union", a, b);
+  old.respond();
+  const current = FakeWorker.all[1]!;
+  current.respond();
+  await expect(next).resolves.toMatchObject({ ok: true });
+  expect(a.positions).toEqual(snapshot);
+  client.dispose();
+});
 </file>
 
 <file path="tests/domain/commands.test.ts">
@@ -10450,6 +10808,13 @@ function EditorShell() {
 - `three-mesh-bvh@0.9.16` подключён локально к поддерживаемым Mesh без изменения прототипов Three.js. Для сеток от 20 000 треугольников BVH строится одним переиспользуемым Worker; проверка и копирование входных буферов выполняются порциями. Порог является начальной эвристикой. Пока BVH не готов или построение завершилось ошибкой, используется штатный raycast; ошибка отражается в диагностике viewport.
 - Индексы живут только в runtime. SceneSync освобождает их при замене геометрии, удалении узла, смене проекта и dispose. Изменение transform или материала не перестраивает BVH. Skinned/morph Mesh, повреждённые сетки и сетки более 2 млн треугольников не индексируются; повреждённые сетки не участвуют в запросе.
 - Целевые тесты покрывают indexed/non-indexed, шесть примитивов, вложенные трансформации, normal matrix, видимость предков, locked selection, worker success/failure/late result и жизненный цикл геометрии. Browser smoke и замер ускорения отдельно не подтверждены.
+
+## TASK-020 — Production CSG WASM Worker (MVP)
+
+- `src/geometry/csg/` предоставляет `CsgService.run({ jobId, operation, target, cutter }, signal?)`, `cancel(jobId?)` и `dispose()`. Вход — копируемые XYZ/indices и необязательные column-major local-to-world матрицы; результат — derived mesh в локальной системе target, `empty`, статистика, предупреждения и `faceOrigins`. `Project`, история и SceneSync не меняются. Spike использует production service через тонкий адаптер.
+- Manifold 3.5.4 выполняет subtract/union/intersect в Worker. Индексы, конечность чисел, площади треугольников и состояние Manifold проверяются; плохой вход и ответ Worker отвергаются типизированными ошибками. Отрицательный determinant относительного преобразования исправляет winding копии cutter. Повторное конкурентное задание получает `JOB_BUSY`; отмена уничтожает Worker и допускает новый запуск. Буферы входов копируются до transfer. Лимит 64 MiB на совокупные входные буферы и 5-минутный watchdog защитные, не измеренный бюджет производительности.
+- `faceOrigins` использует документированные Manifold `runOriginalID`/`runFlags`: 0 — target, 1 — cutter, 2 — новая поверхность вычитания. UV, авторские normals и группы/слоты материалов на выход не переносятся; предупреждения описывают потерю. `toThree()` пересчитывает normals только для просмотра. Peak WASM/браузерная память, сложные импортированные solids и другие браузеры не профилированы. ADR-003 остаётся PROPOSED; пользовательские Boolean-инструменты относятся к следующим задачам.
+- Целевые Vitest (15), полный набор (153), typecheck, lint и build проходят. Во встроенном браузере dev-маршрут выполнил subtract в Worker (`NoError`), отменил высокодетальный job (`JOB_CANCELLED`) и завершил повторный запуск (`NoError`).
 </file>
 
 </files>
