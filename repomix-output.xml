@@ -7604,6 +7604,16 @@ function EditorShell() {
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
   useEffect(() => () => { dragCleanup.current?.(); }, []);
   useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!editorStore.getSnapshot().document.dirty) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+  useEffect(() => {
     const element = workspace.current;
     if (!element) return;
     const observer = new ResizeObserver(() => setDockWidths(([left, right]) => clampDocks(element.clientWidth, left, right)));
@@ -7815,6 +7825,11 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-013 — Unsaved changes and RAM-only lifecycle
+
+- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
+- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
 
 ## TASK-012 — Desktop workspace and topbar
 

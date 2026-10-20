@@ -1,3 +1,4 @@
+import { disposeObject } from "../../assets/three-resources";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import type { BufferGeometry, Material, Mesh, Object3D } from "three";
 import { ARCHIVE_LIMITS } from "../../assets/native-project-archive";
@@ -92,30 +93,33 @@ function inspectContainer(bytes: Uint8Array): ImportResult<Record<string, unknow
   return { ok: true, value: json };
 }
 
-function dispose(root: Object3D): void {
-  root.traverse((object) => {
-    if (!("isMesh" in object)) return;
-    const mesh = object as Mesh;
-    mesh.geometry?.dispose();
-    for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
-      const mat = material as Material & Record<string, unknown>;
-      for (const value of Object.values(mat)) if (value && typeof value === "object" && "isTexture" in value && "dispose" in value && typeof value.dispose === "function") value.dispose();
-      mat.dispose();
-    }
-  });
-}
-
 export async function prepareGlb(file: File): Promise<ImportResult<PreparedGlb>> {
   if (!/\.glb$/i.test(file.name) || !["", "model/gltf-binary", "application/octet-stream"].includes(file.type))
     return fail("FILE_INVALID", "Выберите локальный файл .glb с допустимым MIME-типом.");
   if (file.size > ARCHIVE_LIMITS.asset) return fail("FILE_INVALID", "GLB превышает 64 МиБ.");
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
+    const decoded = await decodeStaticGlb(bytes);
+    if (!decoded.ok) return decoded;
+    try {
+      const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((n) => n.toString(16).padStart(2, "0")).join("");
+      return { ok: true, value: { name: file.name.slice(0, -4).slice(0, 100) || "Импорт GLB", bytes, hash, triangles: decoded.value.triangles, materialCount: decoded.value.materialCount } };
+    } finally { disposeObject(decoded.value.root); }
+  } catch { return fail("ASSET_DECODE_FAILED", "Не удалось разобрать геометрию GLB."); }
+}
+
+/** Same bounded, URI-free path for import and archive-backed viewport decoding. Caller owns root. */
+export async function decodeStaticGlb(bytes: Uint8Array): Promise<ImportResult<{ root: Object3D; triangles: number; materialCount: number }>> {
+  try {
     const preflight = inspectContainer(bytes);
     if (!preflight.ok) return preflight;
     const loader = new GLTFLoader();
-    const gltf = await loader.parseAsync(bytes.buffer as ArrayBuffer, "");
+    const input = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+      ? bytes.buffer as ArrayBuffer : bytes.slice().buffer as ArrayBuffer;
+    const gltf = await loader.parseAsync(input, "");
+    let retained = false;
     try {
+      gltf.scene.updateMatrixWorld(true);
       if (gltf.animations.length) return fail("IMPORT_UNSUPPORTED", "Анимации glTF пока не переносятся в таймлайн.");
       let meshCount = 0;
       let triangles = 0;
@@ -138,9 +142,9 @@ export async function prepareGlb(file: File): Promise<ImportResult<PreparedGlb>>
       });
       if (invalid || meshCount < 1 || triangles < 1 || triangles > 2_000_000)
         return fail("IMPORT_UNSUPPORTED", "Геометрия пуста, повреждена или превышает лимит треугольников.");
-      const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((n) => n.toString(16).padStart(2, "0")).join("");
-      return { ok: true, value: { name: file.name.slice(0, -4).slice(0, 100) || "Импорт GLB", bytes, hash, triangles, materialCount: materials.size } };
-    } finally { dispose(gltf.scene); }
+      retained = true;
+      return { ok: true, value: { root: gltf.scene, triangles, materialCount: materials.size } };
+    } finally { if (!retained) disposeObject(gltf.scene); }
   } catch { return fail("ASSET_DECODE_FAILED", "Не удалось разобрать геометрию GLB."); }
 }
 

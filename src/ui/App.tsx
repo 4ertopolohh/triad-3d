@@ -1,5 +1,6 @@
+import { Viewport } from "../renderer/Viewport";
 import { createProject } from "../domain";
-import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject, selectRevision } from "../app/editor-store";
+import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { lazy, Suspense, useCallback } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -54,7 +55,6 @@ function EditorShell() {
   const [dragging, setDragging] = useState(false);
   const dragCleanup = useRef<(() => void) | null>(null);
   const project = selectProject(state);
-  const revision = selectRevision(state);
   const dirty = selectDirty(state);
   const canUndo = selectCanUndo(state);
   const canRedo = selectCanRedo(state);
@@ -245,7 +245,7 @@ function EditorShell() {
       </header>
       {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
       {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
-        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются. 3D-просмотр появится позже.</span>
+        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются.</span>
         <button type="button" onClick={confirmGlb}>Добавить в модель</button>
         <button type="button" onClick={() => { setPendingGlb(null); notice("info", "Импорт отменён."); }}>Отмена</button>
       </div>}
@@ -266,8 +266,7 @@ function EditorShell() {
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
           <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ · {state.tool.mode === "model" ? "МОДЕЛЬ" : "СЦЕНА"}</span><span>Проект только в памяти вкладки</span></div>
-          <div className="stage-center"><div className="stage-symbol" aria-hidden="true">◇</div><h1>{state.tool.mode === "model" ? "Пространство для вашей модели" : "Пространство сцены"}</h1><p>{state.tool.mode === "model" ? "3D-просмотр и редактирование модели появятся в следующих задачах." : "Размещение экземпляров и настройка окружения появятся в следующих задачах. Основная модель остаётся общей для проекта."}</p><span className="status-pill">{dirty ? "Есть несохранённые изменения" : `Проект в памяти · ревизия ${revision}`}</span></div>
-          <div className="stage-footer">3D-просмотр пока недоступен</div>
+          <Viewport store={editorStore} mode={state.tool.mode} />
         </main>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
         <aside className="dock right-dock" aria-label="Инспектор">

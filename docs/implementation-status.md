@@ -1,5 +1,12 @@
 # Implementation status
 
+## TASK-014 — Three.js renderer adapter
+
+- The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.
+- GPU geometry, materials, and textures are disposed when sources disappear or change, and asynchronous GLB results cannot attach after project replacement or viewport teardown. The renderer owns its canvas, resize observer, frame loop, and context-loss listeners. A graphics failure stops rendering and offers explicit retry from the current Project snapshot.
+- Scene mode labels the primary model as a preview; it does not synthesize serialized instances. HDRI environment assets, Scene instances, material textures, and modifier evaluation are not yet rendered, with visible diagnostics. Actual device loss and cross-browser recovery remain unverified on hardware; the loss handler and retry were tested in isolation.
+- In the in-app Chromium desktop viewport, Auto selected WebGPU and forced WebGL2 selected WebGL2. A local static GLB rendered, Undo/Redo changed the preview, and switching Model/Scene kept one canvas. Save/Open UI, dock resizing, and actual device loss were not browser-tested in this run.
+
 ## TASK-013 — Unsaved changes and RAM-only lifecycle
 
 - The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.

@@ -38,6 +38,8 @@ export interface EditorStore {
   setTool(next: Partial<EditorState["tool"]>): void;
   setView(next: Partial<EditorState["view"]>): void;
   getAssetBytes(): AssetBytes;
+  readAssetBytes(id: string): Uint8Array | undefined;
+  getProjectEpoch(): object;
   captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
   confirmSaved(revision: number, identity: object): boolean;
   replaceProject(loaded: LoadedProject, identity: object): boolean;
@@ -55,6 +57,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   let bus = createCommandBus(initialProject);
   let assetBytes = new AssetBytes();
   let identity: object = {};
+  let projectEpoch: object = {};
   let savedPosition: object | null = {};
   let positions: object[] = [savedPosition];
   const listeners = new Set<() => void>();
@@ -169,6 +172,8 @@ export function createEditorStore(initialProject: Project): EditorStore {
       }
     },
     getAssetBytes: () => assetBytes.clone(),
+    readAssetBytes: (id) => assetBytes.get(id),
+    getProjectEpoch: () => projectEpoch,
     captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
     confirmSaved(revision, expectedIdentity) {
       if (identity !== expectedIdentity || state.document.revision !== revision) return false;
@@ -184,6 +189,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       assetBytes.clear();
       assetBytes = nextAssets;
       identity = {};
+      projectEpoch = {};
       savedPosition = {};
       positions = [savedPosition];
       publish({
