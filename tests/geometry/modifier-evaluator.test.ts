@@ -115,7 +115,7 @@ describe("ModifierEvaluator", () => {
     p.nodes.find(n => n.id === "b")!.modifierIds = []; p.modifiers.pop();
     m.parameters = { operation: "wrong", cutterNodeId: "b" };
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
-    m.kind = "mirror";
+    m.kind = "bend";
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "UNSUPPORTED_MODIFIER" } });
   });
   it("keeps a fallback on worker failure and recovers on retry", async () => {

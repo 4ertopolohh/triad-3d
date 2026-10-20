@@ -31,7 +31,7 @@ describe("project document schema v1", () => {
     project.assets.push({ id: "asset-1", hash: "hash", mediaType: "image/png", path: "assets/x.png", colorSpace: "srgb" });
     project.scene.background.environmentAssetId = "asset-1";
     project.modifiers.push(
-      { id: "modifier-1", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 1, parameters: { axis: [1, 0, 0] } },
+      { id: "modifier-1", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 1, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } },
       { id: "modifier-2", nodeId: mesh.id, kind: "bevel", order: 1, enabled: true, version: 1, parameters: { width: 0 } },
     );
     mesh.modifierIds.push("modifier-1", "modifier-2");

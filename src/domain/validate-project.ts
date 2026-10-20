@@ -1,6 +1,7 @@
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
 import { parseArrayParameters } from "../geometry/modifiers/array";
+import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -165,6 +166,10 @@ export function validateProject(project: Project): ValidationIssue[] {
     if (modifier.kind === "array") {
       try { parseArrayParameters(modifier.parameters); }
       catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры массива." }); }
+    }
+    if (modifier.kind === "mirror") {
+      try { parseMirrorParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Mirror." }); }
     }
     if (modifier.kind === "boolean") {
       const params = modifier.parameters;
