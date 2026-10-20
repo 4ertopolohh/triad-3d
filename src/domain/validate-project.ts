@@ -6,6 +6,7 @@ export type ValidationCode =
   | "MISSING_REFERENCE"
   | "INVALID_HIERARCHY"
   | "HIERARCHY_CYCLE"
+  | "DEPENDENCY_CYCLE"
   | "INVALID_NUMBER"
   | "INVALID_STRUCTURE";
 
@@ -62,6 +63,7 @@ export function validateProject(project: Project): ValidationIssue[] {
   }
 
   const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  const booleanEdges = new Map<EntityId, EntityId[]>();
   for (const node of project.nodes) {
     if (node.id !== project.model.rootNodeId && node.parentId === null) {
       issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
@@ -88,7 +90,10 @@ export function validateProject(project: Project): ValidationIssue[] {
       }
     }
     for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    const seenModifiers = new Set<EntityId>();
     for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
+      seenModifiers.add(modifierId);
       reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
       const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
       if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
@@ -147,12 +152,55 @@ export function validateProject(project: Project): ValidationIssue[] {
     reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
     finite(modifier.order, `modifiers.${modifier.id}.order`);
     finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!Number.isSafeInteger(modifier.order) || modifier.order < 0 || !Number.isSafeInteger(modifier.version) || modifier.version < 0)
+      issues.push({ code: "INVALID_NUMBER", path: `modifiers.${modifier.id}`, message: "Порядок и версия должны быть неотрицательными целыми числами." });
     if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
       issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
     }
     for (const [name, value] of Object.entries(modifier.parameters)) {
       if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
       else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+    if (modifier.kind === "boolean") {
+      const params = modifier.parameters;
+      const keys = Object.keys(params);
+      if (keys.length !== 2 || !keys.includes("operation") || !keys.includes("cutterNodeId")
+        || !["subtract", "union", "intersect"].includes(String(params.operation))
+        || typeof params.cutterNodeId !== "string" || !params.cutterNodeId.trim()) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: "Некорректные параметры Boolean." });
+      } else {
+        const owner = nodesById.get(modifier.nodeId);
+        const cutter = nodesById.get(params.cutterNodeId);
+        if (owner?.kind !== "mesh" || (owner.meshSource.kind === "primitive" && owner.meshSource.primitive === "plane"))
+          issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.nodeId`, message: "Boolean target должен быть замкнутым mesh." });
+        if (!cutter || cutter.kind !== "mesh" || (cutter.meshSource.kind === "primitive" && cutter.meshSource.primitive === "plane"))
+          issues.push({ code: "MISSING_REFERENCE", path: `modifiers.${modifier.id}.parameters.cutterNodeId`, message: "Boolean cutter должен быть существующим замкнутым mesh." });
+        if (owner?.kind === "mesh" && cutter?.kind === "mesh")
+          booleanEdges.set(owner.id, [...booleanEdges.get(owner.id) ?? [], cutter.id]);
+      }
+    }
+  }
+  const visitedBoolean = new Set<EntityId>();
+  const activeBoolean = new Set<EntityId>();
+  for (const start of booleanEdges.keys()) {
+    if (visitedBoolean.has(start)) continue;
+    const stack: { id: EntityId; next: number }[] = [{ id: start, next: 0 }];
+    activeBoolean.add(start);
+    while (stack.length) {
+      const frame = stack[stack.length - 1]!;
+      const edges = booleanEdges.get(frame.id) ?? [];
+      if (frame.next === edges.length) {
+        activeBoolean.delete(frame.id);
+        visitedBoolean.add(frame.id);
+        stack.pop();
+        continue;
+      }
+      const next = edges[frame.next++]!;
+      if (activeBoolean.has(next)) {
+        issues.push({ code: "DEPENDENCY_CYCLE", path: `nodes.${frame.id}.modifierIds`, message: "Обнаружен цикл зависимостей Boolean." });
+        continue;
+      }
+      if (!visitedBoolean.has(next)) { activeBoolean.add(next); stack.push({ id: next, next: 0 }); }
     }
   }
   for (const material of project.materials) {

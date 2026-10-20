@@ -1,5 +1,6 @@
-import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
+import type { Asset, EntityId, MeshNode, Modifier, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
+import type { BooleanParameters } from "../geometry/modifiers/types";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
@@ -13,7 +14,12 @@ export type ProjectCommand =
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
-  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } };
+  | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
+  | { commandId: string; type: "ADD_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "UPDATE_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
+  | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
+  | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
 
 export const CommandErrorCode = {
   REVISION_CONFLICT: "REVISION_CONFLICT",
@@ -32,6 +38,10 @@ export type PatchChange =
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
   | { kind: "removeAsset"; asset: Asset }
+  | { kind: "addModifier"; modifier: Modifier; index: number }
+  | { kind: "removeModifier"; modifier: Modifier; index: number }
+  | { kind: "setModifier"; modifierId: EntityId; before: Modifier; after: Modifier }
+  | { kind: "setModifierIds"; nodeId: EntityId; before: EntityId[]; after: EntityId[] }
   | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children" | "parentId"; before: Node["name"] | Transform | boolean | EntityId[] | EntityId | null; after: Node["name"] | Transform | boolean | EntityId[] | EntityId | null }
   | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
   | { kind: "modelRevision"; before: number; after: number };
@@ -89,6 +99,19 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_BOOLEAN_MODIFIER") return ownKeys(payload, ["nodeId", "modifierId", "operation", "cutterNodeId"])
+    && id(payload.nodeId) && id(payload.modifierId) && id(payload.cutterNodeId)
+    && booleanOperation(payload.operation) && same(value.targetIds, [payload.nodeId, payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "UPDATE_BOOLEAN_MODIFIER") return ownKeys(payload, ["modifierId", "operation", "cutterNodeId"])
+    && id(payload.modifierId) && id(payload.cutterNodeId) && booleanOperation(payload.operation)
+    && same(value.targetIds, [payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "SET_MODIFIER_ENABLED") return ownKeys(payload, ["modifierId", "enabled"])
+    && id(payload.modifierId) && typeof payload.enabled === "boolean" && same(value.targetIds, [payload.modifierId]);
+  if (value.type === "MOVE_MODIFIER") return ownKeys(payload, ["modifierId", "toIndex"])
+    && id(payload.modifierId) && Number.isSafeInteger(payload.toIndex) && (payload.toIndex as number) >= 0
+    && same(value.targetIds, [payload.modifierId]);
+  if (value.type === "REMOVE_MODIFIER") return ownKeys(payload, ["modifierId"])
+    && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
   if (value.type === "GROUP_NODES") return ownKeys(payload, ["nodeIds", "group"]) && idList(payload.nodeIds)
     && payload.nodeIds.length > 0 && new Set(payload.nodeIds).size === payload.nodeIds.length
     && validNode(payload.group) && payload.group.kind === "group" && payload.group.children.length === 0
@@ -128,6 +151,9 @@ function validCommand(value: unknown): value is ProjectCommand {
     default: return false;
   }
 }
+
+const booleanOperation = (value: unknown): value is BooleanParameters["operation"] =>
+  value === "subtract" || value === "union" || value === "intersect";
 
 const nodeById = (project: Project, nodeId: string): Node | undefined => project.nodes.find(node => node.id === nodeId);
 function matrix(transform: Transform): Matrix4 {
@@ -183,6 +209,29 @@ function blocked(project: Project, node: Node, flags = false): CommandErrorCode 
   return null;
 }
 
+function bump(modifier: Modifier): boolean {
+  if (!Number.isSafeInteger(modifier.version) || modifier.version >= Number.MAX_SAFE_INTEGER) return false;
+  modifier.version += 1;
+  return true;
+}
+
+function normalizeOrders(project: Project, node: MeshNode): boolean {
+  for (const [index, modifierId] of node.modifierIds.entries()) {
+    const modifier = project.modifiers.find(item => item.id === modifierId);
+    if (!modifier) return false;
+    if (modifier.order !== index) {
+      modifier.order = index;
+      if (!bump(modifier)) return false;
+    }
+  }
+  return true;
+}
+
+function meshOperand(project: Project, nodeId: string): MeshNode | undefined {
+  const node = nodeById(project, nodeId);
+  return node?.kind === "mesh" && !(node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane") ? node : undefined;
+}
+
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
   if (command.type === "MOVE_NODE") {
     const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
@@ -227,6 +276,8 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     if (!node || !parent || node.id === project.model.rootNodeId || guarded(project, node) || guarded(project, parent))
       return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел нельзя удалить.");
     const removed = descendants(project, node); const ids = new Set(removed.map(item => item.id));
+    if (project.modifiers.some(item => item.kind === "boolean" && ids.has(String(item.parameters.cutterNodeId)) && !ids.has(item.nodeId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел используется как Boolean cutter оставшимся модификатором.");
     if (removed.some(item => item.modifierIds.length) || project.modifiers.some(item => ids.has(item.nodeId))
       || project.tracks.some(item => ids.has(item.nodeId)))
       return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "У структуры есть зависимые дорожки или модификаторы.");
@@ -258,6 +309,59 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID узла уже используется.");
     project.nodes = project.nodes.map((entry) => entry.id === parentId ? { ...entry, children: [...entry.children, node.id] } : entry);
     project.nodes.push(structuredClone(node));
+    return null;
+  }
+  if (command.type === "ADD_BOOLEAN_MODIFIER") {
+    const { nodeId, modifierId, operation, cutterNodeId } = command.payload;
+    const target = meshOperand(project, nodeId);
+    if (!target || !meshOperand(project, cutterNodeId)) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Boolean требует существующие замкнутые mesh-операнды.");
+    if (nodeId === cutterNodeId || entityIds(project).has(modifierId)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Boolean не может ссылаться на себя; ID модификатора должен быть уникальным.");
+    const block = blocked(project, target);
+    if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
+    const last = project.modifiers.find(item => item.id === target.modifierIds.at(-1));
+    const order = last ? last.order + 1 : 0;
+    if (!Number.isSafeInteger(order)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок стека переполнен.");
+    project.modifiers.push({ id: modifierId, nodeId, kind: "boolean", order, enabled: true, version: 0, parameters: { operation, cutterNodeId } });
+    target.modifierIds.push(modifierId);
+    return null;
+  }
+  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
+    || command.type === "MOVE_MODIFIER" || command.type === "REMOVE_MODIFIER") {
+    const modifier = project.modifiers.find(item => item.id === command.payload.modifierId);
+    if (!modifier) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор не найден.");
+    const target = nodeById(project, modifier.nodeId);
+    if (!target || target.kind !== "mesh" || !target.modifierIds.includes(modifier.id))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Стек модификатора не найден.");
+    const block = blocked(project, target);
+    if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
+    if (command.type === "UPDATE_BOOLEAN_MODIFIER") {
+      if (modifier.kind !== "boolean") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является Boolean.");
+      const { operation, cutterNodeId } = command.payload;
+      if (!meshOperand(project, cutterNodeId)) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Boolean cutter не является замкнутым mesh.");
+      if (cutterNodeId === target.id) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Boolean не может ссылаться на свой mesh.");
+      if (modifier.parameters.operation !== operation || modifier.parameters.cutterNodeId !== cutterNodeId) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.parameters = { operation, cutterNodeId };
+      }
+    } else if (command.type === "SET_MODIFIER_ENABLED") {
+      if (modifier.enabled !== command.payload.enabled) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.enabled = command.payload.enabled;
+      }
+    } else if (command.type === "MOVE_MODIFIER") {
+      const { toIndex } = command.payload;
+      if (toIndex >= target.modifierIds.length) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Индекс модификатора вне стека.");
+      const oldIndex = target.modifierIds.indexOf(modifier.id);
+      if (oldIndex !== toIndex) {
+        target.modifierIds.splice(oldIndex, 1);
+        target.modifierIds.splice(toIndex, 0, modifier.id);
+        if (!normalizeOrders(project, target)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок или версия модификатора недопустимы.");
+      }
+    } else {
+      target.modifierIds = target.modifierIds.filter(item => item !== modifier.id);
+      project.modifiers = project.modifiers.filter(item => item.id !== modifier.id);
+      if (!normalizeOrders(project, target)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок или версия модификатора недопустимы.");
+    }
     return null;
   }
   const current = project.nodes.find((entry) => entry.id === command.payload.nodeId);
@@ -304,12 +408,21 @@ function diff(before: Project, after: Project): ProjectPatch {
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
+    if (!same(old.modifierIds, node.modifierIds)) changes.push({ kind: "setModifierIds", nodeId: node.id,
+      before: structuredClone(old.modifierIds), after: structuredClone(node.modifierIds) });
     for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
     if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
       changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
+  }
+  for (const [index, modifier] of [...before.modifiers.entries()].reverse()) if (!after.modifiers.some(item => item.id === modifier.id))
+    changes.push({ kind: "removeModifier", modifier: structuredClone(modifier), index });
+  for (const [index, modifier] of after.modifiers.entries()) {
+    const old = before.modifiers.find(item => item.id === modifier.id);
+    if (!old) changes.push({ kind: "addModifier", modifier: structuredClone(modifier), index });
+    else if (!same(old, modifier)) changes.push({ kind: "setModifier", modifierId: modifier.id, before: structuredClone(old), after: structuredClone(modifier) });
   }
   for (const node of before.nodes) if (!after.nodes.some(entry => entry.id === node.id)) changes.push({ kind: "removeNode", node: structuredClone(node) });
   if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
@@ -322,7 +435,11 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
     if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "addModifier") return { kind: "removeModifier", modifier: structuredClone(change.modifier), index: change.index };
+    if (change.kind === "removeModifier") return { kind: "addModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    if (change.kind === "setModifier") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    if (change.kind === "setModifierIds") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setPrimitiveSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
   }) };
@@ -339,6 +456,22 @@ export function applyProjectPatch(project: Project, patch: ProjectPatch): Projec
       const index = result.assets.findIndex((asset) => asset.id === change.asset.id);
       if (index < 0 || !same(result.assets[index], change.asset)) throw new Error("Patch asset conflict");
       result.assets.splice(index, 1);
+    } else if (change.kind === "addModifier") {
+      if (entityIds(result).has(change.modifier.id)) throw new Error("Patch modifier ID conflict");
+      if (change.index < 0 || change.index > result.modifiers.length) throw new Error("Patch modifier index conflict");
+      result.modifiers.splice(change.index, 0, structuredClone(change.modifier));
+    } else if (change.kind === "removeModifier") {
+      const index = result.modifiers.findIndex(item => item.id === change.modifier.id);
+      if (index !== change.index || !same(result.modifiers[index], change.modifier)) throw new Error("Patch modifier conflict");
+      result.modifiers.splice(index, 1);
+    } else if (change.kind === "setModifier") {
+      const index = result.modifiers.findIndex(item => item.id === change.modifierId);
+      if (index < 0 || !same(result.modifiers[index], change.before)) throw new Error("Patch modifier conflict");
+      result.modifiers[index] = structuredClone(change.after);
+    } else if (change.kind === "setModifierIds") {
+      const node = result.nodes.find(item => item.id === change.nodeId);
+      if (!node || !same(node.modifierIds, change.before)) throw new Error("Patch modifier stack conflict");
+      node.modifierIds = structuredClone(change.after);
     } else if (change.kind === "addNode") {
       if (entityIds(result).has(change.node.id)) throw new Error("Patch ID conflict");
       result.nodes.push(structuredClone(change.node));

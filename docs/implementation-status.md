@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-022A — Boolean modifier commands (часть TASK-022)
+
+- CommandBus поддерживает добавление, изменение, включение, перестановку и удаление Boolean-модификаторов через атомарные транзакции и обратимые патчи. Существующий EditorStore публикует изменения в истории и инвалидирует derived generation.
+- Доменная проверка контролирует точные Boolean-параметры, владельца и порядок стека, ссылки на mesh и циклы зависимостей, включая отключённые модификаторы. Удаление используемого cutter отклоняется. Сохранение использует прежний документ v1.
+- Boolean UI и подключение ModifierEvaluator к SceneSync остаются следующими частями TASK-022.
+
 ## TASK-027 — Transactional Heavy Job Controller (MVP)
 
 - `EditorStore.jobs.run(spec)` validates a detached Project snapshot, runs one asynchronous computation with `AbortSignal` and optional progress, then commits prepared typed commands through one CommandBus transaction. `cancelJob()` and `dispose()` terminate the active lifecycle; late results and progress are ignored. Read-only jobs leave document, dirty state and history untouched.
