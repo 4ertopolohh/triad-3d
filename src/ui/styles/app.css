@@ -1,6 +1,17 @@
 body { margin: 0; }
 #root { min-height: 100vh; }
 .app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.app-content { min-height: 100vh; display: flex; flex-direction: column; }
+.job-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgb(12 18 28 / .5); }
+.job-dialog { width: min(420px, calc(100vw - 32px)); box-sizing: border-box; display: grid; gap: var(--space-4); padding: var(--space-6); border: var(--border-default); border-radius: var(--radius-lg); background: var(--color-surface-raised); box-shadow: 0 20px 70px rgb(0 0 0 / .22); }
+.job-dialog h2, .job-dialog p { margin: 0; }
+.job-dialog progress { width: 100%; accent-color: var(--color-primary-accent-strong); }
+.job-indeterminate { height: 8px; border-radius: 4px; background: var(--color-state-info-surface); overflow: hidden; }
+.job-indeterminate::after { content: ""; display: block; width: 35%; height: 100%; background: var(--color-primary-accent-strong); animation: job-progress 1.4s ease-in-out infinite alternate; }
+@keyframes job-progress { from { transform: translateX(0); } to { transform: translateX(185%); } }
+.job-dialog button { justify-self: end; min-height: 32px; padding: 0 var(--space-4); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.job-dialog button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.job-result { padding: var(--space-3) var(--space-4); color: var(--color-state-danger); }
 .topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
 .brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
 .brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
@@ -71,7 +82,7 @@ body { margin: 0; }
   .project-title { max-width: 110px; }
 }
 @media (max-width: 959px) {
-  .app-shell > :not(.narrow-screen) { display: none; }
+  .app-content > :not(.narrow-screen) { display: none; }
   .narrow-screen { display: flex; min-height: 100vh; flex-direction: column; justify-content: center; align-items: center; padding: var(--space-6); text-align: center; }
   .narrow-screen strong { font-size: var(--font-size-xl); }
   .narrow-screen p { max-width: 34rem; line-height: 1.6; }

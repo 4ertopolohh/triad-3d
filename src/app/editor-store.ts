@@ -4,6 +4,7 @@ import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/comm
 import type { EntityId, Project } from "../domain/types";
 import { AssetBytes } from "../assets/asset-bytes";
 import type { LoadedProject } from "../assets/native-project-archive";
+import { createJobController, isJobActive, type JobController, type JobState } from "./job-controller";
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
   : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
@@ -13,7 +14,7 @@ export interface EditorState {
   readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
   readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
   readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
-  readonly job: { readonly status: "idle" | "validating" | "running" | "applying" | "succeeded" | "failed" | "cancelled" };
+  readonly job: JobState;
   readonly history: { readonly entries: readonly HistoryEntry[]; readonly cursor: number; readonly canUndo: boolean; readonly canRedo: boolean };
   readonly derived: { readonly generation: number; readonly documentRevision: number; readonly scope: "all" };
 }
@@ -27,6 +28,7 @@ export interface HistoryEntry {
 }
 
 export interface EditorStore {
+  readonly jobs: JobController;
   getSnapshot(): EditorState;
   subscribe(listener: () => void): () => void;
   executeCommand(command: ProjectCommand, expectedRevision: number, groupId?: string): CommandResult;
@@ -67,7 +69,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
     selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
     tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
     view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
-    job: Object.freeze({ status: "idle" as const }),
+    job: Object.freeze({ id: null, name: null, status: "idle", progress: null, cancellable: false, error: null }),
     history: Object.freeze({ entries: Object.freeze([]) as readonly HistoryEntry[], cursor: 0, canUndo: false, canRedo: false }),
     derived: Object.freeze({ generation: 0, documentRevision: bus.getRevision(), scope: "all" as const }),
   });
@@ -75,7 +77,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   function publish(next: EditorState): void {
     state = Object.freeze(next);
     for (const listener of [...listeners]) {
-      if (listeners.has(listener)) listener();
+      if (listeners.has(listener)) { try { listener(); } catch (error) { console.error("EditorStore subscriber failed", error); } }
     }
   }
 
@@ -126,6 +128,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   }
 
   function travel(direction: -1 | 1, expectedRevision: number): CommandResult {
+    if (jobActive()) return busy("history");
     if (expectedRevision !== state.document.revision)
       return { ok: false, id: "history", code: CommandErrorCode.REVISION_CONFLICT, message: "Ревизия документа изменилась." };
     const cursor = state.history.cursor;
@@ -146,18 +149,34 @@ export function createEditorStore(initialProject: Project): EditorStore {
     return result;
   }
 
+  const jobActive = () => isJobActive(state.job.status);
+  const busy = (id: string): CommandResult => ({ ok: false, id, code: CommandErrorCode.JOB_BUSY, message: "Редактирование заблокировано до завершения операции." });
+  const jobs = createJobController({
+    capture: () => Object.freeze({ project: deepFreeze(structuredClone(state.document.project) as Project), revision: state.document.revision,
+      projectId: state.document.project.id, identity, epoch: projectEpoch }),
+    isCurrent: (context) => identity === context.identity && projectEpoch === context.epoch
+      && state.document.revision === context.revision && state.document.project.id === context.projectId,
+    publish: (job) => publish({ ...state, job }),
+    commit: (commands, revision, id) => {
+      if (state.job.id !== id || state.job.status !== "applying") return busy(id);
+      return commit(bus.executeTransaction(commands, revision, id));
+    },
+  });
+
   return {
+    jobs,
     getSnapshot: () => state,
     subscribe(listener) {
       listeners.add(listener);
       return () => { listeners.delete(listener); };
     },
-    executeCommand: (command, expectedRevision, groupId) => commit(bus.executeCommand(command, expectedRevision), groupId),
+    executeCommand: (command, expectedRevision, groupId) => jobActive() ? busy(command.commandId) : commit(bus.executeCommand(command, expectedRevision), groupId),
     executeTransaction: (commands, expectedRevision, transactionId, groupId) =>
-      commit(bus.executeTransaction(commands, expectedRevision, transactionId), groupId),
+      jobActive() ? busy(transactionId ?? commands[0]?.commandId ?? "transaction") : commit(bus.executeTransaction(commands, expectedRevision, transactionId), groupId),
     undo: (expectedRevision) => travel(-1, expectedRevision),
     redo: (expectedRevision) => travel(1, expectedRevision),
     cancelGesture(groupId, expectedRevision) {
+      if (jobActive()) return busy(groupId);
       const cursor = state.history.cursor;
       const entry = state.history.entries[cursor - 1];
       if (expectedRevision !== state.document.revision || cursor !== state.history.entries.length || !entry || entry.groupId !== groupId || positions[cursor] === savedPosition)
@@ -175,6 +194,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       return result;
     },
     addMeshAsset(command, bytes, expectedRevision, expectedIdentity) {
+      if (jobActive()) return busy(command.commandId);
       if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
         return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
       if (command.payload.asset && (bytes.byteLength === 0 || state.document.project.assets.some((asset) => asset.id === command.payload.asset?.id)))
@@ -197,12 +217,14 @@ export function createEditorStore(initialProject: Project): EditorStore {
     getProjectEpoch: () => projectEpoch,
     captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
     confirmSaved(revision, expectedIdentity) {
+      if (jobActive()) return false;
       if (identity !== expectedIdentity || state.document.revision !== revision) return false;
       savedPosition = positions[state.history.cursor] ?? null;
       if (state.document.dirty) publish({ ...state, document: Object.freeze({ ...state.document, dirty: false }) });
       return true;
     },
     replaceProject(loaded, expectedIdentity) {
+      if (jobActive()) return false;
       if (identity !== expectedIdentity) return false;
       const nextBus = createCommandBus(loaded.project);
       const nextAssets = loaded.assets.clone();
@@ -223,6 +245,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       return true;
     },
     setSelection(ids, activeId) {
+      if (jobActive()) return;
       const valid = new Set(state.document.project.nodes.map((node) => node.id));
       const selected = [...new Set(ids.filter((id) => valid.has(id)))];
       const active = activeId === undefined ? (selected[0] ?? null) :
@@ -232,6 +255,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
     },
     setTool(next) {
+      if (jobActive()) return;
       const tool = { ...state.tool, ...next };
       if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
       publish({ ...state, tool: Object.freeze(tool) });

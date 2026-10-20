@@ -99,6 +99,10 @@ src/
       protocol.ts
       service.ts
       types.ts
+    modifiers/
+      evaluator.ts
+      index.ts
+      types.ts
     primitives.ts
     surface-query.ts
   importers/
@@ -155,6 +159,7 @@ tests/
   fixtures/
     projects.ts
   geometry/
+    modifier-evaluator.test.ts
     surface-query.test.ts
   importers/
     glb.test.ts
@@ -4364,6 +4369,208 @@ export type CsgResult = {
 };
 </file>
 
+<file path="src/geometry/modifiers/evaluator.ts">
+import { Matrix4, Quaternion, Vector3 } from "three";
+import type { MeshNode, Modifier, Node, Project } from "../../domain/types";
+import { primitiveGeometry } from "../../renderer/primitive";
+import { CsgError, CsgService, fromThree, validateMesh, type MeshData } from "../csg";
+import type { AssetGeometryResolver, BooleanParameters, EvaluationResult, GeometryAttributes, ModifierDiagnostic, ModifierErrorCode, ModifierWarning } from "./types";
+
+type CsgRunner = Pick<CsgService, "run" | "cancel">;
+type Stage = { mesh: MeshData; key: string; attributes: GeometryAttributes; warnings: ModifierWarning[]; applied: string[]; empty: boolean };
+type Context = { project: Readonly<Project>; snapshot: string; nodes: Map<string, Node>; modifiers: Map<string, Modifier>; signal: AbortSignal | undefined; epoch: number; active: Set<string> };
+const cloneMesh = (mesh: MeshData): MeshData => ({ positions: mesh.positions.slice(), indices: mesh.indices.slice() });
+const cloneStage = (stage: Stage): Stage => ({ ...stage, mesh: cloneMesh(stage.mesh), attributes: { ...stage.attributes }, warnings: [...stage.warnings], applied: [...stage.applied] });
+const bytes = (stage: Stage) => stage.mesh.positions.byteLength + stage.mesh.indices.byteLength;
+const stable = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) => item && typeof item === "object" && !Array.isArray(item) && !(item instanceof Float32Array) && !(item instanceof Uint32Array)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+
+class EvaluationFailure extends Error {
+  constructor(readonly code: ModifierErrorCode, message: string, readonly nodeId?: string, readonly modifierId?: string) { super(message); }
+}
+function booleanParameters(modifier: Modifier): BooleanParameters {
+  const p = modifier.parameters;
+  if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).length !== 2 || typeof p.operation !== "string" || !["subtract", "union", "intersect"].includes(p.operation) || typeof p.cutterNodeId !== "string" || !p.cutterNodeId.trim())
+    throw new EvaluationFailure("INVALID_MODIFIER", "Некорректные параметры Boolean: нужны operation и cutterNodeId.", modifier.nodeId, modifier.id);
+  return { operation: p.operation as BooleanParameters["operation"], cutterNodeId: p.cutterNodeId };
+}
+function ordered(node: MeshNode, modifiers: Map<string, Modifier>): Modifier[] {
+  const seen = new Set<string>();
+  let previous = -1;
+  return node.modifierIds.map((id) => {
+    const modifier = modifiers.get(id);
+    if (!modifier || seen.has(id) || modifier.nodeId !== node.id || !Number.isInteger(modifier.order) || modifier.order <= previous || !Number.isInteger(modifier.version) || modifier.version < 0)
+      throw new EvaluationFailure("INVALID_MODIFIER", "Неверная ссылка или порядок стека модификаторов.", node.id, id);
+    seen.add(id); previous = modifier.order;
+    return modifier;
+  });
+}
+function worldMatrix(node: Node, nodes: Map<string, Node>): number[] {
+  const visited = new Set<string>();
+  const chain: Node[] = [];
+  let current: Node | undefined = node;
+  while (current) {
+    if (visited.has(current.id)) throw new EvaluationFailure("DEPENDENCY_CYCLE", "Цикл в иерархии узлов.", node.id);
+    visited.add(current.id); chain.push(current);
+    if (current.parentId === null) break;
+    current = nodes.get(current.parentId);
+    if (!current) throw new EvaluationFailure("INVALID_REFERENCE", "Родительский узел не найден.", node.id);
+  }
+  const matrix = new Matrix4();
+  for (const item of chain.reverse()) {
+    const t = item.transform;
+    const values = [...t.position, ...t.rotationQuat, ...t.scale];
+    if (values.some((n) => !Number.isFinite(n))) throw new EvaluationFailure("FILE_INVALID", "Некорректное преобразование узла.", item.id);
+    matrix.multiply(new Matrix4().compose(new Vector3(...t.position), new Quaternion(...t.rotationQuat), new Vector3(...t.scale)));
+  }
+  return matrix.toArray();
+}
+
+/** Sequential, RAM-only evaluator. One active evaluation per instance; caller retains ownership of returned buffers. */
+export class ModifierEvaluator {
+  private readonly runner: CsgRunner;
+  private readonly ownsRunner: boolean;
+  private readonly cache = new Map<string, Stage>();
+  private cacheBytes = 0;
+  private busy = false;
+  private disposed = false;
+  private epoch = 0;
+  private nextJob = 0;
+  constructor(private readonly options: { assetResolver?: AssetGeometryResolver; csg?: CsgRunner; byteBudget?: number } = {}) {
+    this.ownsRunner = !options.csg;
+    this.runner = options.csg ?? new CsgService();
+    if (options.byteBudget !== undefined && (!Number.isSafeInteger(options.byteBudget) || options.byteBudget < 0)) throw new Error("Invalid modifier cache byte budget");
+  }
+  get cacheSizeBytes(): number { return this.cacheBytes; }
+  clearCache(): void { this.cache.clear(); this.cacheBytes = 0; this.epoch++; }
+  dispose(): void { this.disposed = true; this.clearCache(); this.runner.cancel(); if (this.ownsRunner) (this.runner as CsgService).dispose(); }
+  private read(key: string): Stage | undefined {
+    const stage = this.cache.get(key);
+    if (stage) { this.cache.delete(key); this.cache.set(key, stage); return cloneStage(stage); }
+    return undefined;
+  }
+  private write(stage: Stage): void {
+    const budget = this.options.byteBudget ?? 64 * 1024 * 1024;
+    if (bytes(stage) > budget || this.cache.has(stage.key)) return;
+    this.cache.set(stage.key, cloneStage(stage)); this.cacheBytes += bytes(stage);
+    while (this.cacheBytes > budget) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest === undefined) break;
+      this.cacheBytes -= bytes(this.cache.get(oldest)!); this.cache.delete(oldest);
+    }
+  }
+  async evaluate(project: Readonly<Project>, nodeId: string, signal?: AbortSignal): Promise<EvaluationResult> {
+    const fail = (error: ModifierDiagnostic, fallback?: Stage): EvaluationResult => ({ ok: false, error, ...(fallback ? { mesh: cloneMesh(fallback.mesh), empty: fallback.empty } : {}), warnings: fallback?.warnings ?? [], appliedModifierIds: fallback?.applied ?? [], fallback: !!fallback });
+    if (this.disposed) return fail({ code: "WORKER_FAILED", message: "Evaluator освобождён." });
+    if (this.busy) return fail({ code: "JOB_BUSY", message: "Вычисление уже выполняется." });
+    this.busy = true;
+    const epoch = this.epoch;
+    const snapshot = stable(project);
+    let last: Stage | undefined;
+    try {
+      const ctx: Context = { project, snapshot, nodes: new Map(project.nodes.map((n) => [n.id, n])), modifiers: new Map(project.modifiers.map((m) => [m.id, m])), signal, epoch, active: new Set() };
+      const stage = await this.resolve(nodeId, ctx, (s) => { last = s; });
+      this.check(signal, epoch);
+      this.checkProject(ctx, nodeId);
+      return { ok: true, mesh: cloneMesh(stage.mesh), empty: stage.empty, warnings: [...stage.warnings], appliedModifierIds: [...stage.applied], fallback: false };
+    } catch (error) {
+      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError ? error.code : "WORKER_FAILED";
+      const message = error instanceof Error ? error.message : String(error);
+      const diagnostic: ModifierDiagnostic = { code, message, ...(error instanceof EvaluationFailure && error.nodeId ? { nodeId: error.nodeId } : { nodeId }), ...(error instanceof EvaluationFailure && error.modifierId ? { modifierId: error.modifierId } : {}) };
+      return fail(diagnostic, code === "JOB_CANCELLED" || code === "STALE_PROJECT" ? undefined : last);
+    } finally { this.busy = false; }
+  }
+  private check(signal: AbortSignal | undefined, epoch: number): void {
+    if (signal?.aborted || this.disposed || epoch !== this.epoch) throw new EvaluationFailure("JOB_CANCELLED", "Вычисление отменено.");
+  }
+  private checkProject(ctx: Context, nodeId: string): void {
+    if (stable(ctx.project) !== ctx.snapshot) throw new EvaluationFailure("STALE_PROJECT", "Проект изменился во время вычисления.", nodeId);
+  }
+  private async resolve(nodeId: string, ctx: Context, progress?: (stage: Stage) => void): Promise<Stage> {
+    this.check(ctx.signal, ctx.epoch);
+    const node = ctx.nodes.get(nodeId);
+    if (!node) throw new EvaluationFailure("INVALID_REFERENCE", "Узел не найден.", nodeId);
+    if (node.kind !== "mesh") throw new EvaluationFailure("INVALID_REFERENCE", "Узел не является mesh.", nodeId);
+    if (ctx.active.has(nodeId)) throw new EvaluationFailure("DEPENDENCY_CYCLE", "Цикл зависимостей Boolean.", nodeId);
+    ctx.active.add(nodeId);
+    try {
+      const modifiers = ordered(node, ctx.modifiers);
+      const source = node.meshSource;
+      let mesh: MeshData;
+      let fingerprint: string;
+      let attributes: GeometryAttributes = {};
+      if (source.kind === "primitive") {
+        let geometry;
+        try { geometry = primitiveGeometry(source); }
+        catch (error) { throw new EvaluationFailure("FILE_INVALID", error instanceof Error ? error.message : String(error), nodeId); }
+        try { mesh = fromThree(geometry); attributes = { uv: geometry.hasAttribute("uv"), normals: geometry.hasAttribute("normal"), materialGroups: geometry.groups.length > 0, materialSlots: node.materialSlots.length }; }
+        finally { geometry.dispose(); }
+        fingerprint = stable(source);
+      } else {
+        const asset = ctx.project.assets.find((a) => a.id === source.assetId);
+        if (!asset || !this.options.assetResolver) throw new EvaluationFailure("ASSET_DECODE_FAILED", "Геометрия asset недоступна локально.", nodeId);
+        const resolved = await this.options.assetResolver(node, ctx.project, ctx.signal);
+        if (!resolved.fingerprint) throw new EvaluationFailure("ASSET_DECODE_FAILED", "Не указан fingerprint геометрии asset.", nodeId);
+        this.check(ctx.signal, ctx.epoch);
+        this.checkProject(ctx, nodeId);
+        mesh = cloneMesh(resolved.mesh); attributes = { ...resolved.attributes, materialSlots: Math.max(resolved.attributes?.materialSlots ?? 0, node.materialSlots.length) };
+        fingerprint = stable([source, asset.hash, resolved.fingerprint]);
+      }
+      validateMesh(mesh);
+      let stage: Stage = { mesh, key: stable([ctx.project.id, node.id, fingerprint, attributes]), attributes, warnings: [], applied: [], empty: false };
+      stage = this.read(stage.key) ?? stage;
+      progress?.(stage);
+      this.write(stage);
+      for (const modifier of modifiers) {
+        this.check(ctx.signal, ctx.epoch);
+        if (!modifier.enabled) continue;
+        if (modifier.kind !== "boolean") throw new EvaluationFailure("UNSUPPORTED_MODIFIER", `Модификатор ${modifier.kind} пока не поддерживается.`, nodeId, modifier.id);
+        const params = booleanParameters(modifier);
+        if (params.cutterNodeId === node.id) throw new EvaluationFailure("DEPENDENCY_CYCLE", "Boolean не может ссылаться на свой mesh.", nodeId, modifier.id);
+        const cutter = await this.resolve(params.cutterNodeId, ctx);
+        const cutterNode = ctx.nodes.get(params.cutterNodeId)!;
+        const targetWorld = worldMatrix(node, ctx.nodes), cutterWorld = worldMatrix(cutterNode, ctx.nodes);
+        const key = stable([stage.key, modifier.id, modifier.kind, modifier.version, modifier.order, modifier.parameters, cutter.key, targetWorld, cutterWorld]);
+        const hit = this.read(key);
+        if (hit) { stage = hit; progress?.(stage); continue; }
+        if (stage.empty || cutter.empty) throw new EvaluationFailure("GEOMETRY_DEGENERATE", "Пустая сетка не может служить входом CSG.", nodeId, modifier.id);
+        const result = await this.runner.run({ jobId: `modifier-${++this.nextJob}`, operation: params.operation,
+          target: { mesh: cloneMesh(stage.mesh), worldMatrix: targetWorld, attributes: stage.attributes },
+          cutter: { mesh: cloneMesh(cutter.mesh), worldMatrix: cutterWorld, attributes: cutter.attributes } }, ctx.signal);
+        this.check(ctx.signal, ctx.epoch);
+        this.checkProject(ctx, nodeId);
+        validateMesh(result.output, result.empty);
+        if (result.coordinateSpace !== "target-local" || result.empty !== (result.output.indices.length === 0)) throw new EvaluationFailure("WORKER_FAILED", "Некорректный результат CSG.", nodeId, modifier.id);
+        stage = { mesh: cloneMesh(result.output), key, attributes: {}, warnings: [...stage.warnings, ...cutter.warnings, ...result.warnings], applied: [...stage.applied, modifier.id], empty: result.empty };
+        this.write(stage); progress?.(stage);
+      }
+      return stage;
+    } finally { ctx.active.delete(nodeId); }
+  }
+}
+</file>
+
+<file path="src/geometry/modifiers/index.ts">
+export { ModifierEvaluator } from "./evaluator";
+export type { BooleanParameters, EvaluationResult, ModifierDiagnostic, ModifierErrorCode, ModifierWarning, AssetGeometryResolver } from "./types";
+</file>
+
+<file path="src/geometry/modifiers/types.ts">
+import type { Project, MeshNode } from "../../domain/types";
+import type { CsgErrorCode, CsgOperation, CsgWarning, MeshData } from "../csg";
+
+export type BooleanParameters = { operation: CsgOperation; cutterNodeId: string };
+export type ModifierErrorCode = CsgErrorCode | "INVALID_REFERENCE" | "DEPENDENCY_CYCLE" | "INVALID_MODIFIER" | "UNSUPPORTED_MODIFIER" | "ASSET_DECODE_FAILED" | "STALE_PROJECT";
+export type ModifierDiagnostic = { code: ModifierErrorCode; message: string; nodeId?: string; modifierId?: string };
+export type ModifierWarning = CsgWarning;
+export type GeometryAttributes = { uv?: boolean; normals?: boolean; materialGroups?: boolean; materialSlots?: number };
+/** Resolver returns detached local-space buffers and a content fingerprint (normally Asset.hash). No network access. */
+export type AssetGeometryResolver = (node: Readonly<MeshNode>, project: Readonly<Project>, signal?: AbortSignal) => Promise<{ mesh: MeshData; fingerprint: string; attributes?: GeometryAttributes }>;
+export type EvaluationResult =
+  | { ok: true; mesh: MeshData; empty: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: false }
+  | { ok: false; error: ModifierDiagnostic; mesh?: MeshData; empty?: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: boolean };
+</file>
+
 <file path="src/geometry/primitives.ts">
 import type { MeshNode, MeshSource } from "../domain/types";
 
@@ -6442,6 +6649,176 @@ test("write generated component for isolated harness", async () => {
   const sourceDirectory = join(output, "src");
   await mkdir(sourceDirectory, { recursive: true });
   await writeFile(join(sourceDirectory, result.filename), result.source, "utf8");
+});
+</file>
+
+<file path="tests/geometry/modifier-evaluator.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import type { Project, Modifier } from "../../src/domain/types";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import { ModifierEvaluator } from "../../src/geometry/modifiers";
+import { CsgError, type CsgRequest, type CsgResult } from "../../src/geometry/csg";
+
+function fixture(): Project {
+  const p = createProject(() => `id-${Math.random()}`);
+  const root = p.nodes[0]!;
+  for (const id of ["a", "b", "c", "d"]) { p.nodes.push(createPrimitiveNode("cube", root.id, id)); root.children.push(id); }
+  return p;
+}
+function add(p: Project, nodeId: string, id: string, cutterNodeId: string, operation: "subtract" | "union" | "intersect" = "subtract") {
+  const node = p.nodes.find(n => n.id === nodeId)!;
+  const m: Modifier = { id, nodeId, kind: "boolean", order: node.modifierIds.length, enabled: true, version: 0, parameters: { cutterNodeId, operation } };
+  node.modifierIds.push(id); p.modifiers.push(m); return m;
+}
+function fake() {
+  const calls: CsgRequest[] = [];
+  const run = vi.fn(async (request: CsgRequest): Promise<CsgResult> => {
+    calls.push(request);
+    const output = { positions: request.target.mesh.positions.slice(), indices: request.target.mesh.indices.slice() };
+    output.positions[0] = (output.positions[0] ?? 0) + 0.1;
+    return { jobId: request.jobId, coordinateSpace: "target-local", output, empty: false, faceOrigins: new Uint8Array(output.indices.length / 3), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] };
+  });
+  return { run, cancel: vi.fn(), calls };
+}
+
+describe("ModifierEvaluator", () => {
+  it("returns source geometry, leaves Project untouched and protects cached buffers", async () => {
+    const p = fixture(), before = JSON.stringify(p), csg = fake(), evaluator = new ModifierEvaluator({ csg });
+    const first = await evaluator.evaluate(p, "a");
+    expect(first.ok).toBe(true);
+    if (first.ok) first.mesh.positions[0] = 500;
+    const second = await evaluator.evaluate(p, "a");
+    expect(second.ok && second.mesh.positions[0]).not.toBe(500);
+    expect(csg.calls).toHaveLength(0); expect(JSON.stringify(p)).toBe(before);
+    evaluator.dispose(); expect(evaluator.cacheSizeBytes).toBe(0);
+  });
+  it("applies two stages in order, resolves parent transforms, and reuses cache", async () => {
+    const p = fixture(), csg = fake();
+    add(p, "a", "m1", "b"); add(p, "a", "m2", "c", "union");
+    p.nodes.find(n => n.id === "a")!.transform.position = [1, 0, 0];
+    p.nodes.find(n => n.id === "b")!.transform.position = [2, 0, 0];
+    const evaluator = new ModifierEvaluator({ csg });
+    const first = await evaluator.evaluate(p, "a");
+    expect(first.ok && first.appliedModifierIds).toEqual(["m1", "m2"]);
+    expect(csg.calls.map(x => x.operation)).toEqual(["subtract", "union"]);
+    expect(csg.calls[1]!.target.mesh.positions[0]).toBeCloseTo(csg.calls[0]!.target.mesh.positions[0]! + 0.1);
+    expect(csg.calls[0]!.target.worldMatrix![12]).toBe(1);
+    expect(csg.calls[0]!.cutter.worldMatrix![12]).toBe(2);
+    await evaluator.evaluate(p, "a"); expect(csg.calls).toHaveLength(2);
+    p.modifiers[1]!.parameters.operation = "intersect";
+    await evaluator.evaluate(p, "a"); expect(csg.calls).toHaveLength(3);
+    expect(csg.calls[2]!.operation).toBe("intersect");
+  });
+  it("invalidates dependent stages but preserves independent stages", async () => {
+    const p = fixture(), csg = fake(), evaluator = new ModifierEvaluator({ csg });
+    add(p, "a", "ma", "b"); add(p, "d", "md", "c");
+    await evaluator.evaluate(p, "a"); await evaluator.evaluate(p, "d");
+    expect(csg.calls).toHaveLength(2);
+    p.nodes.find(n => n.id === "b")!.transform.position = [3, 0, 0];
+    await evaluator.evaluate(p, "a"); await evaluator.evaluate(p, "d");
+    expect(csg.calls).toHaveLength(3);
+    const b = p.nodes.find(n => n.id === "b")!;
+    if (b.kind === "mesh" && b.meshSource.kind === "primitive") b.meshSource.parameters.size = 2;
+    await evaluator.evaluate(p, "a"); expect(csg.calls).toHaveLength(4);
+  });
+  it("handles toggle and reorder without treating disabled modifiers as applied", async () => {
+    const p = fixture(), csg = fake(), evaluator = new ModifierEvaluator({ csg });
+    const one = add(p, "a", "one", "b"), two = add(p, "a", "two", "c", "union");
+    await evaluator.evaluate(p, "a");
+    one.enabled = false;
+    const toggled = await evaluator.evaluate(p, "a");
+    expect(toggled.ok && toggled.appliedModifierIds).toEqual(["two"]);
+    expect(csg.calls).toHaveLength(3);
+    one.enabled = true;
+    await evaluator.evaluate(p, "a"); expect(csg.calls).toHaveLength(3);
+    p.nodes.find(n => n.id === "a")!.modifierIds = ["two", "one"];
+    two.order = 0; one.order = 1;
+    const reordered = await evaluator.evaluate(p, "a");
+    expect(reordered.ok && reordered.appliedModifierIds).toEqual(["two", "one"]);
+    expect(csg.calls).toHaveLength(5);
+  });
+  it("reports missing, self and indirect cycles, bad parameters and unsupported kinds", async () => {
+    const p = fixture(), evaluator = new ModifierEvaluator({ csg: fake() });
+    const m = add(p, "a", "ma", "missing");
+    expect((await evaluator.evaluate(p, "a")).ok).toBe(false);
+    expect((await evaluator.evaluate(p, "a"))).toMatchObject({ error: { code: "INVALID_REFERENCE" } });
+    m.parameters.cutterNodeId = "a";
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "DEPENDENCY_CYCLE" } });
+    m.parameters.cutterNodeId = "b"; add(p, "b", "mb", "a");
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "DEPENDENCY_CYCLE" } });
+    p.nodes.find(n => n.id === "b")!.modifierIds = []; p.modifiers.pop();
+    m.parameters = { operation: "wrong", cutterNodeId: "b" };
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
+    m.kind = "mirror";
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "UNSUPPORTED_MODIFIER" } });
+  });
+  it("keeps a fallback on worker failure and recovers on retry", async () => {
+    const p = fixture(), csg = fake(), evaluator = new ModifierEvaluator({ csg });
+    add(p, "a", "m", "b");
+    csg.run.mockRejectedValueOnce(new CsgError("GEOMETRY_NON_MANIFOLD", "open surface"));
+    const failed = await evaluator.evaluate(p, "a");
+    expect(failed).toMatchObject({ ok: false, error: { code: "GEOMETRY_NON_MANIFOLD" }, fallback: true, appliedModifierIds: [] });
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true });
+  });
+  it("cancels an in-flight job, rejects late output, then accepts another job", async () => {
+    const p = fixture(), controller = new AbortController(), csg = fake();
+    add(p, "a", "m", "b");
+    let complete!: (value: CsgResult) => void;
+    csg.run.mockImplementationOnce((request: CsgRequest) => new Promise<CsgResult>(resolve => { complete = resolve; csg.calls.push(request); }));
+    const evaluator = new ModifierEvaluator({ csg });
+    const pending = evaluator.evaluate(p, "a", controller.signal);
+    await vi.waitFor(() => expect(csg.calls).toHaveLength(1));
+    controller.abort();
+    complete({ jobId: "late", coordinateSpace: "target-local", output: csg.calls[0]!.target.mesh, empty: false, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] });
+    expect(await pending).toMatchObject({ ok: false, error: { code: "JOB_CANCELLED" }, fallback: false });
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true });
+  });
+  it("composes different parent transforms", async () => {
+    const p = fixture(), csg = fake();
+    add(p, "a", "m", "b");
+    const root = p.nodes[0]!;
+    const group = { ...structuredClone(root), id: "group", parentId: root.id, children: ["b"], transform: { ...root.transform, position: [5, 0, 0] as const } };
+    p.nodes.push(group); root.children.push(group.id);
+    p.nodes.find(n => n.id === "b")!.parentId = group.id;
+    p.nodes.find(n => n.id === "b")!.transform.position = [2, 0, 0];
+    await new ModifierEvaluator({ csg }).evaluate(p, "a");
+    expect(csg.calls[0]!.cutter.worldMatrix![12]).toBe(7);
+  });
+  it("uses only local asset resolver and its content fingerprint", async () => {
+    const p = fixture(), csg = fake();
+    const a = p.nodes.find(n => n.id === "a")!;
+    if (a.kind !== "mesh") throw new Error("fixture");
+    a.meshSource = { kind: "asset", assetId: "asset" };
+    p.assets.push({ id: "asset", hash: "hash", mediaType: "model/gltf-binary", path: "assets/a.glb", colorSpace: "none" });
+    let fingerprint = "v1";
+    const resolver = vi.fn(async () => ({ mesh: { positions: new Float32Array([-1,-1,0, 1,-1,0, 0,1,0]), indices: new Uint32Array([0,1,2]) }, fingerprint }));
+    const evaluator = new ModifierEvaluator({ csg, assetResolver: resolver });
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true });
+    fingerprint = "v2";
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true });
+    expect(resolver).toHaveBeenCalledTimes(2);
+    await expect(new ModifierEvaluator({ csg }).evaluate(p, "a")).resolves.toMatchObject({ error: { code: "ASSET_DECODE_FAILED" } });
+  });
+  it("accepts empty intersection and bounded cache eviction", async () => {
+    const p = fixture(), csg = fake(); add(p, "a", "m", "b", "intersect");
+    csg.run.mockResolvedValueOnce({ jobId: "empty", coordinateSpace: "target-local", output: { positions: new Float32Array(), indices: new Uint32Array() }, empty: true, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] });
+    const evaluator = new ModifierEvaluator({ csg, byteBudget: 1000 });
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true, empty: true });
+    expect(evaluator.cacheSizeBytes).toBeLessThanOrEqual(1000);
+    evaluator.clearCache(); expect(evaluator.cacheSizeBytes).toBe(0);
+  });
+  it("rejects a changed Project after an asynchronous worker completes", async () => {
+    const p = fixture(), csg = fake(); add(p, "a", "m", "b");
+    let complete!: (value: CsgResult) => void;
+    csg.run.mockImplementationOnce((request: CsgRequest) => new Promise<CsgResult>(resolve => { complete = resolve; csg.calls.push(request); }));
+    const evaluator = new ModifierEvaluator({ csg });
+    const pending = evaluator.evaluate(p, "a");
+    await vi.waitFor(() => expect(csg.calls).toHaveLength(1));
+    p.nodes.find(n => n.id === "b")!.transform.position = [1, 0, 0];
+    complete({ jobId: "late", coordinateSpace: "target-local", output: csg.calls[0]!.target.mesh, empty: false, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] });
+    expect(await pending).toMatchObject({ ok: false, error: { code: "STALE_PROJECT" }, fallback: false });
+  });
 });
 </file>
 
@@ -9065,63 +9442,6 @@ describe("domain scene synchronization", () => {
 }
 </file>
 
-<file path="docs/data-contracts.md">
-# Data and contracts
-
-## Native `.triad3d` container (TASK-010A)
-
-The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. The document uses schema v1 (`schemaVersion: "1.0.0"`); the manifest uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
-
-The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
-
-## GLB import (TASK-010B)
-
-A confirmed static GLB 2.0 is stored unchanged as `assets/<sha256>.glb` with `mediaType: model/gltf-binary` and `colorSpace: none`. One domain mesh node with identity transform points to the asset under the existing model root; glTF transforms and PBR data remain inside the binary source. No material slots or editable child meshes are synthesized. Import metadata is covered by reversible command patches, while bytes stay in RAM and in the explicit native archive. Duplicate identical GLBs reuse the existing asset ID and bytes. Unsupported animations, skinning, morph targets, multiple mesh nodes or scenes, glTF extensions and any URI are rejected before parsing; this is a partial implementation of FR-064.
-
-## Project invariants
-
-- Exactly one Model and one Scene.
-- Node has unique stable ID and parent cannot form cycle.
-- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
-- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
-- Session history in RAM only, no autosave on tab close.
-
-## Entities
-
-- `Project`: schemaVersion/modelId/sceneId/assets/animations
-- `Model`: rootNodeId/revision/child hierarchy
-- `Scene`: camera/background/HDRI/light/instances
-- `Node`: id/type/transform/parent/material/modifiers
-- `Modifier`: id/type/order/args/enabled
-- `Material`: PBR fields + slots
-- `Asset`: hash/mediaType/path/colorspace
-- `AnimationClip`: duration/loop/trackRefs
-- `Track`: nodeId/propertyPath/keyframes
-- `InteractionRule NEXT`: typed event/condition/action
-
-## Messages
-
-- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
-- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
-- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
-- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
-- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
-- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
-
-## JSON document and native manifest v1
-
-- `document.json` uses the current `Project` shape and `schemaVersion: "1.0.0"`. Its authoritative machine-readable contract is [`document-v1.schema.json`](../src/domain/schemas/document-v1.schema.json). `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
-- `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
-- Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. No migration is registered until a real earlier schema exists.
-- Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
-
-The earlier illustrative example used `formatVersion`, `projectId`, and `scene.modelInstances` inside the document. The implemented domain type instead uses `schemaVersion`, `id`, and `scene.instances`; TASK-009 fixes the JSON contract to those existing types without inventing fields.
-
-## Error codes
-
-FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
-</file>
-
 <file path="src/renderer/scene-sync.ts">
 import * as T from "three";
 import type { DeepReadonly } from "../app/editor-store";
@@ -9283,6 +9603,69 @@ export class SceneSync {
   private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.surfaces.clear(); }
   dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
 }
+</file>
+
+<file path="docs/data-contracts.md">
+# Data and contracts
+
+## Native `.triad3d` container (TASK-010A)
+
+The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. The document uses schema v1 (`schemaVersion: "1.0.0"`); the manifest uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
+
+The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
+
+## GLB import (TASK-010B)
+
+A confirmed static GLB 2.0 is stored unchanged as `assets/<sha256>.glb` with `mediaType: model/gltf-binary` and `colorSpace: none`. One domain mesh node with identity transform points to the asset under the existing model root; glTF transforms and PBR data remain inside the binary source. No material slots or editable child meshes are synthesized. Import metadata is covered by reversible command patches, while bytes stay in RAM and in the explicit native archive. Duplicate identical GLBs reuse the existing asset ID and bytes. Unsupported animations, skinning, morph targets, multiple mesh nodes or scenes, glTF extensions and any URI are rejected before parsing; this is a partial implementation of FR-064.
+
+## Project invariants
+
+- Exactly one Model and one Scene.
+- Node has unique stable ID and parent cannot form cycle.
+- Source meshes and modifiers stored; derived mesh caches omitted from authoritative model.
+- Manual archive `.triad3d` (ZIP) with manifest/document/assets; bytes pinned by hash.
+- Session history in RAM only, no autosave on tab close.
+
+## Entities
+
+- `Project`: schemaVersion/modelId/sceneId/assets/animations
+- `Model`: rootNodeId/revision/child hierarchy
+- `Scene`: camera/background/HDRI/light/instances
+- `Node`: id/type/transform/parent/material/modifiers
+- `Modifier`: id/type/order/args/enabled
+- `Material`: PBR fields + slots
+- `Asset`: hash/mediaType/path/colorspace
+- `AnimationClip`: duration/loop/trackRefs
+- `Track`: nodeId/propertyPath/keyframes
+- `InteractionRule NEXT`: typed event/condition/action
+
+## Messages
+
+- `executeCommand(command, expectedRevision)` returns patch+inverse or error.
+- `computeGeometry(jobId, sourceMesh, orderedModifiers)` returns derived mesh/stats or error.
+- `evaluateAnimation(clipId, t)` returns pose; use absolute time not accumulated deltas.
+- `importNativeProject(bytes)` performs dry-run validation before replacing current document.
+- `exportReact(document, quality, props)` returns TSX, assets, README and omissions.
+- `exportGLTF` NEXT: compatible asset data only; runtime logic excluded.
+
+## JSON document and native manifest v1
+
+- `document.json` uses the current `Project` shape and `schemaVersion: "1.0.0"`. Its authoritative machine-readable contract is [`document-v1.schema.json`](../src/domain/schemas/document-v1.schema.json). `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
+- `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
+- Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. No migration is registered until a real earlier schema exists.
+- Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
+
+The earlier illustrative example used `formatVersion`, `projectId`, and `scene.modelInstances` inside the document. The implemented domain type instead uses `schemaVersion`, `id`, and `scene.instances`; TASK-009 fixes the JSON contract to those existing types without inventing fields.
+
+## Error codes
+
+FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+
+## TASK-021 modifier evaluation
+
+Enabled Boolean modifiers use `parameters: { operation: "subtract" | "union" | "intersect", cutterNodeId: string }`. This fits the existing document v1 parameter map without a schema change. `node.modifierIds` defines stack order; the corresponding `Modifier.order` values must be strictly increasing.
+
+`ModifierEvaluator.evaluate(project, meshNodeId, signal?)` returns a discriminated success/error result with detached local-space `MeshData`, `empty`, CSG warnings, applied modifier IDs and an optional fallback after failure. Asset-backed meshes require a local `assetResolver` that supplies detached geometry and a content fingerprint. The evaluator never writes Project or history. It owns an in-memory, byte-bounded LRU stage cache; `clearCache()` and `dispose()` release cached buffers. A single evaluator accepts one active job at a time. Boolean uses `CsgService`; UV, authored normals, material groups and slots are not preserved by CSG. SceneSync is not yet connected to this service.
 </file>
 
 <file path="src/domain/command-bus.ts">
@@ -10712,6 +11095,12 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## TASK-021 — Modifier Graph Evaluator (MVP)
+
+- `src/geometry/modifiers/` evaluates primitive and locally resolved asset meshes through ordered Boolean stacks using the existing CSG service. Dependencies, hierarchy transforms, self and indirect cycles, invalid references and parameters receive typed diagnostics. Unsupported modifier kinds remain explicit errors.
+- Derived stages live only in a configurable byte-bounded LRU cache. Keys include source content, modifier identity/version/order/parameters, cutter stages and influencing world matrices. Results are copied at API boundaries. Errors can return the last valid stage as a marked fallback; cancellation and stale Project detection do not publish a result.
+- `SceneSync` still renders source geometry. Boolean UI, modifier editing commands, and general modifier algorithms remain later tasks. CSG output retains XYZ/triangles only; UV and material groups/slots are lost and normals need recomputation for display.
 
 ## TASK-018 — Inspector трансформаций и параметров примитивов
 

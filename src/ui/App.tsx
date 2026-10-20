@@ -11,6 +11,8 @@ import packageInfo from "../../package.json";
 import { createPrimitiveNode, primitiveDefinitions, type PrimitiveKind } from "../geometry/primitives";
 import { ObjectTree } from "./ObjectTree";
 import { Inspector } from "./Inspector";
+import { JobOverlay } from "./JobOverlay";
+import { isJobActive } from "../app/job-controller";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -61,7 +63,8 @@ function EditorShell() {
   const dirty = selectDirty(state);
   const canUndo = selectCanUndo(state);
   const canRedo = selectCanRedo(state);
-  const blocked = fileBusy || !!pendingGlb || state.job.status === "validating" || state.job.status === "running" || state.job.status === "applying";
+  const jobBlocked = isJobActive(state.job.status);
+  const blocked = fileBusy || !!pendingGlb || jobBlocked;
   const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
   useEffect(() => () => { dragCleanup.current?.(); }, []);
@@ -237,11 +240,12 @@ function EditorShell() {
   }
   return (
     <div className="app-shell">
+      <div className="app-content" inert={jobBlocked}>
       <header className="topbar">
         <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="project-title" title={project.name}>{project.name}</span><span className={`dirty-indicator ${dirty ? "is-dirty" : ""}`} title={dirty ? "Есть несохранённые изменения" : "Нет несохранённых изменений"}>{dirty ? "● Не сохранено" : "Сохранено"}</span></div>
         <div className="mode-switch" role="group" aria-label="Режим редактора">
-          <button type="button" aria-pressed={state.tool.mode === "model"} onClick={() => editorStore.setTool({ mode: "model" })}>Модель</button>
-          <button type="button" aria-pressed={state.tool.mode === "scene"} onClick={() => editorStore.setTool({ mode: "scene" })}>Сцена</button>
+          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "model"} onClick={() => editorStore.setTool({ mode: "model" })}>Модель</button>
+          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "scene"} onClick={() => editorStore.setTool({ mode: "scene" })}>Сцена</button>
         </div>
         <div className="file-actions">
           <button type="button" disabled={blocked} onClick={newProject}>Новый проект</button>
@@ -283,6 +287,8 @@ function EditorShell() {
       </div>
       <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
       <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
+      </div>
+      <JobOverlay job={state.job} cancel={() => editorStore.jobs.cancelJob()} />
     </div>
   );
 }

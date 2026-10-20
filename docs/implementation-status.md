@@ -1,5 +1,11 @@
 # Implementation status
 
+## TASK-027 — Transactional Heavy Job Controller (MVP)
+
+- `EditorStore.jobs.run(spec)` validates a detached Project snapshot, runs one asynchronous computation with `AbortSignal` and optional progress, then commits prepared typed commands through one CommandBus transaction. `cancelJob()` and `dispose()` terminate the active lifecycle; late results and progress are ignored. Read-only jobs leave document, dirty state and history untouched.
+- Active jobs block EditorStore document/history writes, project replacement, save confirmation, selection and tool changes. The Russian modal overlay uses `inert` for background controls, exposes actual progress or an indeterminate indicator, diagnostics, and Cancel when supported. Renderer synchronization still follows derived generation rather than progress updates.
+- Targeted tests cover lifecycle, atomic Undo, validation, concurrent starts, cancellation, Worker diagnostics, stale context, mutation guards, invalid commit, progress and disposal. TST-025 remains pending as a full browser E2E scenario until Boolean UI can start a real long operation. No Boolean modifier commands or UI were added.
+
 ## TASK-021 — Modifier Graph Evaluator (MVP)
 
 - `src/geometry/modifiers/` evaluates primitive and locally resolved asset meshes through ordered Boolean stacks using the existing CSG service. Dependencies, hierarchy transforms, self and indirect cycles, invalid references and parameters receive typed diagnostics. Unsupported modifier kinds remain explicit errors.

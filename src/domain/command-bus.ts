@@ -23,6 +23,7 @@ export const CommandErrorCode = {
   NODE_HIDDEN: "NODE_HIDDEN",
   VALIDATION_FAILED: "VALIDATION_FAILED",
   INTERNAL_ERROR: "INTERNAL_ERROR",
+  JOB_BUSY: "JOB_BUSY",
 } as const;
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
