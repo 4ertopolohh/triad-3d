@@ -90,3 +90,11 @@ body { margin: 0; }
 .renderer-toolbar button:not(:disabled):hover { border-color: var(--color-primary-accent-strong); }
 .renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
 .renderer-status [role="alert"] { color: var(--color-state-danger); }
+.primitive-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.primitive-editor { display: grid; gap: 10px; margin-bottom: 18px; }
+.primitive-editor h3 { margin: 0; font-size: 14px; }
+.primitive-editor label { display: grid; gap: 4px; font-size: 12px; }
+.primitive-editor input { width: 100%; box-sizing: border-box; }
+.primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
+button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
+button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }

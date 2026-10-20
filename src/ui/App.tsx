@@ -8,6 +8,8 @@ import { AssetBytes } from "../assets/asset-bytes";
 import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
 import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
 import packageInfo from "../../package.json";
+import { createPrimitiveNode, primitiveDefinitions, validatePrimitiveSource, type PrimitiveKind, type PrimitiveSource } from "../geometry/primitives";
+import type { DeepReadonly } from "../app/editor-store";
 
 const RendererSpike = import.meta.env.DEV
   ? lazy(() => import("../spikes/renderer/RendererSpike"))
@@ -223,6 +225,25 @@ function EditorShell() {
     setPendingGlb(null);
     notice(result.ok ? "success" : "error", result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
   }
+  const root = project.nodes.find(node => node.id === project.model.rootNodeId);
+  const canEditModel = !blocked && state.tool.mode === "model" && !!root?.visible && !root?.locked;
+  const selected = project.nodes.find(node => node.id === state.selection.activeId);
+  let selectedUnavailable = "";
+  if (selected) {
+    let ancestor: typeof selected | undefined = selected;
+    while (ancestor) {
+      if (ancestor.locked) { selectedUnavailable = "Объект или его родитель заблокирован."; break; }
+      if (!ancestor.visible) { selectedUnavailable = "Объект или его родитель скрыт."; break; }
+      ancestor = ancestor.parentId ? project.nodes.find(node => node.id === ancestor?.parentId) : undefined;
+    }
+  }
+  function addPrimitive(kind: PrimitiveKind) {
+    if (!canEditModel) return;
+    const node = createPrimitiveNode(kind, project.model.rootNodeId, crypto.randomUUID());
+    const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, state.document.revision);
+    if (!result.ok) notice("error", result.message);
+    else { editorStore.setSelection([node.id], node.id); notice("success", `${node.name} добавлен в модель.`); }
+  }
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -258,10 +279,10 @@ function EditorShell() {
             <p className="eyebrow">Текущий проект</p>
             <div className="project-name">{project.name}</div>
             <div className="tree-row"><span aria-hidden="true">▦</span> Модель <small>корень</small></div>
-            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <div className="tree-row" key={node.id}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></div>)}
+            {project.nodes.filter((node) => node.parentId === project.model.rootNodeId).map((node) => <button type="button" className="tree-row" key={node.id} aria-pressed={state.selection.activeId === node.id} onClick={() => editorStore.setSelection([node.id], node.id)}><span aria-hidden="true">◇</span>{node.name}<small>{node.kind === "mesh" && node.meshSource.kind === "asset" ? "GLB" : node.kind}</small></button>)}
             <div className="tree-row"><span aria-hidden="true">◫</span> Сцена</div>
             <p className="panel-hint">Дерево объектов и инструменты редактирования появятся в следующих задачах.</p>
-          </div> : <div className="panel-content"><p className="panel-hint">Библиотека ресурсов появится в следующих задачах. Импортированный GLB сохраняется в проекте.</p></div>}
+          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
@@ -271,11 +292,39 @@ function EditorShell() {
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
         <aside className="dock right-dock" aria-label="Инспектор">
           <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><p className="eyebrow">{state.tool.mode === "scene" ? "Окружение" : "Свойства"}</p><p className="panel-hint">{state.selection.activeId ? "Редактирование свойств выбранного объекта появится в следующих задачах." : state.tool.mode === "scene" ? "Объект не выделен. Настройки окружения сцены появятся в следующих задачах." : "Объект не выделен. Инспектор свойств появится в следующих задачах."}</p><div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
+          <div className="panel-content"><p className="eyebrow">{state.tool.mode === "scene" ? "Окружение" : "Свойства"}</p>{selected?.kind === "mesh" && selected.meshSource.kind === "primitive" ? <PrimitiveEditor key={`${selected.id}:${JSON.stringify(selected.meshSource)}`} source={selected.meshSource} disabled={!canEditModel || !!selectedUnavailable} reason={blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : selectedUnavailable} onApply={source => { const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [selected.id], payload: { nodeId: selected.id, source } }, editorStore.getSnapshot().document.revision); if (!result.ok) notice("error", result.message); else if (result.changed) notice("success", "Параметры обновлены."); }} /> : <p className="panel-hint">{state.selection.activeId ? "Параметры выбранного объекта пока недоступны." : "Выберите примитив в структуре или viewport."}</p>}<div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div><div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div></div>
         </aside>
       </div>
       <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
       <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
     </div>
   );
+}
+
+function PrimitiveEditor({ source, disabled, reason, onApply }: { source: DeepReadonly<PrimitiveSource>; disabled: boolean; reason: string; onApply: (source: PrimitiveSource) => void }) {
+  const specs = primitiveDefinitions[source.primitive].parameters;
+  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
+    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
+  const [draft, setDraft] = useState<Record<string, string>>(() => Object.fromEntries(keys.map(key => [key, String(source.parameters[key] ?? specs[key]!.defaultValue)])));
+  const [error, setError] = useState("");
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    const parameters: Record<string, number> = { ...source.parameters };
+    for (const key of keys) {
+      if (!draft[key]?.trim()) { setError(`Введите значение «${specs[key]!.label}».`); return; }
+      parameters[key] = Number(draft[key]);
+    }
+    const next: PrimitiveSource = { kind: "primitive", primitive: source.primitive, parameters };
+    const issue = validatePrimitiveSource(next);
+    if (issue) { setError(issue); return; }
+    setError("");
+    onApply(next);
+  }
+  return <form className="primitive-editor" onSubmit={submit}>
+    <h3>{primitiveDefinitions[source.primitive].label}</h3>
+    {keys.map(key => <label key={key}>{specs[key]!.label}<input type="number" step={specs[key]!.integer ? 1 : "any"} min={specs[key]!.min === Number.MIN_VALUE ? "0" : specs[key]!.min} max={specs[key]!.max} value={draft[key] ?? ""} disabled={disabled} onChange={event => { setDraft(previous => ({ ...previous, [key]: event.target.value })); setError(""); }} /></label>)}
+    <button type="submit" disabled={disabled}>Применить параметры</button>
+    {reason && <p className="panel-hint">{reason}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </form>;
 }

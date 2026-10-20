@@ -1,4 +1,5 @@
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+import { validatePrimitiveSource } from "../geometry/primitives";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -81,7 +82,10 @@ export function validateProject(project: Project): ValidationIssue[] {
     checkTransform(node, finite, `nodes.${node.id}.transform`);
     if (node.kind === "mesh") {
       if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else for (const [name, value] of Object.entries(node.meshSource.parameters)) finite(value, `nodes.${node.id}.meshSource.parameters.${name}`);
+      else {
+        const message = validatePrimitiveSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      }
     }
     for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
     for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {

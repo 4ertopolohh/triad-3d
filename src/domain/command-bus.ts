@@ -1,12 +1,14 @@
 import type { Asset, EntityId, MeshNode, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
+import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
   | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
   | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
-  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } };
+  | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } }
+  | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } };
 
 export const CommandErrorCode = {
   REVISION_CONFLICT: "REVISION_CONFLICT",
@@ -25,6 +27,7 @@ export type PatchChange =
   | { kind: "addAsset"; asset: Asset }
   | { kind: "removeAsset"; asset: Asset }
   | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children"; before: Node["name"] | Transform | boolean | EntityId[]; after: Node["name"] | Transform | boolean | EntityId[] }
+  | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
   | { kind: "modelRevision"; before: number; after: number };
 export interface ProjectPatch { changes: PatchChange[] }
 
@@ -48,6 +51,9 @@ const idList = (value: unknown): value is string[] => Array.isArray(value) && va
 const numbers = (value: unknown, count: number): value is number[] =>
   Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+const samePrimitive = (left: PrimitiveSource, right: PrimitiveSource): boolean => left.primitive === right.primitive
+  && Object.keys(left.parameters).length === Object.keys(right.parameters).length
+  && Object.keys(left.parameters).every(key => Object.hasOwn(right.parameters, key) && left.parameters[key] === right.parameters[key]);
 const ownKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
   Object.keys(value).every((key) => keys.includes(key));
 
@@ -70,8 +76,7 @@ function validNode(value: unknown): value is Node {
   if (!record(source)) return false;
   if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
   return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
-    && ["cube", "sphere", "torus", "cylinder", "cone", "plane"].includes(String(source.primitive))
-    && record(source.parameters) && Object.values(source.parameters).every((item) => typeof item === "number" && Number.isFinite(item));
+    && validatePrimitiveSource(source) === null;
 }
 
 function validCommand(value: unknown): value is ProjectCommand {
@@ -98,6 +103,8 @@ function validCommand(value: unknown): value is ProjectCommand {
   switch (value.type) {
     case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
     case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
+    case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
+      && ownKeys(payload.source, ["kind", "primitive", "parameters"]) && validatePrimitiveSource(payload.source) === null;
     case "SET_NODE_FLAGS": return ownKeys(payload, ["nodeId", "visible", "locked"])
       && (Object.hasOwn(payload, "visible") || Object.hasOwn(payload, "locked"))
       && (!Object.hasOwn(payload, "visible") || typeof payload.visible === "boolean")
@@ -161,6 +168,13 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
   switch (command.type) {
     case "RENAME_NODE": next = { ...current, name: command.payload.name }; break;
     case "SET_NODE_TRANSFORM": next = { ...current, transform: structuredClone(command.payload.transform) }; break;
+    case "SET_PRIMITIVE_PARAMETERS":
+      if (current.kind !== "mesh" || current.meshSource.kind !== "primitive")
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Узел не является параметрическим примитивом.");
+      if (current.meshSource.primitive !== command.payload.source.primitive)
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Тип примитива нельзя изменить командой параметров.");
+      next = samePrimitive(current.meshSource, command.payload.source) ? current
+        : { ...current, meshSource: structuredClone(command.payload.source) }; break;
     case "SET_NODE_FLAGS": next = { ...current,
       visible: command.payload.visible ?? current.visible,
       locked: command.payload.locked ?? current.locked }; break;
@@ -188,6 +202,8 @@ function diff(before: Project, after: Project): ProjectPatch {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
+    if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
+      changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
   }
   if (before.model.revision !== after.model.revision) changes.push({ kind: "modelRevision", before: before.model.revision, after: after.model.revision });
   return { changes };
@@ -200,6 +216,7 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
     if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
+    if (change.kind === "setPrimitiveSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
   }) };
 }
@@ -225,6 +242,10 @@ export function applyProjectPatch(project: Project, patch: ProjectPatch): Projec
     } else if (change.kind === "modelRevision") {
       if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
       result.model.revision = change.after;
+    } else if (change.kind === "setPrimitiveSource") {
+      const node = result.nodes.find((entry) => entry.id === change.nodeId);
+      if (!node || node.kind !== "mesh" || node.meshSource.kind !== "primitive" || !same(node.meshSource, change.before)) throw new Error("Patch primitive conflict");
+      node.meshSource = structuredClone(change.after);
     } else {
       const node = result.nodes.find((entry) => entry.id === change.nodeId);
       if (!node || !same(node[change.field], change.before)) throw new Error("Patch field conflict");
