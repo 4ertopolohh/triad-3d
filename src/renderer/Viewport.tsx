@@ -54,12 +54,19 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
   const canTransform = editable(state, state.selection.activeId, blocked);
+  const vertexMode = state.meshEdit.mode === "vertex";
+  const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
   return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
     <div className="renderer-toolbar">
+      <div className="viewport-tools" role="group" aria-label="Режим выбора">
+        <button type="button" aria-pressed={!vertexMode} onClick={() => store.exitVertexMode()}>Объект</button>
+        <button type="button" aria-pressed={vertexMode} disabled={mode !== "model" || blocked || state.selection.ids.length !== 1 || activeNode?.kind !== "mesh" || activeNode.meshSource.kind !== "editable"}
+          onClick={() => { const message = store.enterVertexMode(state.document.revision, store.getProjectEpoch()); setInteractionError(message); }}>Вершины</button>
+      </div>
       <div className="viewport-tools" role="group" aria-label="Инструменты 3D">
         {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
           <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
-            disabled={tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
+            disabled={vertexMode || tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
       </div>
       <div className="viewport-tools" role="group" aria-label="Пространство координат">
         <button type="button" aria-pressed={state.tool.space === "local"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "local" })}>Локально</button>
@@ -77,7 +84,8 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
     <div className="renderer-host" ref={host} />
     <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
       <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
-      {state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
+      {!vertexMode && state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
+      {vertexMode && <span>Выбор вершин: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
       {interactionError && <span role="alert">{interactionError}</span>}
       {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
       {scene.diagnostics.map(text => <span key={text}>{text}</span>)}

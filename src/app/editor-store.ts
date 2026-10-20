@@ -5,6 +5,7 @@ import type { EntityId, Project } from "../domain/types";
 import { AssetBytes } from "../assets/asset-bytes";
 import type { LoadedProject } from "../assets/native-project-archive";
 import { createJobController, isJobActive, type JobController, type JobState } from "./job-controller";
+import { MAX_VISIBLE_VERTICES, normalizeVertexIndices } from "../geometry/vertex-selection";
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
   : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
@@ -12,6 +13,7 @@ export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
 export interface EditorState {
   readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
   readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
+  readonly meshEdit: { readonly mode: "object" | "vertex"; readonly nodeId: EntityId | null; readonly vertexIndices: readonly number[] };
   readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
   readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
   readonly job: JobState;
@@ -38,6 +40,9 @@ export interface EditorStore {
   cancelGesture(groupId: string, expectedRevision: number): CommandResult;
   addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
+  enterVertexMode(expectedRevision: number, expectedEpoch: object): string | null;
+  exitVertexMode(): void;
+  setVertexSelection(indices: readonly number[], expectedRevision: number, expectedEpoch: object): boolean;
   setTool(next: Partial<EditorState["tool"]>): void;
   setView(next: Partial<EditorState["view"]>): void;
   getAssetBytes(): AssetBytes;
@@ -67,6 +72,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   let state: EditorState = Object.freeze({
     document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
     selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+    meshEdit: Object.freeze({ mode: "object" as const, nodeId: null, vertexIndices: Object.freeze([]) as readonly number[] }),
     tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
     view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
     job: Object.freeze({ id: null, name: null, status: "idle", progress: null, cancellable: false, error: null }),
@@ -91,6 +97,35 @@ export function createEditorStore(initialProject: Project): EditorStore {
       if (change.kind === "addAsset" || change.kind === "removeAsset") needed.add(change.asset.id);
     }
     for (const id of assetBytes.ids()) if (!needed.has(id)) assetBytes.delete(id);
+  }
+
+  const emptyMeshEdit = (): EditorState["meshEdit"] => Object.freeze({ mode: "object", nodeId: null, vertexIndices: Object.freeze([]) });
+  function canEditVertex(project: DeepReadonly<Project>, nodeId: string | null): boolean {
+    if (!nodeId || state.tool.mode !== "model" || state.selection.ids.length !== 1 || state.selection.activeId !== nodeId || jobActive()) return false;
+    let node = project.nodes.find(item => item.id === nodeId);
+    if (node?.kind !== "mesh" || node.meshSource.kind !== "editable" || node.meshSource.positions.length / 3 > MAX_VISIBLE_VERTICES
+      || node.modifierIds.some(id => project.modifiers.find(item => item.id === id)?.enabled)
+      || project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === nodeId)) return false;
+    while (node) {
+      if (!node.visible || node.locked) return false;
+      node = node.parentId ? project.nodes.find(item => item.id === node!.parentId) : undefined;
+    }
+    return true;
+  }
+  function reconcileMeshEdit(project: Project, patch?: ProjectPatch): EditorState["meshEdit"] {
+    const old = state.meshEdit;
+    if (old.mode !== "vertex" || !canEditVertex(project, old.nodeId)) return emptyMeshEdit();
+    const node = project.nodes.find(item => item.id === old.nodeId)!;
+    if (node.kind !== "mesh" || node.meshSource.kind !== "editable") return emptyMeshEdit();
+    const changed = patch?.changes.some(change => change.kind === "setMeshSource" && change.nodeId === old.nodeId);
+    if (changed) {
+      const change = patch!.changes.find(item => item.kind === "setMeshSource" && item.nodeId === old.nodeId);
+      if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable"
+        || JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
+        || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return emptyMeshEdit();
+    }
+    const indices = normalizeVertexIndices(node.meshSource, old.vertexIndices);
+    return indices ? Object.freeze({ mode: "vertex", nodeId: old.nodeId, vertexIndices: Object.freeze(indices) }) : emptyMeshEdit();
   }
 
   function commit(result: CommandResult, groupId?: string): CommandResult {
@@ -121,6 +156,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       ...state,
       document: Object.freeze({ project: deepFreeze(structuredClone(result.project)), revision: result.revision, dirty: true }),
       selection: Object.freeze({ ids: Object.freeze(selectedIds), activeId: state.selection.activeId && selectedIds.includes(state.selection.activeId) ? state.selection.activeId : selectedIds[0] ?? null }),
+      meshEdit: reconcileMeshEdit(result.project, result.patch),
       history: historyState(entries, nextCursor),
       derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
     });
@@ -143,6 +179,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
     publish({ ...state,
       document: Object.freeze({ project: deepFreeze(result.project), revision: result.revision, dirty: positions[nextCursor] !== savedPosition }),
       selection: Object.freeze({ ids: Object.freeze(ids), activeId: state.selection.activeId && ids.includes(state.selection.activeId) ? state.selection.activeId : null }),
+      meshEdit: reconcileMeshEdit(result.project, direction === -1 ? entry.undoPatch as ProjectPatch : entry.patch as ProjectPatch),
       history: historyState(state.history.entries, nextCursor),
       derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
     });
@@ -189,6 +226,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
       publish({ ...state,
         document: Object.freeze({ project: deepFreeze(result.project), revision: result.revision, dirty: positions[cursor - 1] !== savedPosition }),
         history: historyState(entries, cursor - 1),
+        meshEdit: reconcileMeshEdit(result.project, entry.undoPatch as ProjectPatch),
         derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: result.revision, scope: "all" }),
       });
       return result;
@@ -239,6 +277,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
         ...state,
         document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
         selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
+        meshEdit: emptyMeshEdit(),
         history: historyState([], 0),
         derived: Object.freeze({ generation: state.derived.generation + 1, documentRevision: bus.getRevision(), scope: "all" }),
       });
@@ -252,13 +291,35 @@ export function createEditorStore(initialProject: Project): EditorStore {
         activeId !== null && selected.includes(activeId) ? activeId : null;
       if (active === state.selection.activeId && selected.length === state.selection.ids.length
         && selected.every((id, index) => id === state.selection.ids[index])) return;
-      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }) });
+      publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }),
+        meshEdit: state.meshEdit.mode === "vertex" && (selected.length !== 1 || active !== state.meshEdit.nodeId) ? emptyMeshEdit() : state.meshEdit });
+    },
+    enterVertexMode(expectedRevision, expectedEpoch) {
+      if (expectedRevision !== state.document.revision || expectedEpoch !== projectEpoch) return "Проект изменился. Повторите действие.";
+      const id = state.selection.activeId;
+      const node = state.document.project.nodes.find(item => item.id === id);
+      if (node?.kind === "mesh" && node.meshSource.kind === "editable" && node.meshSource.positions.length / 3 > MAX_VISIBLE_VERTICES)
+        return `Сетка содержит более ${MAX_VISIBLE_VERTICES} render vertices; отображение маркеров недоступно.`;
+      if (!canEditVertex(state.document.project, id)) return "Выберите один видимый и разблокированный Editable Mesh в режиме «Модель».";
+      publish({ ...state, meshEdit: Object.freeze({ mode: "vertex", nodeId: id, vertexIndices: Object.freeze([]) }) });
+      return null;
+    },
+    exitVertexMode() { if (state.meshEdit.mode === "vertex") publish({ ...state, meshEdit: emptyMeshEdit() }); },
+    setVertexSelection(indices, expectedRevision, expectedEpoch) {
+      if (expectedRevision !== state.document.revision || expectedEpoch !== projectEpoch || !canEditVertex(state.document.project, state.meshEdit.nodeId)) return false;
+      const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+      if (node?.kind !== "mesh" || node.meshSource.kind !== "editable" || state.meshEdit.mode !== "vertex") return false;
+      const normalized = normalizeVertexIndices(node.meshSource, indices);
+      if (!normalized) return false;
+      if (normalized.length === state.meshEdit.vertexIndices.length && normalized.every((id, i) => id === state.meshEdit.vertexIndices[i])) return true;
+      publish({ ...state, meshEdit: Object.freeze({ mode: "vertex", nodeId: node.id, vertexIndices: Object.freeze(normalized) }) });
+      return true;
     },
     setTool(next) {
       if (jobActive()) return;
       const tool = { ...state.tool, ...next };
       if (tool.mode === state.tool.mode && tool.active === state.tool.active && tool.space === state.tool.space) return;
-      publish({ ...state, tool: Object.freeze(tool) });
+      publish({ ...state, tool: Object.freeze(tool), meshEdit: tool.mode === "model" ? state.meshEdit : emptyMeshEdit() });
     },
     setView(next) {
       const view = { ...state.view, ...next };

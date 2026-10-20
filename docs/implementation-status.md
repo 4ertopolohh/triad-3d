@@ -1,5 +1,12 @@
 # Implementation status
 
+## CODEX-024B — Выбор и численное перемещение вершин (часть TASK-024)
+
+- Inspector явно преобразует поддерживаемый примитив в Editable Mesh через CommandBus. Object/Vertex mode и выбранные render vertex indices хранятся только в EditorStore и очищаются при потере допустимости или замене проекта.
+- Viewport выбирает вершину по SurfaceQuery, треугольнику и экранному допуску; Shift добавляет, Ctrl переключает. Совпадающие UV seam vertices представлены одной точкой. Временные GPU-инстансы следуют иерархии узла и освобождаются при смене режима и dispose. Локальное смещение через Inspector создаёт одну обратимую команду; объектный gizmo и горячие клавиши трансформации в Vertex mode отключены.
+- Desktop browser smoke: Cube → Editable Mesh → vertex click → X translation → Undo/Redo проверен в WebGPU/WebGL2; GPU-маркеры визуально подтверждены в WebGL2. Системный save picker встроенного браузера не дал завершить ручной save/reopen smoke; native archive round trip изменённой сетки с UV подтверждён тестом. TASK-024 и FR-013 остаются частичными: Edge/Face, extrude и масштабирование элементов не реализованы.
+- Проверки: `npm run typecheck`, `npm run lint`, `npm run build` PASS; целевые тесты 34 PASS. Полный `npm test` перед итоговой правкой визуальных маркеров: 32 файла, 251 тест PASS; после неё целевые тесты повторены. Сборка сохраняет существующее предупреждение о крупном chunk.
+
 ## CODEX-024A — Editable mesh domain foundation (часть TASK-024)
 
 - Project schema 1.1.0 stores JSON editable positions, triangle indices and optional UV. Strict v1.0 documents migrate in memory; ZIP manifest remains 1.0.0. Invalid geometry is rejected before project replacement.

@@ -89,6 +89,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
   const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
   const axisLabels = ["X", "Y", "Z"] as const;
   const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
+  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
   return <div className="inspector">
     <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
     {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
@@ -118,13 +119,88 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
       </section>
       <section aria-label="Геометрия"><h4>Геометрия</h4>
         {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
-          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
+          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
+        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
+      {state.meshEdit.mode === "vertex" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}
     <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
     <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
   </div>;
+}
+
+function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
+  if (blocked) return "Дождитесь завершения операции.";
+  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
+  const access = accessReason(state.document.project, node);
+  if (access) return access;
+  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
+    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
+    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
+  return "";
+}
+
+function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
+  const [error, setError] = useState("");
+  const reason = meshRestriction(state, node, blocked);
+  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
+  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
+  function convert() {
+    const current = store.getSnapshot();
+    const selected = current.document.project.nodes.find(item => item.id === node.id);
+    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
+      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  const epoch = store.getProjectEpoch();
+  function enter() {
+    const message = store.enterVertexMode(state.document.revision, epoch);
+    setError(message ?? "");
+  }
+  return <div className="mesh-edit-actions">
+    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode === "vertex"
+      ? <button type="button" onClick={() => store.exitVertexMode()}>Вернуться к объектам</button>
+      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
+    {restriction && <p className="panel-hint">{restriction}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </div>;
+}
+
+function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
+  const [error, setError] = useState("");
+  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+  const epoch = store.getProjectEpoch();
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
+  const nodeId = node.id;
+  const reason = meshRestriction(state, node, blocked);
+  function apply() {
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== "vertex" || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.vertexIndices.length !== state.meshEdit.vertexIndices.length
+      || current.meshEdit.vertexIndices.some((index, position) => index !== state.meshEdit.vertexIndices[position])) {
+      setError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = delta.map(parseNumber);
+    const failure = parsed.find(item => !item.ok);
+    if (failure && !failure.ok) { setError(failure.message); return; }
+    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
+    if (values.every(value => value === 0)) { setError(""); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId],
+      payload: { nodeId, vertexIndices: [...current.meshEdit.vertexIndices], delta: values } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  return <section aria-label="Редактирование вершин"><h4>Редактирование вершин</h4>
+    <p className="panel-hint">{node.name} · Выбрано вершин: {state.meshEdit.vertexIndices.length}</p>
+    <p className="panel-hint">Локальные координаты объекта</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !state.meshEdit.vertexIndices.length} onClick={apply}>Применить смещение</button>
+    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
+  </section>;
 }
 
 function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {

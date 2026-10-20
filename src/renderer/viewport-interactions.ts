@@ -4,6 +4,8 @@ import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { EditorStore, EditorState } from "../app/editor-store";
 import type { Transform } from "../domain/types";
 import { applyTransform, type SceneSync } from "./scene-sync";
+import { vertexRepresentatives } from "../geometry/vertex-selection";
+import { pickEditableVertex } from "./vertex-picking";
 
 type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
 const EPS = 1e-6;
@@ -66,6 +68,8 @@ export class ViewportInteractions {
   private snap = false;
   private gizmoPress = false;
   private unsubscribe: () => void;
+  private markers: T.Group | null = null;
+  private markerKey = "";
 
   constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
     private report: (message: string | null) => void, blocked: boolean) {
@@ -95,7 +99,7 @@ export class ViewportInteractions {
     const state = this.store.getSnapshot();
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
-    if (!id || !object || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
+    if (!id || !object || state.meshEdit.mode === "vertex" || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
     this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
       revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
     this.report(null);
@@ -136,12 +140,26 @@ export class ViewportInteractions {
     if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
       || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
     // TransformControls clears its axis in its own pointerup handler; a gizmo press is not a selection click.
-    if (this.gizmo.axis) return;
+    if (this.gizmo.axis && this.store.getSnapshot().meshEdit.mode === "object") return;
     const rect = this.canvas.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
     this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
       -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
     const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
+    const current = this.store.getSnapshot();
+    if (current.meshEdit.mode === "vertex") {
+      const id = current.meshEdit.nodeId;
+      const node = current.document.project.nodes.find(item => item.id === id);
+      if (!id || node?.kind !== "mesh" || node.meshSource.kind !== "editable") return;
+      if (hit?.nodeId && hit.nodeId !== id) { this.report("Для выбора другого объекта выйдите из режима вершин."); return; }
+      const vertex = hit?.nodeId === id ? pickEditableVertex(hit, node.meshSource, this.graph.camera, event.clientX, event.clientY, rect) : null;
+      const selected = current.meshEdit.vertexIndices;
+      const next = vertex === null ? [] : event.ctrlKey || event.metaKey ? selected.includes(vertex) ? selected.filter(index => index !== vertex) : [...selected, vertex]
+        : event.shiftKey ? [...selected, vertex] : [vertex];
+      this.store.setVertexSelection(next, current.document.revision, this.store.getProjectEpoch());
+      this.report(null);
+      return;
+    }
     const id = hit?.nodeId;
     if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
       const ids = this.store.getSnapshot().selection.ids;
@@ -153,6 +171,18 @@ export class ViewportInteractions {
   private onKeyDown = (event: KeyboardEvent) => {
     const target = event.target as HTMLElement | null;
     if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
+    const meshEdit = this.store.getSnapshot().meshEdit;
+    if (meshEdit.mode === "vertex") {
+      if (event.key === "Escape") {
+        if (meshEdit.vertexIndices.length) {
+          const state = this.store.getSnapshot();
+          this.store.setVertexSelection([], state.document.revision, this.store.getProjectEpoch());
+        } else this.store.exitVertexMode();
+        event.preventDefault();
+      } else if (event.key === "Delete" || ["g", "r", "s"].includes(event.key.toLowerCase())) event.preventDefault();
+      else if (event.key.toLowerCase() === "f") { this.fit(); event.preventDefault(); }
+      return;
+    }
     if (event.key === "Escape") {
       if (this.drag) this.cancel("Преобразование отменено.");
       else this.store.setSelection([]);
@@ -191,14 +221,66 @@ export class ViewportInteractions {
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
     this.gizmo.detach();
-    if (object && editable(state, id, this.blocked) && state.tool.active !== "select") {
+    if (object && state.meshEdit.mode === "object" && editable(state, id, this.blocked) && state.tool.active !== "select") {
       this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
       this.gizmo.setSpace(state.tool.space);
       this.gizmo.attach(object);
     }
     this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
     this.updateOutline(object || null);
+    this.syncMarkers(state);
   };
+  private clearMarkers(): void {
+    if (!this.markers) return;
+    this.markers.removeFromParent();
+    this.markers.traverse(part => {
+      if (part instanceof T.InstancedMesh) { part.geometry.dispose(); (part.material as T.Material).dispose(); }
+    });
+    this.markers = null;
+    this.markerKey = "";
+  }
+  private syncMarkers(state: EditorState): void {
+    const id = state.meshEdit.nodeId;
+    const node = state.document.project.nodes.find(item => item.id === id);
+    const wrapper = id ? this.graph.objects.get(id)?.object : undefined;
+    if (state.meshEdit.mode !== "vertex" || node?.kind !== "mesh" || node.meshSource.kind !== "editable" || !wrapper || this.blocked) { this.clearMarkers(); return; }
+    const key = `${id}:${state.derived.generation}:${state.meshEdit.vertexIndices.join(",")}`;
+    if (key === this.markerKey && this.markers?.parent === wrapper) return;
+    this.clearMarkers();
+    const group = new T.Group();
+    group.name = "Временные маркеры вершин";
+    const selected = new Set(state.meshEdit.vertexIndices);
+    const normal: number[] = [], active: number[] = [];
+    for (const index of vertexRepresentatives(node.meshSource)) {
+      const target = selected.has(index) ? active : normal;
+      target.push(...node.meshSource.positions.slice(index * 3, index * 3 + 3));
+    }
+    const accent = typeof document === "undefined" || !document.documentElement || typeof getComputedStyle === "undefined" ? "#5c83d2"
+      : getComputedStyle(document.documentElement).getPropertyValue("--color-primary-accent-strong").trim() || "#5c83d2";
+    const bounds = new T.Box3();
+    for (let i = 0; i < node.meshSource.positions.length; i += 3)
+      bounds.expandByPoint(new T.Vector3(...node.meshSource.positions.slice(i, i + 3) as [number, number, number]));
+    const extent = Math.max(bounds.getSize(new T.Vector3()).length(), 1e-3);
+    for (const [values, color, size] of [[normal, "#ffffff", 0.012], [active, accent, 0.022]] as const) {
+      if (!values.length) continue;
+      const geometry = new T.TetrahedronGeometry(1);
+      const material = new T.MeshBasicMaterial({ color, depthTest: false, depthWrite: false, toneMapped: false });
+      const markers = new T.InstancedMesh(geometry, material, values.length / 3);
+      const matrix = new T.Matrix4();
+      const scale = new T.Vector3(1, 1, 1).multiplyScalar(extent * size);
+      for (let i = 0; i < values.length / 3; i++) {
+        matrix.compose(new T.Vector3(values[i * 3]!, values[i * 3 + 1]!, values[i * 3 + 2]!), new T.Quaternion(), scale);
+        markers.setMatrixAt(i, matrix);
+      }
+      markers.instanceMatrix.needsUpdate = true;
+      markers.renderOrder = 1000;
+      markers.frustumCulled = false;
+      group.add(markers);
+    }
+    wrapper.add(group);
+    this.markers = group;
+    this.markerKey = key;
+  }
   private updateOutline(object: T.Object3D | null): void {
     if (!object) { this.outline.visible = false; return; }
     visibleBounds(object, this.bounds);
@@ -248,6 +330,7 @@ export class ViewportInteractions {
   dispose(): void {
     if (this.disposed) return;
     this.cancel(); this.disposed = true; this.unsubscribe();
+    this.clearMarkers();
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
