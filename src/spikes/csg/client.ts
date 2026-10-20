@@ -1,41 +1,14 @@
+import { CsgService } from "../../geometry/csg";
 import type { MeshData, Operation } from "./core";
-import type { Request, Response } from "./protocol";
 
+/** Compatibility adapter for the TASK-003 demonstration. */
 export class CsgClient {
-  private worker: Worker | undefined;
-  private sequence = 0;
-  private rejectPending: ((error: Error) => void) | undefined;
-
-  run(operation: Operation, first: MeshData, second: MeshData): Promise<Response & { ok: true }> {
-    this.cancel();
-    const id = ++this.sequence;
-    const worker = new Worker(new URL("./csg.worker.ts", import.meta.url), { type: "module" });
-    this.worker = worker;
-    return new Promise((resolve, reject) => {
-      this.rejectPending = reject;
-      worker.onmessage = (event: MessageEvent<Response>) => {
-        if (this.worker !== worker || event.data.id !== id) return;
-        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
-        if (event.data.ok) resolve(event.data);
-        else reject(new Error(`${event.data.code}: ${event.data.message}`));
-      };
-      worker.onerror = (event) => {
-        if (this.worker !== worker) return;
-        this.worker = undefined; this.rejectPending = undefined; worker.terminate();
-        reject(new Error(event.message));
-      };
-      const request: Request = { id, operation, first, second };
-      worker.postMessage(request); // structured clone preserves caller-owned buffers
-    });
+  private service = new CsgService();
+  private id = 0;
+  async run(operation: Operation, first: MeshData, second: MeshData) {
+    const result = await this.service.run({ jobId: String(++this.id), operation, target: { mesh: first }, cutter: { mesh: second } });
+    return { ok: true as const, result: { output: result.output, status: "NoError", computeMs: result.stats.computeMs, empty: result.empty, inputTriangles: result.stats.inputTriangles, outputTriangles: result.stats.outputTriangles } };
   }
-
-  cancel() {
-    ++this.sequence;
-    this.worker?.terminate();
-    this.worker = undefined;
-    this.rejectPending?.(new Error("JOB_CANCELLED: Вычисление отменено"));
-    this.rejectPending = undefined;
-  }
-
-  dispose() { this.cancel(); }
+  cancel() { this.service.cancel(); }
+  dispose() { this.service.dispose(); }
 }

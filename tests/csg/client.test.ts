@@ -1,18 +1,18 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { CsgClient } from "../../src/spikes/csg/client";
 import { makeInputs } from "../../src/spikes/csg/core";
-import type { Response } from "../../src/spikes/csg/protocol";
+import type { WorkerResponse } from "../../src/geometry/csg/protocol";
 
 class FakeWorker {
   static all: FakeWorker[] = [];
-  onmessage: ((event: MessageEvent<Response>) => void) | null = null;
+  onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null;
   onerror: ((event: ErrorEvent) => void) | null = null;
   terminated = false;
-  requestId = 0;
+  requestId = "";
   constructor() { FakeWorker.all.push(this); }
-  postMessage(request: { id: number }) { this.requestId = request.id; }
+  postMessage(request: { jobId: string }) { this.requestId = request.jobId; }
   terminate() { this.terminated = true; }
-  respond() { this.onmessage?.({ data: { id: this.requestId, ok: true, result: { output: { positions: new Float32Array(), indices: new Uint32Array() }, status: "NoError", computeMs: 0, empty: true, inputTriangles: 0, outputTriangles: 0 } } } as MessageEvent<Response>); }
+  respond() { this.onmessage?.({ data: { jobId: this.requestId, ok: true, result: { jobId: this.requestId, output: { positions: new Float32Array(), indices: new Uint32Array() }, faceOrigins: new Uint8Array(), coordinateSpace: "target-local", empty: true, stats: { computeMs: 0, inputTriangles: 0, outputTriangles: 0 }, warnings: [] } } } as unknown as MessageEvent<WorkerResponse>); }
 }
 
 afterEach(() => { vi.unstubAllGlobals(); FakeWorker.all = []; });

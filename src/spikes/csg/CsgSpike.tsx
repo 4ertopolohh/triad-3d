@@ -6,14 +6,14 @@ import { makeInputs, toThree, type Detail, type MeshData, type Operation } from 
 
 export default function CsgSpike() {
   const mount = useRef<HTMLDivElement>(null);
-  const client = useRef(new CsgClient());
+  const client = useRef<CsgClient | null>(null);
   const [operation, setOperation] = useState<Operation>("subtract");
   const [detail, setDetail] = useState<Detail>("medium");
   const [view, setView] = useState<"input" | "result">("result");
   const [data, setData] = useState<{ inputs: [MeshData, MeshData]; output: MeshData; metrics: string }>();
   const [status, setStatus] = useState("Готово к запуску");
 
-  useEffect(() => () => client.current.dispose(), []);
+  useEffect(() => { client.current = new CsgClient(); return () => { client.current?.dispose(); client.current = null; }; }, []);
   useEffect(() => {
     const host = mount.current;
     if (!host) return;
@@ -47,7 +47,7 @@ export default function CsgSpike() {
     const inputs = makeInputs(operation, detail);
     setStatus("Вычисление…");
     try {
-      const response = await client.current.run(operation, ...inputs);
+      const response = await client.current!.run(operation, ...inputs);
       const result = response.result;
       setData({ inputs, output: result.output, metrics: `Вход: ${result.inputTriangles} треугольников · Выход: ${result.outputTriangles} · CSG: ${result.computeMs.toFixed(1)} мс · ${result.status}` });
       setStatus(result.empty ? "Пустое пересечение" : "Готово");
@@ -60,7 +60,7 @@ export default function CsgSpike() {
     <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
       <select aria-label="Операция" value={operation} onChange={(event) => setOperation(event.target.value as Operation)}><option value="subtract">Вычитание</option><option value="union">Объединение</option><option value="intersect">Пересечение</option></select>
       <select aria-label="Детализация" value={detail} onChange={(event) => setDetail(event.target.value as Detail)}><option value="low">Низкая</option><option value="medium">Средняя</option><option value="high">Высокая</option></select>
-      <button onClick={run}>Запустить</button><button onClick={() => { client.current.cancel(); setStatus("JOB_CANCELLED: Вычисление отменено"); }}>Отменить</button>
+      <button onClick={run}>Запустить</button><button onClick={() => { client.current?.cancel(); setStatus("JOB_CANCELLED: Вычисление отменено"); }}>Отменить</button>
       <button onClick={() => setView(view === "input" ? "result" : "input")}>Показать {view === "input" ? "результат" : "исходные тела"}</button>
     </div>
     <div ref={mount} style={{ width: "100%", maxWidth: 1000, height: 480 }} />

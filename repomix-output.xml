@@ -92,6 +92,7 @@ src/
     validate-project.ts
   geometry/
     primitives.ts
+    surface-query.ts
   importers/
     gltf/
       import-glb.ts
@@ -145,6 +146,8 @@ tests/
     prepare.test.ts
   fixtures/
     projects.ts
+  geometry/
+    surface-query.test.ts
   importers/
     glb.test.ts
   renderer/
@@ -4128,6 +4131,245 @@ export function createPrimitiveNode(kind: PrimitiveKind, parentId: string, id: s
 }
 </file>
 
+<file path="src/geometry/surface-query.ts">
+import * as T from "three";
+import { MeshBVH, acceleratedRaycast } from "three-mesh-bvh";
+import { GenerateMeshBVHWorker } from "three-mesh-bvh/worker";
+
+/** Initial engineering heuristic, not a measured performance boundary. */
+export const DEFAULT_WORKER_TRIANGLES = 20_000;
+const MAX_TRIANGLES = 2_000_000;
+type IndexedGeometry = T.BufferGeometry & { boundsTree?: MeshBVH };
+type WorkerLike = Pick<GenerateMeshBVHWorker, "generate" | "dispose">;
+type Record = { geometry: IndexedGeometry; meshes: Set<T.Mesh>; state: "queued" | "building" | "ready" | "failed"; valid: boolean; generation: number };
+type Owner = { nodeId: string; wrapper: T.Object3D };
+
+/** Coordinates: pointLocal/normalLocal are in Mesh geometry space; pointNodeLocal is in the
+ * domain node wrapper's space; pointWorld/normalWorld are in scene world space. */
+export type SurfaceHit = {
+  nodeId: string; mesh: T.Mesh; pointWorld: T.Vector3; pointLocal: T.Vector3;
+  pointNodeLocal: T.Vector3; normalWorld: T.Vector3; normalLocal: T.Vector3;
+  distance: number; faceIndex?: number; uv?: T.Vector2;
+};
+
+function finite(values: ArrayLike<number>): boolean {
+  for (let i = 0; i < values.length; i++) if (!Number.isFinite(values[i])) return false;
+  return true;
+}
+
+function shapeValid(geometry: T.BufferGeometry): boolean {
+  const position = geometry.getAttribute("position");
+  if (!position || position.itemSize < 3 || position.count < 3 || position.count % 3 !== 0 && !geometry.index) return false;
+  const index = geometry.index;
+  const triangles = (index ? index.count : position.count) / 3;
+  return Number.isInteger(triangles) && triangles >= 1 && triangles <= MAX_TRIANGLES;
+}
+
+function suitable(geometry: T.BufferGeometry): boolean {
+  if (!shapeValid(geometry)) return false;
+  const position = geometry.getAttribute("position");
+  const index = geometry.index;
+  for (let i = 0; i < position.count; i++) {
+    if (![position.getX(i), position.getY(i), position.getZ(i)].every(Number.isFinite)) return false;
+  }
+  if (index) for (let i = 0; i < index.count; i++) {
+    const n = index.getX(i);
+    if (!Number.isInteger(n) || n < 0 || n >= position.count) return false;
+  }
+  return true;
+}
+
+async function workerCopy(geometry: T.BufferGeometry, current: () => boolean): Promise<T.BufferGeometry> {
+  // GenerateMeshBVHWorker transfers these arrays. Clone them, never live renderer buffers.
+  const copy = new T.BufferGeometry();
+  const source = geometry.getAttribute("position");
+  const positions = new Float32Array(source.count * 3);
+  for (let i = 0; i < source.count; i++) {
+    const x = source.getX(i), y = source.getY(i), z = source.getZ(i);
+    if (![x, y, z].every(Number.isFinite)) throw new Error("Invalid vertex position");
+    positions.set([x, y, z], i * 3);
+    if (i % 8192 === 8191) { await new Promise<void>(resolve => setTimeout(resolve, 0)); if (!current()) throw new Error("Stale geometry"); }
+  }
+  copy.setAttribute("position", new T.BufferAttribute(positions, 3));
+  if (geometry.index) {
+    const values = new Uint32Array(geometry.index.count);
+    for (let i = 0; i < values.length; i++) {
+      const value = geometry.index.getX(i);
+      if (!Number.isInteger(value) || value < 0 || value >= source.count) throw new Error("Invalid triangle index");
+      values[i] = value;
+      if (i % 24576 === 24575) { await new Promise<void>(resolve => setTimeout(resolve, 0)); if (!current()) throw new Error("Stale geometry"); }
+    }
+    copy.setIndex(new T.BufferAttribute(values, 1));
+  }
+  for (const group of geometry.groups) copy.addGroup(group.start, group.count, group.materialIndex);
+  return copy;
+}
+
+export class SurfaceQuery {
+  private warnings = new Map<Record, string>();
+  get diagnostics(): string[] { return [...this.warnings.values()]; }
+  private owners = new Map<T.Mesh, Owner>();
+  private records = new Map<T.BufferGeometry, Record>();
+  private queue: Record[] = [];
+  private worker: WorkerLike | undefined;
+  private active = false;
+  private closed = false;
+  private generation = 0;
+  constructor(private workerTriangles = DEFAULT_WORKER_TRIANGLES,
+    private makeWorker: () => WorkerLike = () => new GenerateMeshBVHWorker(), private onDiagnostic: () => void = () => {}) {}
+
+  private note(record: Record, message: string): void {
+    const nodeId = this.owners.get(record.meshes.values().next().value as T.Mesh)?.nodeId ?? "?";
+    this.warnings.set(record, `${nodeId}: ${message}`);
+    this.onDiagnostic();
+  }
+
+  register(nodeId: string, wrapper: T.Object3D, content: T.Object3D): void {
+    if (this.closed) return;
+    content.traverse(object => {
+      if (!(object instanceof T.Mesh) || object instanceof T.SkinnedMesh || object.morphTargetInfluences?.length || !(object.geometry instanceof T.BufferGeometry)) return;
+      const mesh = object;
+      this.owners.set(mesh, { nodeId, wrapper });
+      const geometry = mesh.geometry as IndexedGeometry;
+      let record = this.records.get(geometry);
+      if (!record) {
+        const heavy = (geometry.index?.count ?? geometry.getAttribute("position")?.count ?? 0) / 3 >= this.workerTriangles && typeof Worker !== "undefined";
+        record = { geometry, meshes: new Set(), state: "queued", valid: heavy ? false : suitable(geometry), generation: this.generation };
+        this.records.set(geometry, record);
+        record.meshes.add(mesh);
+        if (heavy && shapeValid(geometry)) {
+          this.queue.push(record); this.pump();
+        } else if (!record.valid) { record.state = "failed"; this.note(record, "Некорректная треугольная геометрия; выбор поверхности отключён."); }
+        else {
+          try { geometry.boundsTree = new MeshBVH(geometry, { indirect: true }); record.state = "ready"; }
+          catch { record.state = "failed"; this.note(record, "BVH не построен; используется обычный выбор поверхности."); }
+        }
+      }
+      record.meshes.add(mesh);
+      if (record.state === "ready") mesh.raycast = acceleratedRaycast;
+    });
+  }
+
+  release(content: T.Object3D): void {
+    content.traverse(object => {
+      if (!(object instanceof T.Mesh)) return;
+      this.owners.delete(object);
+      const geometry = object.geometry as IndexedGeometry;
+      const record = this.records.get(geometry);
+      if (!record) return;
+      record.meshes.delete(object);
+      if (record.meshes.size === 0) {
+        const building = record.state === "building";
+        record.generation = -1;
+        delete geometry.boundsTree;
+        this.records.delete(geometry);
+        this.warnings.delete(record);
+        this.queue = this.queue.filter(item => item !== record);
+        if (building) {
+          this.generation++;
+          for (const remaining of this.records.values()) remaining.generation = this.generation;
+          this.worker?.dispose(); this.worker = undefined; this.active = false; this.pump();
+        }
+      }
+    });
+  }
+
+  private pump(): void {
+    if (this.active || this.closed) return;
+    const record = this.queue.shift();
+    if (!record) return;
+    this.active = true; record.state = "building";
+    const generation = this.generation;
+    void this.build(record, generation);
+  }
+
+  private async build(record: Record, generation: number): Promise<void> {
+    let copy: T.BufferGeometry | undefined;
+    const current = () => !this.closed && generation === this.generation && record.generation === generation && this.records.get(record.geometry) === record;
+    try {
+      copy = await workerCopy(record.geometry, current);
+      if (!current()) return;
+      record.valid = true; // Standard raycast remains available while the Worker builds.
+      this.worker ??= this.makeWorker();
+      const bvh = await this.worker.generate(copy, { indirect: true });
+      if (!current()) return;
+      const serialized = MeshBVH.serialize(bvh, { cloneBuffers: false });
+      // Indirect mode preserves triangle ordering. The worker may add an identity index
+      // for non-indexed geometry; mirror it only when needed by BVH traversal.
+      if (!record.geometry.index && serialized.index) record.geometry.setIndex(new T.BufferAttribute(serialized.index.slice(), 1));
+      record.geometry.boundsTree = MeshBVH.deserialize(serialized, record.geometry, { setIndex: false });
+      record.state = "ready";
+      for (const mesh of record.meshes) mesh.raycast = acceleratedRaycast;
+    } catch {
+      if (current()) { record.state = "failed"; this.note(record, record.valid
+        ? "BVH не построен; используется обычный выбор поверхности."
+        : "Некорректная треугольная геометрия; выбор поверхности отключён.");
+        this.worker?.dispose(); this.worker = undefined; }
+    } finally {
+      copy?.dispose();
+      if (generation === this.generation) { this.active = false; this.pump(); }
+    }
+  }
+
+  nearest(ray: T.Ray, near = 0, far = Infinity): SurfaceHit | null {
+    if (this.closed || !finite(ray.origin.toArray()) || !finite(ray.direction.toArray()) || ray.direction.lengthSq() < 1e-20) return null;
+    const caster = new T.Raycaster(ray.origin, ray.direction.clone().normalize(), near, far) as T.Raycaster & { firstHitOnly?: boolean };
+    caster.firstHitOnly = true;
+    let best: SurfaceHit | null = null;
+    for (const [mesh, owner] of this.owners) {
+      let parent: T.Object3D | null = mesh;
+      let visible = true; let owned = false;
+      while (parent) { if (!parent.visible) { visible = false; break; } if (parent === owner.wrapper) owned = true; parent = parent.parent; }
+      if (!visible || !owned || !this.records.get(mesh.geometry)?.valid) continue;
+      mesh.updateWorldMatrix(true, false);
+      owner.wrapper.updateWorldMatrix(true, false);
+      const determinant = mesh.matrixWorld.determinant();
+      const nodeDeterminant = owner.wrapper.matrixWorld.determinant();
+      if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-12 || !Number.isFinite(nodeDeterminant) || Math.abs(nodeDeterminant) < 1e-12) continue;
+      const intersections: T.Intersection[] = [];
+      try { mesh.raycast(caster, intersections); } catch { continue; }
+      for (const hit of intersections) {
+        if (!Number.isFinite(hit.distance) || hit.distance < near || hit.distance > far || best && hit.distance >= best.distance) continue;
+        const local = hit.point.clone().applyMatrix4(mesh.matrixWorld.clone().invert());
+        const nodeLocal = hit.point.clone().applyMatrix4(owner.wrapper.matrixWorld.clone().invert());
+        const faceIndex = hit.faceIndex ?? undefined;
+        if (faceIndex === undefined) continue;
+        const position = mesh.geometry.getAttribute("position");
+        const index = mesh.geometry.index;
+        const a = index ? index.getX(faceIndex * 3) : faceIndex * 3;
+        const b = index ? index.getX(faceIndex * 3 + 1) : faceIndex * 3 + 1;
+        const c = index ? index.getX(faceIndex * 3 + 2) : faceIndex * 3 + 2;
+        if ([a, b, c].some(n => n >= position.count)) continue;
+        const va = new T.Vector3().fromBufferAttribute(position, a);
+        const vb = new T.Vector3().fromBufferAttribute(position, b);
+        const vc = new T.Vector3().fromBufferAttribute(position, c);
+        const normalLocal = vb.sub(va).cross(vc.sub(va)).normalize();
+        const normalWorld = normalLocal.clone().applyNormalMatrix(new T.Matrix3().getNormalMatrix(mesh.matrixWorld)).normalize();
+        if (!finite([...local.toArray(), ...nodeLocal.toArray(), ...normalWorld.toArray()]) || normalLocal.lengthSq() < 0.5) continue;
+        const uv = mesh.geometry.getAttribute("uv") && hit.uv ? hit.uv.clone() : undefined;
+        best = { nodeId: owner.nodeId, mesh, pointWorld: hit.point.clone(), pointLocal: local, pointNodeLocal: nodeLocal,
+          normalLocal, normalWorld, distance: hit.distance, faceIndex, ...(uv && finite(uv.toArray()) ? { uv } : {}) };
+      }
+    }
+    return best;
+  }
+
+  dispose(): void {
+    if (this.closed) return;
+    this.closed = true; this.clear();
+  }
+
+  clear(): void {
+    this.generation++;
+    for (const record of this.records.values()) delete record.geometry.boundsTree;
+    this.records.clear(); this.owners.clear(); this.queue = [];
+    this.warnings.clear();
+    this.worker?.dispose(); this.worker = undefined;
+    this.active = false;
+  }
+}
+</file>
+
 <file path="src/spikes/csg/client.ts">
 import type { MeshData, Operation } from "./core";
 import type { Request, Response } from "./protocol";
@@ -6023,6 +6265,208 @@ test("write generated component for isolated harness", async () => {
 });
 </file>
 
+<file path="tests/geometry/surface-query.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { MeshBVH, acceleratedRaycast } from "three-mesh-bvh";
+import { SurfaceQuery } from "../../src/geometry/surface-query";
+import { primitiveGeometry } from "../../src/renderer/primitive";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const ray = (x = 0, y = 0) => new T.Ray(new T.Vector3(x, y, 10), new T.Vector3(0, 0, -1));
+const near = (a: T.Vector3, b: T.Vector3) => expect(a.distanceTo(b)).toBeLessThan(1e-5);
+function triangle(indexed = true, uv = true): T.BufferGeometry {
+  const geometry = new T.BufferGeometry();
+  geometry.setAttribute("position", new T.Float32BufferAttribute([-1, -1, 0, 1, -1, 0, 0, 1, 0], 3));
+  if (indexed) geometry.setIndex([0, 1, 2]);
+  if (uv) geometry.setAttribute("uv", new T.Float32BufferAttribute([0, 0, 1, 0, .5, 1], 2));
+  return geometry;
+}
+function mount(query: SurfaceQuery, geometry: T.BufferGeometry, nodeId = "node") {
+  const scene = new T.Scene(); const wrapper = new T.Group(); const mesh = new T.Mesh(geometry, new T.MeshBasicMaterial({ side: T.DoubleSide }));
+  scene.add(wrapper); wrapper.add(mesh); scene.updateMatrixWorld(true); query.register(nodeId, wrapper, mesh);
+  return { scene, wrapper, mesh };
+}
+
+describe("surface queries", () => {
+  it("matches standard Three raycast on indexed and non-indexed triangles, including UV and no-hit", () => {
+    for (const indexed of [true, false]) for (const uv of [true, false]) {
+      const query = new SurfaceQuery(); const { mesh } = mount(query, triangle(indexed, uv));
+      const standard = T.Mesh.prototype.raycast;
+      const baseline: T.Intersection[] = [];
+      standard.call(mesh, new T.Raycaster(ray().origin, ray().direction), baseline);
+      const hit = query.nearest(ray());
+      expect(hit).not.toBeNull(); expect(mesh.geometry).toHaveProperty("boundsTree");
+      expect(hit!.distance).toBeCloseTo(baseline[0]!.distance);
+      near(hit!.pointWorld, baseline[0]!.point);
+      expect(hit!.faceIndex).toBe(0);
+      expect(hit!.uv?.toArray()).toEqual(uv ? [0.5, 0.5] : undefined);
+      expect(query.nearest(ray(8))).toBeNull();
+      query.dispose();
+      expect(mesh.geometry).not.toHaveProperty("boundsTree");
+    }
+  });
+  it("returns nearest visible surface and distinct world, node and mesh coordinates", () => {
+    const query = new SurfaceQuery();
+    const { scene, wrapper, mesh } = mount(query, triangle());
+    wrapper.position.set(2, 3, 1); wrapper.rotation.z = Math.PI / 2; wrapper.scale.set(2, 1, 3);
+    mesh.position.set(0, 0, 2); mesh.scale.set(1, 2, 1);
+    scene.updateMatrixWorld(true);
+    const target = new T.Vector3(0, 0, 0).applyMatrix4(mesh.matrixWorld);
+    const hit = query.nearest(ray(target.x, target.y));
+    expect(hit).not.toBeNull(); near(hit!.pointWorld, target); near(hit!.pointLocal, new T.Vector3());
+    near(hit!.pointNodeLocal, new T.Vector3(0, 0, 2));
+    near(hit!.normalWorld, new T.Vector3(0, 0, 1));
+    const front = new T.Mesh(triangle(), new T.MeshBasicMaterial({ side: T.DoubleSide }));
+    front.position.set(0, 0, 3); wrapper.add(front); scene.updateMatrixWorld(true);
+    query.register("node", wrapper, front);
+    expect(query.nearest(ray(target.x, target.y))?.mesh).toBe(front);
+    front.visible = false;
+    expect(query.nearest(ray(target.x, target.y))?.mesh).toBe(mesh);
+    wrapper.visible = false;
+    expect(query.nearest(ray(target.x, target.y))).toBeNull();
+    query.dispose();
+  });
+  it("handles normal matrix under nonuniform scale and rejects invalid data", () => {
+    const query = new SurfaceQuery(); const { scene, wrapper, mesh } = mount(query, triangle());
+    mesh.rotation.x = Math.PI / 4; wrapper.scale.set(2, 3, 1); scene.updateMatrixWorld(true);
+    const hit = query.nearest(ray());
+    expect(hit).not.toBeNull();
+    const expected = new T.Vector3(0, 0, 1).applyNormalMatrix(new T.Matrix3().getNormalMatrix(mesh.matrixWorld)).normalize();
+    near(hit!.normalWorld, expected);
+    wrapper.scale.x = 0;
+    expect(query.nearest(ray())).toBeNull();
+    query.dispose();
+    const bad = triangle(); bad.getAttribute("position").setX(0, Infinity);
+    const invalid = new SurfaceQuery(); mount(invalid, bad);
+    expect(invalid.nearest(ray())).toBeNull(); invalid.dispose();
+  });
+  it("builds BVH for all six primitive geometries", () => {
+    for (const primitive of ["cube", "sphere", "torus", "cylinder", "cone", "plane"] as const) {
+      const query = new SurfaceQuery();
+      const source = { kind: "primitive" as const, primitive, parameters: {} };
+      const { mesh } = mount(query, primitiveGeometry(source));
+      expect(mesh.geometry).toHaveProperty("boundsTree");
+      expect(query.nearest(ray())?.nodeId ?? "node").toBe("node");
+      query.dispose();
+    }
+  });
+  it("queries a nested static GLB mesh without changing document history or dirty state", async () => {
+    const project = createNestedMeshProject();
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    if (node.kind !== "mesh") throw new Error("fixture");
+    node.meshSource = { kind: "asset", assetId: "glb" };
+    project.assets.push({ id: "glb", hash: "a".repeat(64), mediaType: "model/gltf-binary", path: "assets/glb.glb", colorSpace: "none" });
+    const store = createEditorStore(project);
+    const root = new T.Group(); const nested = new T.Group(); nested.position.z = 2;
+    const mesh = new T.Mesh(triangle(), new T.MeshBasicMaterial({ side: T.DoubleSide }));
+    nested.add(mesh); root.add(nested);
+    const graph = new SceneSync(() => {}, async () => root);
+    graph.sync(store.getSnapshot().document.project, () => new Uint8Array([1]), store.getProjectEpoch());
+    await Promise.resolve(); await Promise.resolve();
+    const before = store.getSnapshot();
+    const hit = graph.surfaces.nearest(ray());
+    expect(hit?.nodeId).toBe("mesh-node"); expect(hit?.mesh).toBe(mesh);
+    near(hit!.pointLocal, new T.Vector3()); near(hit!.pointNodeLocal, new T.Vector3(0, 0, 2));
+    expect(store.getSnapshot().document.revision).toBe(before.document.revision);
+    expect(store.getSnapshot().history.entries).toEqual(before.history.entries);
+    expect(store.getSnapshot().document.dirty).toBe(before.document.dirty);
+    graph.dispose();
+  });
+  it("uses an asynchronous worker copy and ignores late results after replacement", async () => {
+    let resolve!: (bvh: MeshBVH) => void;
+    let copied!: T.BufferGeometry;
+    const dispose = vi.fn();
+    const query = new SurfaceQuery(1, () => ({ dispose, generate: copy => {
+      copied = copy; return new Promise<MeshBVH>(done => { resolve = done; });
+    } }));
+    vi.stubGlobal("Worker", class {});
+    const original = triangle(); const { mesh } = mount(query, original);
+    await vi.waitFor(() => expect(copied).toBeDefined());
+    expect(copied).not.toBe(original);
+    expect(copied.getAttribute("position").array.buffer).not.toBe(original.getAttribute("position").array.buffer);
+    expect(query.nearest(ray())?.mesh).toBe(mesh); // standard raycast while pending
+    query.release(mesh);
+    resolve(new MeshBVH(copied, { indirect: true }));
+    await Promise.resolve(); await Promise.resolve();
+    expect(original).not.toHaveProperty("boundsTree");
+    expect(dispose).toHaveBeenCalled();
+    query.dispose(); vi.unstubAllGlobals();
+  });
+  it("attaches a completed worker BVH to the live indexed and non-indexed geometry", async () => {
+    vi.stubGlobal("Worker", class {});
+    for (const indexed of [true, false]) {
+      let resolve!: (bvh: MeshBVH) => void;
+      let copy!: T.BufferGeometry;
+      const query = new SurfaceQuery(1, () => ({ dispose: vi.fn(), generate: geometry => {
+        copy = geometry; return new Promise(done => { resolve = done; });
+      } }));
+      const geometry = triangle(indexed); const { mesh } = mount(query, geometry);
+      await vi.waitFor(() => expect(copy).toBeDefined());
+      expect(geometry.getAttribute("position").array.byteLength).toBeGreaterThan(0);
+      resolve(new MeshBVH(copy, { indirect: true }));
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+      expect(geometry).toHaveProperty("boundsTree");
+      expect(mesh.raycast).toBe(acceleratedRaycast);
+      expect(query.nearest(ray())?.faceIndex).toBe(0);
+      query.dispose();
+    }
+    vi.unstubAllGlobals();
+  });
+  it("keeps fallback raycast after worker failure without automatic retry", async () => {
+    const generate = vi.fn(() => Promise.reject(new Error("worker failed")));
+    const query = new SurfaceQuery(1, () => ({ generate, dispose: vi.fn() }));
+    vi.stubGlobal("Worker", class {});
+    const { mesh } = mount(query, triangle());
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(query.nearest(ray())?.mesh).toBe(mesh);
+    expect(generate).toHaveBeenCalledOnce();
+    query.dispose(); vi.unstubAllGlobals();
+  });
+  it("serializes heavy builds through one reusable Worker", async () => {
+    vi.stubGlobal("Worker", class {});
+    const pending: Array<{ copy: T.BufferGeometry; done: (bvh: MeshBVH) => void }> = [];
+    const generate = vi.fn((copy: T.BufferGeometry) => new Promise<MeshBVH>(done => pending.push({ copy, done })));
+    const makeWorker = vi.fn(() => ({ generate, dispose: vi.fn() }));
+    const query = new SurfaceQuery(1, makeWorker);
+    const second = triangle();
+    mount(query, triangle(), "one"); mount(query, second, "two");
+    await vi.waitFor(() => expect(pending).toHaveLength(1));
+    expect(generate).toHaveBeenCalledTimes(1);
+    pending[0]!.done(new MeshBVH(pending[0]!.copy, { indirect: true }));
+    await vi.waitFor(() => expect(pending).toHaveLength(2));
+    expect(makeWorker).toHaveBeenCalledOnce();
+    pending[1]!.done(new MeshBVH(pending[1]!.copy, { indirect: true }));
+    await vi.waitFor(() => expect(second).toHaveProperty("boundsTree"));
+    query.dispose(); vi.unstubAllGlobals();
+  });
+  it("invalidates old geometry on primitive edit and keeps BVH on transform/material changes", () => {
+    const project = createNestedMeshProject(); const graph = new SceneSync(() => {});
+    graph.sync(project, () => undefined);
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    if (node.kind !== "mesh" || node.meshSource.kind !== "primitive") throw new Error("fixture");
+    const first = (graph.objects.get(node.id)!.content as T.Mesh).geometry;
+    const firstBvh = (first as T.BufferGeometry & { boundsTree?: MeshBVH }).boundsTree;
+    node.transform.position = [2, 0, 0]; graph.sync(project, () => undefined);
+    expect((graph.objects.get(node.id)!.content as T.Mesh).geometry).toBe(first);
+    project.materials.push({ id: "material", name: "Тест", baseColor: [1, 0, 0], metalness: 0, roughness: .5,
+      emissive: [0, 0, 0], opacity: 1, transmission: 0, ior: 1.5, clearcoat: 0, envIntensity: 1, textureAssetIds: [] });
+    node.materialSlots.push({ name: "Основной", materialId: "material" });
+    graph.sync(project, () => undefined);
+    expect((graph.objects.get(node.id)!.content as T.Mesh).geometry).toBe(first);
+    expect((first as T.BufferGeometry & { boundsTree?: MeshBVH }).boundsTree).toBe(firstBvh);
+    node.meshSource.parameters.size = 2; graph.sync(project, () => undefined);
+    const second = (graph.objects.get(node.id)!.content as T.Mesh).geometry;
+    expect(second).not.toBe(first); expect(first).not.toHaveProperty("boundsTree");
+    node.meshSource.parameters.size = 1; graph.sync(project, () => undefined);
+    expect(second).not.toHaveProperty("boundsTree");
+    graph.dispose();
+  });
+});
+</file>
+
 <file path="tests/renderer/adapter.test.ts">
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WebGPURenderer } from "three/webgpu";
@@ -6203,83 +6647,6 @@ describe("parametric primitives", () => {
     sync.sync(project, () => undefined);
     expect(sync.objects.has(node.id)).toBe(false);
     sync.dispose();
-  });
-});
-</file>
-
-<file path="tests/renderer/viewport-interactions.test.ts">
-import { afterEach, describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { createEditorStore } from "../../src/app/editor-store";
-import { ViewportInteractions, editable, localTransform, transformChanged } from "../../src/renderer/viewport-interactions";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import { createNestedMeshProject } from "../fixtures/projects";
-
-describe("viewport transform safeguards", () => {
-  afterEach(() => vi.unstubAllGlobals());
-  it("uses local values under transformed parents and rejects invalid scale/quaternion", () => {
-    const parent = new T.Group(); parent.position.set(10, 0, 0); parent.rotation.z = Math.PI / 2;
-    const child = new T.Group(); parent.add(child); child.position.set(2, 3, 4);
-    expect(localTransform(child)?.position).toEqual([2, 3, 4]);
-    child.scale.x = 0;
-    expect(localTransform(child)).toBeNull();
-    child.scale.x = -1;
-    expect(localTransform(child)).toBeNull();
-    child.scale.x = 1; child.quaternion.set(NaN, 0, 0, 1);
-    expect(localTransform(child)).toBeNull();
-  });
-  it("ignores numerical noise and equivalent quaternion sign", () => {
-    const a = { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const };
-    expect(transformChanged(a, { ...a, position: [1e-8, 0, 0], rotationQuat: [0, 0, 0, -1] })).toBe(false);
-    expect(transformChanged(a, { ...a, position: [0.5, 0, 0] })).toBe(true);
-  });
-  it("honors inherited hidden and locked flags, mode, block, and protected root", () => {
-    const project = createNestedMeshProject();
-    const store = createEditorStore(project);
-    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(true);
-    expect(editable(store.getSnapshot(), project.model.rootNodeId, false)).toBe(false);
-    expect(editable(store.getSnapshot(), "mesh-node", true)).toBe(false);
-    store.setTool({ mode: "scene" });
-    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
-    store.setTool({ mode: "model" });
-    const revision = store.getSnapshot().document.revision;
-    const result = store.executeCommand({ commandId: "lock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"],
-      payload: { nodeId: "nested-group", locked: true } }, revision);
-    expect(result.ok).toBe(true);
-    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
-  });
-  it("commits one command per drag and rolls back a revision conflict", () => {
-    const document = new EventTarget();
-    const canvas = Object.assign(new EventTarget(), {
-      style: {}, ownerDocument: document, getRootNode: () => document,
-      getBoundingClientRect: () => ({ left: 0, top: 0, width: 600, height: 400 }),
-    }) as unknown as HTMLCanvasElement;
-    vi.stubGlobal("window", new EventTarget());
-    const store = createEditorStore(createNestedMeshProject());
-    const graph = new SceneSync(() => {});
-    graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
-    const unsubscribe = store.subscribe(() => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch()));
-    store.setSelection(["mesh-node"]); store.setTool({ active: "move" });
-    const messages: Array<string | null> = [];
-    const interaction = new ViewportInteractions(graph, canvas, store, message => messages.push(message), false);
-    const object = graph.objects.get("mesh-node")!.object;
-    interaction.gizmo.dispatchEvent({ type: "mouseDown", mode: "translate" });
-    object.position.x = 2;
-    expect(store.getSnapshot().document.revision).toBe(0);
-    interaction.gizmo.dispatchEvent({ type: "mouseUp", mode: "translate" });
-    expect(store.getSnapshot().document.revision).toBe(1);
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")?.transform.position[0]).toBe(2);
-    interaction.gizmo.dispatchEvent({ type: "mouseDown", mode: "translate" });
-    object.position.x = 4;
-    store.executeCommand({ commandId: "rename", type: "RENAME_NODE", targetIds: ["mesh-node"],
-      payload: { nodeId: "mesh-node", name: "Новое имя" } }, 1);
-    interaction.gizmo.dispatchEvent({ type: "mouseUp", mode: "translate" });
-    expect(store.getSnapshot().document.revision).toBe(2);
-    expect(store.getSnapshot().history.entries).toHaveLength(2);
-    expect(object.position.x).toBe(2);
-    expect(messages.some(message => message?.includes("отменено"))).toBe(true);
-    interaction.dispose(); unsubscribe(); graph.dispose();
   });
 });
 </file>
@@ -7071,280 +7438,6 @@ export function primitiveGeometry(source: DeepReadonly<Extract<MeshSource, { kin
 }
 </file>
 
-<file path="src/renderer/viewport-interactions.ts">
-import * as T from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { TransformControls } from "three/addons/controls/TransformControls.js";
-import type { EditorStore, EditorState } from "../app/editor-store";
-import type { Transform } from "../domain/types";
-import { applyTransform, type SceneSync } from "./scene-sync";
-
-type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
-const EPS = 1e-6;
-
-export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
-  if (!id || blocked || state.tool.mode !== "model" || id === state.document.project.model.rootNodeId) return false;
-  const nodes = new Map(state.document.project.nodes.map(node => [node.id, node]));
-  let node = nodes.get(id);
-  if (!node) return false;
-  while (node) {
-    if (!node.visible || node.locked) return false;
-    node = node.parentId ? nodes.get(node.parentId) : undefined;
-  }
-  return true;
-}
-
-export function localTransform(object: T.Object3D): Transform | null {
-  const p = object.position.toArray();
-  const q = object.quaternion.toArray();
-  const s = object.scale.toArray();
-  const length = Math.hypot(...q);
-  if (![...p, ...q, ...s].every(Number.isFinite) || length < EPS || s.some(value => Math.abs(value) < EPS || value < 0)) return null;
-  const normalized = q.map(value => value / length) as [number, number, number, number];
-  return { position: p as [number, number, number], rotationQuat: normalized, scale: s as [number, number, number] };
-}
-
-export function transformChanged(a: Transform, b: Transform): boolean {
-  const distance = (x: readonly number[], y: readonly number[]) => x.some((value, index) => Math.abs(value - (y[index] ?? 0)) > EPS);
-  const q = Math.abs(a.rotationQuat.reduce((sum, value, index) => sum + value * (b.rotationQuat[index] ?? 0), 0));
-  return distance(a.position, b.position) || distance(a.scale, b.scale) || 1 - q > EPS;
-}
-
-function visibleBounds(object: T.Object3D, box: T.Box3): T.Box3 {
-  box.makeEmpty();
-  object.updateWorldMatrix(true, true);
-  const visit = (part: T.Object3D, visible: boolean) => {
-    const shown = visible && part.visible;
-    if (!shown) return;
-    if (part instanceof T.Mesh && part.geometry) {
-      if (!part.geometry.boundingBox) part.geometry.computeBoundingBox();
-      if (part.geometry.boundingBox) box.union(part.geometry.boundingBox.clone().applyMatrix4(part.matrixWorld));
-    }
-    for (const child of part.children) visit(child, shown);
-  };
-  visit(object, true);
-  return box;
-}
-
-export class ViewportInteractions {
-  readonly orbit: OrbitControls;
-  readonly gizmo: TransformControls;
-  private readonly raycaster = new T.Raycaster();
-  private readonly bounds = new T.Box3();
-  private readonly outline = new T.Box3Helper(this.bounds, 0xf9b44c);
-  private drag: Drag | null = null;
-  private down: { x: number; y: number; pointerId: number } | null = null;
-  private cameraVersion = -1;
-  private disposed = false;
-  private blocked = false;
-  private snap = false;
-  private gizmoPress = false;
-  private unsubscribe: () => void;
-
-  constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
-    private report: (message: string | null) => void, blocked: boolean) {
-    this.blocked = blocked;
-    this.orbit = new OrbitControls(graph.camera, canvas);
-    this.orbit.enableDamping = true;
-    this.orbit.minDistance = 0.05;
-    this.orbit.maxDistance = 100000;
-    this.orbit.screenSpacePanning = true;
-    this.gizmo = new TransformControls(graph.camera, canvas);
-    graph.scene.add(this.gizmo.getHelper());
-    this.outline.visible = false;
-    graph.scene.add(this.outline);
-    this.gizmo.addEventListener("mouseDown", this.onGizmoDown);
-    this.gizmo.addEventListener("mouseUp", this.onGizmoUp);
-    this.gizmo.addEventListener("dragging-changed", this.onDraggingChanged);
-    canvas.addEventListener("pointerdown", this.onPointerDown);
-    canvas.addEventListener("pointerup", this.onPointerUp);
-    canvas.addEventListener("pointercancel", this.onPointerCancel);
-    window.addEventListener("keydown", this.onKeyDown);
-    this.unsubscribe = store.subscribe(this.sync);
-    this.sync();
-  }
-
-  private onGizmoDown = () => {
-    this.gizmoPress = true;
-    const state = this.store.getSnapshot();
-    const id = state.selection.activeId;
-    const object = id && this.graph.objects.get(id)?.object;
-    if (!id || !object || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
-    this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
-      revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
-    this.report(null);
-  };
-  private onGizmoUp = () => {
-    const drag = this.drag;
-    if (!drag) return;
-    this.drag = null;
-    const state = this.store.getSnapshot();
-    if (state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
-      || state.tool.active !== drag.tool || state.tool.space !== drag.space
-      || state.selection.activeId !== drag.id || !editable(state, drag.id, this.blocked)
-      || this.graph.objects.get(drag.id)?.object !== drag.object) {
-      this.restore(drag); this.report("Изменение отменено: объект или проект изменился во время перетаскивания."); return;
-    }
-    const transform = localTransform(drag.object);
-    if (!transform) { this.restore(drag); this.report("Изменение отменено: недопустимое положение, вращение или масштаб."); return; }
-    if (!transformChanged(drag.start, transform)) { this.restore(drag); return; }
-    const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_TRANSFORM", targetIds: [drag.id],
-      payload: { nodeId: drag.id, transform } }, drag.revision);
-    if (!result.ok) { this.restore(drag); this.report(`Изменение отменено: ${result.message}`); }
-  };
-  private onDraggingChanged = (event: { value: unknown }) => { this.orbit.enabled = event.value !== true; };
-  private restore(drag: Drag): void {
-    const current = this.store.getSnapshot().document.project.nodes.find(node => node.id === drag.id);
-    if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
-  }
-  cancel(message: string | null = null): void {
-    if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
-    if (message) this.report(message);
-  }
-  private onPointerDown = (event: PointerEvent) => {
-    if (event.button === 0) this.down = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
-  };
-  private onPointerUp = (event: PointerEvent) => {
-    const down = this.down; this.down = null;
-    const gizmoPress = this.gizmoPress; this.gizmoPress = false;
-    if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
-      || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
-    // TransformControls clears its axis in its own pointerup handler; a gizmo press is not a selection click.
-    if (this.gizmo.axis) return;
-    const rect = this.canvas.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
-      -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
-    const candidates: T.Object3D[] = [];
-    for (const entry of this.graph.objects.values()) if (entry.content && entry.object.visible) candidates.push(entry.content);
-    const hit = this.raycaster.intersectObjects(candidates, true).find(item => {
-      let current: T.Object3D | null = item.object;
-      while (current) { if (!current.visible) return false; current = current.parent; }
-      return true;
-    });
-    const wrappers = new Map<T.Object3D, string>([...this.graph.objects].map(([id, entry]) => [entry.object, id]));
-    let parent = hit?.object;
-    while (parent && !wrappers.has(parent)) parent = parent.parent ?? undefined;
-    const id = parent ? wrappers.get(parent) : undefined;
-    if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
-      const ids = this.store.getSnapshot().selection.ids;
-      const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];
-      this.store.setSelection(next, next.includes(id) ? id : next[0] ?? null);
-    } else this.store.setSelection(id ? [id] : []);
-  };
-  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
-  private onKeyDown = (event: KeyboardEvent) => {
-    const target = event.target as HTMLElement | null;
-    if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
-    if (event.key === "Escape") {
-      if (this.drag) this.cancel("Преобразование отменено.");
-      else this.store.setSelection([]);
-      event.preventDefault(); return;
-    }
-    if (event.key === "Delete" && !this.blocked && this.store.getSnapshot().tool.mode === "model") {
-      const snapshot = this.store.getSnapshot();
-      const id = snapshot.selection.activeId;
-      if (id && id !== snapshot.document.project.model.rootNodeId) {
-        const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [id], payload: { nodeId: id } }, snapshot.document.revision);
-        if (!result.ok) this.report(result.message);
-        event.preventDefault(); return;
-      }
-    }
-    const key = event.key.toLowerCase();
-    if (key === "f") { this.fit(); event.preventDefault(); }
-    else if (editable(this.store.getSnapshot(), this.store.getSnapshot().selection.activeId, this.blocked) && ["g", "r", "s"].includes(key)) {
-      this.store.setTool({ active: key === "g" ? "move" : key === "r" ? "rotate" : "scale" }); event.preventDefault();
-    }
-  };
-
-  setBlocked(blocked: boolean): void { this.blocked = blocked; this.sync(); }
-  setSnap(enabled: boolean): void {
-    this.snap = enabled;
-    this.gizmo.setTranslationSnap(enabled ? 0.5 : null);
-    this.gizmo.setRotationSnap(enabled ? Math.PI / 12 : null);
-    this.gizmo.setScaleSnap(enabled ? 0.1 : null);
-  }
-  private sync = () => {
-    if (this.disposed) return;
-    const state = this.store.getSnapshot();
-    if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
-      || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
-      || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
-      this.cancel("Изменение отменено: состояние проекта изменилось.");
-    const id = state.selection.activeId;
-    const object = id && this.graph.objects.get(id)?.object;
-    this.gizmo.detach();
-    if (object && editable(state, id, this.blocked) && state.tool.active !== "select") {
-      this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
-      this.gizmo.setSpace(state.tool.space);
-      this.gizmo.attach(object);
-    }
-    this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
-    this.updateOutline(object || null);
-  };
-  private updateOutline(object: T.Object3D | null): void {
-    if (!object) { this.outline.visible = false; return; }
-    visibleBounds(object, this.bounds);
-    this.outline.visible = !this.bounds.isEmpty() && this.bounds.min.toArray().every(Number.isFinite) && this.bounds.max.toArray().every(Number.isFinite);
-    if (this.outline.visible) this.outline.updateMatrixWorld(true);
-  }
-  frame(): void {
-    if (this.cameraVersion !== this.graph.cameraVersion) {
-      this.cameraVersion = this.graph.cameraVersion;
-      this.orbit.target.copy(this.graph.cameraTarget);
-      this.orbit.update();
-    }
-    this.orbit.update();
-    const id = this.store.getSnapshot().selection.activeId;
-    const rootId = this.store.getSnapshot().document.project.model.rootNodeId;
-    this.updateOutline(id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
-  }
-  fit(): void {
-    const state = this.store.getSnapshot();
-    const selected = state.selection.activeId ? this.graph.objects.get(state.selection.activeId)?.object : undefined;
-    const root = this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
-    const target = selected?.visible ? selected : root;
-    if (!target) { this.reset(); return; }
-    visibleBounds(target, this.bounds);
-    if (this.bounds.isEmpty()) { this.reset(); return; }
-    const center = this.bounds.getCenter(new T.Vector3());
-    const size = this.bounds.getSize(new T.Vector3());
-    const radius = Math.max(size.length() / 2, 0.05);
-    const camera = this.graph.camera;
-    const halfFov = T.MathUtils.degToRad(camera.fov / 2);
-    const distance = Math.min(100000, Math.max(0.1, radius * 1.5 / Math.sin(Math.atan(Math.tan(halfFov) * Math.min(1, camera.aspect)))));
-    const direction = camera.position.clone().sub(this.orbit.target).normalize();
-    if (!direction.toArray().every(Number.isFinite) || direction.lengthSq() < EPS) direction.set(1, 0.7, 1).normalize();
-    camera.position.copy(center).addScaledVector(direction, distance);
-    camera.near = Math.max(0.001, (distance - radius * 2) / 100);
-    camera.far = Math.max(camera.near + 1, distance + radius * 4);
-    camera.updateProjectionMatrix();
-    this.orbit.target.copy(center); this.orbit.update();
-  }
-  reset(): void {
-    const camera = this.store.getSnapshot().document.project.scene.camera;
-    this.graph.camera.position.fromArray(camera.position);
-    this.graph.camera.near = camera.near; this.graph.camera.far = camera.far; this.graph.camera.fov = camera.fovDegrees;
-    this.graph.camera.updateProjectionMatrix();
-    this.orbit.target.fromArray(camera.target); this.orbit.update();
-  }
-  dispose(): void {
-    if (this.disposed) return;
-    this.cancel(); this.disposed = true; this.unsubscribe();
-    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
-    this.canvas.removeEventListener("pointerup", this.onPointerUp);
-    this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
-    window.removeEventListener("keydown", this.onKeyDown);
-    this.gizmo.removeEventListener("mouseDown", this.onGizmoDown);
-    this.gizmo.removeEventListener("mouseUp", this.onGizmoUp);
-    this.gizmo.removeEventListener("dragging-changed", this.onDraggingChanged);
-    this.gizmo.detach(); this.gizmo.getHelper().removeFromParent(); this.gizmo.dispose();
-    this.outline.removeFromParent(); this.outline.geometry.dispose(); (this.outline.material as T.Material).dispose();
-    this.orbit.dispose();
-  }
-}
-</file>
-
 <file path="src/renderer/Viewport.tsx">
 import { useEffect, useRef, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
@@ -7880,6 +7973,116 @@ describe("GLB import", () => {
 });
 </file>
 
+<file path="tests/renderer/viewport-interactions.test.ts">
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { createEditorStore } from "../../src/app/editor-store";
+import { ViewportInteractions, editable, localTransform, transformChanged } from "../../src/renderer/viewport-interactions";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+describe("viewport transform safeguards", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("uses local values under transformed parents and rejects invalid scale/quaternion", () => {
+    const parent = new T.Group(); parent.position.set(10, 0, 0); parent.rotation.z = Math.PI / 2;
+    const child = new T.Group(); parent.add(child); child.position.set(2, 3, 4);
+    expect(localTransform(child)?.position).toEqual([2, 3, 4]);
+    child.scale.x = 0;
+    expect(localTransform(child)).toBeNull();
+    child.scale.x = -1;
+    expect(localTransform(child)).toBeNull();
+    child.scale.x = 1; child.quaternion.set(NaN, 0, 0, 1);
+    expect(localTransform(child)).toBeNull();
+  });
+  it("ignores numerical noise and equivalent quaternion sign", () => {
+    const a = { position: [0, 0, 0] as const, rotationQuat: [0, 0, 0, 1] as const, scale: [1, 1, 1] as const };
+    expect(transformChanged(a, { ...a, position: [1e-8, 0, 0], rotationQuat: [0, 0, 0, -1] })).toBe(false);
+    expect(transformChanged(a, { ...a, position: [0.5, 0, 0] })).toBe(true);
+  });
+  it("honors inherited hidden and locked flags, mode, block, and protected root", () => {
+    const project = createNestedMeshProject();
+    const store = createEditorStore(project);
+    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(true);
+    expect(editable(store.getSnapshot(), project.model.rootNodeId, false)).toBe(false);
+    expect(editable(store.getSnapshot(), "mesh-node", true)).toBe(false);
+    store.setTool({ mode: "scene" });
+    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
+    store.setTool({ mode: "model" });
+    const revision = store.getSnapshot().document.revision;
+    const result = store.executeCommand({ commandId: "lock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"],
+      payload: { nodeId: "nested-group", locked: true } }, revision);
+    expect(result.ok).toBe(true);
+    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
+  });
+  it("commits one command per drag and rolls back a revision conflict", () => {
+    const document = new EventTarget();
+    const canvas = Object.assign(new EventTarget(), {
+      style: {}, ownerDocument: document, getRootNode: () => document,
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 600, height: 400 }),
+    }) as unknown as HTMLCanvasElement;
+    vi.stubGlobal("window", new EventTarget());
+    const store = createEditorStore(createNestedMeshProject());
+    const graph = new SceneSync(() => {});
+    graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    const unsubscribe = store.subscribe(() => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch()));
+    store.setSelection(["mesh-node"]); store.setTool({ active: "move" });
+    const messages: Array<string | null> = [];
+    const interaction = new ViewportInteractions(graph, canvas, store, message => messages.push(message), false);
+    const object = graph.objects.get("mesh-node")!.object;
+    interaction.gizmo.dispatchEvent({ type: "mouseDown", mode: "translate" });
+    object.position.x = 2;
+    expect(store.getSnapshot().document.revision).toBe(0);
+    interaction.gizmo.dispatchEvent({ type: "mouseUp", mode: "translate" });
+    expect(store.getSnapshot().document.revision).toBe(1);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")?.transform.position[0]).toBe(2);
+    interaction.gizmo.dispatchEvent({ type: "mouseDown", mode: "translate" });
+    object.position.x = 4;
+    store.executeCommand({ commandId: "rename", type: "RENAME_NODE", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", name: "Новое имя" } }, 1);
+    interaction.gizmo.dispatchEvent({ type: "mouseUp", mode: "translate" });
+    expect(store.getSnapshot().document.revision).toBe(2);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(object.position.x).toBe(2);
+    expect(messages.some(message => message?.includes("отменено"))).toBe(true);
+    interaction.dispose(); unsubscribe(); graph.dispose();
+  });
+  it("selects a locked visible node, supports modifier selection and ignores hidden parents", () => {
+    const document = new EventTarget();
+    const canvas = Object.assign(new EventTarget(), { style: {}, ownerDocument: document, getRootNode: () => document,
+      setPointerCapture: () => {}, releasePointerCapture: () => {},
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 600, height: 400 }) }) as unknown as HTMLCanvasElement;
+    vi.stubGlobal("window", new EventTarget()); vi.stubGlobal("document", document);
+    const store = createEditorStore(createNestedMeshProject());
+    const graph = new SceneSync(() => {});
+    const sync = () => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    sync(); const unsubscribe = store.subscribe(sync);
+    const interaction = new ViewportInteractions(graph, canvas, store, () => {}, false);
+    const handlers = interaction as unknown as { onPointerDown(event: PointerEvent): void; onPointerUp(event: PointerEvent): void };
+    const click = (shiftKey = false) => {
+      const event = { button: 0, pointerId: 1, clientX: 300, clientY: 200, ctrlKey: false, metaKey: false, shiftKey } as PointerEvent;
+      handlers.onPointerDown(event); handlers.onPointerUp(event);
+    };
+    const revision = store.getSnapshot().document.revision;
+    store.executeCommand({ commandId: "lock", type: "SET_NODE_FLAGS", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", locked: true } }, revision);
+    click();
+    expect(store.getSnapshot().selection.ids).toEqual(["mesh-node"]);
+    expect(editable(store.getSnapshot(), "mesh-node", false)).toBe(false);
+    click(true);
+    expect(store.getSnapshot().selection.ids).toEqual([]);
+    const hidden = store.executeCommand({ commandId: "hide-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"],
+      payload: { nodeId: "nested-group", visible: false } }, store.getSnapshot().document.revision);
+    expect(hidden.ok).toBe(true);
+    expect(graph.objects.get("nested-group")?.object.visible).toBe(false);
+    expect(graph.surfaces.nearest(new T.Ray(graph.camera.position.clone(), new T.Vector3().sub(graph.camera.position).normalize()))).toBeNull();
+    click();
+    expect(store.getSnapshot().selection.ids).toEqual([]);
+    interaction.dispose(); unsubscribe(); graph.dispose();
+  });
+});
+</file>
+
 <file path="eslint.config.js">
 import js from "@eslint/js";
 import globals from "globals";
@@ -8111,153 +8314,268 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
-<file path="src/renderer/scene-sync.ts">
+<file path="src/renderer/viewport-interactions.ts">
 import * as T from "three";
-import type { DeepReadonly } from "../app/editor-store";
-import type { Project, Transform, Material } from "../domain/types";
-import { decodeStaticGlb } from "../importers/gltf/import-glb";
-import { disposeObject } from "../assets/three-resources";
-import { primitiveGeometry } from "./primitive";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
+import type { EditorStore, EditorState } from "../app/editor-store";
+import type { Transform } from "../domain/types";
+import { applyTransform, type SceneSync } from "./scene-sync";
 
-export type RenderProject = DeepReadonly<Project>;
-export type AssetReader = (id: string) => Uint8Array | undefined;
-export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
-type Entry = { object: T.Group; key: string; content?: T.Object3D; loading: boolean; error?: string };
-export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
-const decode: AssetDecoder = async bytes => {
-  const result = await decodeStaticGlb(bytes);
-  if (!result.ok) throw new Error(result.error.message);
-  return result.value.root;
-};
+type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
+const EPS = 1e-6;
 
-export function applyTransform(object: T.Object3D, transform: Transform): void {
-  const { position, rotationQuat, scale } = transform;
-  const length = Math.hypot(...rotationQuat);
-  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
-  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
-  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
-  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
-  object.updateMatrix();
-}
-function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
-  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
-    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
-}
-
-export class SceneSync {
-  readonly scene = new T.Scene();
-  readonly camera = new T.PerspectiveCamera();
-  readonly cameraTarget = new T.Vector3();
-  cameraVersion = 0;
-  readonly objects = new Map<string, Entry>();
-  private lights = new T.Group();
-  private projectId = "";
-  private epoch: object | undefined;
-  private lightKey = "";
-  private cameraKey = "";
-  private diagnostics: string[] = [];
-  private closed = false;
-  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
-    if (this.closed) return;
-    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
-    this.diagnostics = [];
-    const camera = project.scene.camera;
-    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
-      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
-    const cameraKey = JSON.stringify(camera);
-    if (cameraKey !== this.cameraKey) {
-      this.cameraKey = cameraKey;
-      this.cameraTarget.fromArray(camera.target);
-      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
-      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
-      this.cameraVersion += 1;
-    }
-    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
-    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
-    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
-    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
-    const lightKey = JSON.stringify(project.scene.lights);
-    if (lightKey !== this.lightKey) {
-      this.lights.clear(); this.lightKey = lightKey;
-      for (const light of project.scene.lights) {
-        const color = new T.Color(...light.color);
-        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
-          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
-        object.position.fromArray(light.position);
-        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
-        this.lights.add(object);
-      }
-    }
-    const ids = new Set(project.nodes.map(n => n.id));
-    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
-    for (const node of project.nodes) {
-      let entry = this.objects.get(node.id);
-      if (!entry) { entry = { object: new T.Group(), key: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
-      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
-      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
-      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
-      const source = node.kind === "mesh" ? node.meshSource : null;
-      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
-      const key = JSON.stringify([source, asset, materials]);
-      if (key === entry.key) continue;
-      if (entry.content) { disposeObject(entry.content); delete entry.content; }
-      // Replacement token prevents late assets from attaching after delete, undo, or another source.
-      const next: Entry = { object: entry.object, key, loading: false }; this.objects.set(node.id, next);
-      if (!source) continue;
-      const assign = (content: T.Object3D) => {
-        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
-        next.content = content; next.loading = false; next.object.add(content); this.emit();
-      };
-      try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
-        else {
-          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
-          const bytes = readAsset(source.assetId);
-          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
-          next.loading = true;
-          void this.decoder(bytes).then(content => {
-            // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) {
-              const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
-              content.traverse(o => { if (o instanceof T.Mesh) {
-                for (const m of Array.isArray(o.material) ? o.material : [o.material]) { oldMaterials.add(m); for (const v of Object.values(m)) if (v instanceof T.Texture) oldTextures.add(v); }
-                o.material = materials.map(m => material(m));
-              } });
-              for (const m of oldMaterials) m.dispose();
-              for (const t of oldTextures) { t.dispose(); if (typeof ImageBitmap !== "undefined" && t.image instanceof ImageBitmap) t.image.close(); }
-            }
-            assign(content);
-          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
-        }
-      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
-    }
-    for (const node of project.nodes) {
-      const object = this.objects.get(node.id)!.object;
-      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
-      if (parent && object.parent !== parent) parent.add(object);
-    }
-    for (const node of project.nodes) {
-      const parent = this.objects.get(node.id)?.object;
-      if (!parent) continue;
-      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
-      if (ordered.some((item, i) => parent.children[i] !== item)) {
-        for (const item of ordered) parent.remove(item);
-        for (const item of ordered) parent.add(item);
-      }
-    }
-    this.scene.updateMatrixWorld(true);
-    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
-    this.emit();
+export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
+  if (!id || blocked || state.tool.mode !== "model" || id === state.document.project.model.rootNodeId) return false;
+  const nodes = new Map(state.document.project.nodes.map(node => [node.id, node]));
+  let node = nodes.get(id);
+  if (!node) return false;
+  while (node) {
+    if (!node.visible || node.locked) return false;
+    node = node.parentId ? nodes.get(node.parentId) : undefined;
   }
-  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
-    errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
-  private remove(entry: Entry): void { if (entry.content) disposeObject(entry.content); entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.lights.clear(); this.scene.clear(); }
+  return true;
+}
+
+export function localTransform(object: T.Object3D): Transform | null {
+  const p = object.position.toArray();
+  const q = object.quaternion.toArray();
+  const s = object.scale.toArray();
+  const length = Math.hypot(...q);
+  if (![...p, ...q, ...s].every(Number.isFinite) || length < EPS || s.some(value => Math.abs(value) < EPS || value < 0)) return null;
+  const normalized = q.map(value => value / length) as [number, number, number, number];
+  return { position: p as [number, number, number], rotationQuat: normalized, scale: s as [number, number, number] };
+}
+
+export function transformChanged(a: Transform, b: Transform): boolean {
+  const distance = (x: readonly number[], y: readonly number[]) => x.some((value, index) => Math.abs(value - (y[index] ?? 0)) > EPS);
+  const q = Math.abs(a.rotationQuat.reduce((sum, value, index) => sum + value * (b.rotationQuat[index] ?? 0), 0));
+  return distance(a.position, b.position) || distance(a.scale, b.scale) || 1 - q > EPS;
+}
+
+function visibleBounds(object: T.Object3D, box: T.Box3): T.Box3 {
+  box.makeEmpty();
+  object.updateWorldMatrix(true, true);
+  const visit = (part: T.Object3D, visible: boolean) => {
+    const shown = visible && part.visible;
+    if (!shown) return;
+    if (part instanceof T.Mesh && part.geometry) {
+      if (!part.geometry.boundingBox) part.geometry.computeBoundingBox();
+      if (part.geometry.boundingBox) box.union(part.geometry.boundingBox.clone().applyMatrix4(part.matrixWorld));
+    }
+    for (const child of part.children) visit(child, shown);
+  };
+  visit(object, true);
+  return box;
+}
+
+export class ViewportInteractions {
+  readonly orbit: OrbitControls;
+  readonly gizmo: TransformControls;
+  private readonly raycaster = new T.Raycaster();
+  private readonly bounds = new T.Box3();
+  private readonly outline = new T.Box3Helper(this.bounds, 0xf9b44c);
+  private drag: Drag | null = null;
+  private down: { x: number; y: number; pointerId: number } | null = null;
+  private cameraVersion = -1;
+  private disposed = false;
+  private blocked = false;
+  private snap = false;
+  private gizmoPress = false;
+  private unsubscribe: () => void;
+
+  constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
+    private report: (message: string | null) => void, blocked: boolean) {
+    this.blocked = blocked;
+    this.orbit = new OrbitControls(graph.camera, canvas);
+    this.orbit.enableDamping = true;
+    this.orbit.minDistance = 0.05;
+    this.orbit.maxDistance = 100000;
+    this.orbit.screenSpacePanning = true;
+    this.gizmo = new TransformControls(graph.camera, canvas);
+    graph.scene.add(this.gizmo.getHelper());
+    this.outline.visible = false;
+    graph.scene.add(this.outline);
+    this.gizmo.addEventListener("mouseDown", this.onGizmoDown);
+    this.gizmo.addEventListener("mouseUp", this.onGizmoUp);
+    this.gizmo.addEventListener("dragging-changed", this.onDraggingChanged);
+    canvas.addEventListener("pointerdown", this.onPointerDown);
+    canvas.addEventListener("pointerup", this.onPointerUp);
+    canvas.addEventListener("pointercancel", this.onPointerCancel);
+    window.addEventListener("keydown", this.onKeyDown);
+    this.unsubscribe = store.subscribe(this.sync);
+    this.sync();
+  }
+
+  private onGizmoDown = () => {
+    this.gizmoPress = true;
+    const state = this.store.getSnapshot();
+    const id = state.selection.activeId;
+    const object = id && this.graph.objects.get(id)?.object;
+    if (!id || !object || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
+    this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
+      revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
+    this.report(null);
+  };
+  private onGizmoUp = () => {
+    const drag = this.drag;
+    if (!drag) return;
+    this.drag = null;
+    const state = this.store.getSnapshot();
+    if (state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
+      || state.tool.active !== drag.tool || state.tool.space !== drag.space
+      || state.selection.activeId !== drag.id || !editable(state, drag.id, this.blocked)
+      || this.graph.objects.get(drag.id)?.object !== drag.object) {
+      this.restore(drag); this.report("Изменение отменено: объект или проект изменился во время перетаскивания."); return;
+    }
+    const transform = localTransform(drag.object);
+    if (!transform) { this.restore(drag); this.report("Изменение отменено: недопустимое положение, вращение или масштаб."); return; }
+    if (!transformChanged(drag.start, transform)) { this.restore(drag); return; }
+    const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_TRANSFORM", targetIds: [drag.id],
+      payload: { nodeId: drag.id, transform } }, drag.revision);
+    if (!result.ok) { this.restore(drag); this.report(`Изменение отменено: ${result.message}`); }
+  };
+  private onDraggingChanged = (event: { value: unknown }) => { this.orbit.enabled = event.value !== true; };
+  private restore(drag: Drag): void {
+    const current = this.store.getSnapshot().document.project.nodes.find(node => node.id === drag.id);
+    if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
+  }
+  cancel(message: string | null = null): void {
+    if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
+    if (message) this.report(message);
+  }
+  private onPointerDown = (event: PointerEvent) => {
+    if (event.button === 0) this.down = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+  };
+  private onPointerUp = (event: PointerEvent) => {
+    const down = this.down; this.down = null;
+    const gizmoPress = this.gizmoPress; this.gizmoPress = false;
+    if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
+      || Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) return;
+    // TransformControls clears its axis in its own pointerup handler; a gizmo press is not a selection click.
+    if (this.gizmo.axis) return;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
+      -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
+    const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
+    const id = hit?.nodeId;
+    if (id && (event.ctrlKey || event.metaKey || event.shiftKey)) {
+      const ids = this.store.getSnapshot().selection.ids;
+      const next = ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id];
+      this.store.setSelection(next, next.includes(id) ? id : next[0] ?? null);
+    } else this.store.setSelection(id ? [id] : []);
+  };
+  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
+  private onKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
+    if (event.key === "Escape") {
+      if (this.drag) this.cancel("Преобразование отменено.");
+      else this.store.setSelection([]);
+      event.preventDefault(); return;
+    }
+    if (event.key === "Delete" && !this.blocked && this.store.getSnapshot().tool.mode === "model") {
+      const snapshot = this.store.getSnapshot();
+      const id = snapshot.selection.activeId;
+      if (id && id !== snapshot.document.project.model.rootNodeId) {
+        const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "DELETE_NODE", targetIds: [id], payload: { nodeId: id } }, snapshot.document.revision);
+        if (!result.ok) this.report(result.message);
+        event.preventDefault(); return;
+      }
+    }
+    const key = event.key.toLowerCase();
+    if (key === "f") { this.fit(); event.preventDefault(); }
+    else if (editable(this.store.getSnapshot(), this.store.getSnapshot().selection.activeId, this.blocked) && ["g", "r", "s"].includes(key)) {
+      this.store.setTool({ active: key === "g" ? "move" : key === "r" ? "rotate" : "scale" }); event.preventDefault();
+    }
+  };
+
+  setBlocked(blocked: boolean): void { this.blocked = blocked; this.sync(); }
+  setSnap(enabled: boolean): void {
+    this.snap = enabled;
+    this.gizmo.setTranslationSnap(enabled ? 0.5 : null);
+    this.gizmo.setRotationSnap(enabled ? Math.PI / 12 : null);
+    this.gizmo.setScaleSnap(enabled ? 0.1 : null);
+  }
+  private sync = () => {
+    if (this.disposed) return;
+    const state = this.store.getSnapshot();
+    if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
+      || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
+      || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
+      this.cancel("Изменение отменено: состояние проекта изменилось.");
+    const id = state.selection.activeId;
+    const object = id && this.graph.objects.get(id)?.object;
+    this.gizmo.detach();
+    if (object && editable(state, id, this.blocked) && state.tool.active !== "select") {
+      this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
+      this.gizmo.setSpace(state.tool.space);
+      this.gizmo.attach(object);
+    }
+    this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
+    this.updateOutline(object || null);
+  };
+  private updateOutline(object: T.Object3D | null): void {
+    if (!object) { this.outline.visible = false; return; }
+    visibleBounds(object, this.bounds);
+    this.outline.visible = !this.bounds.isEmpty() && this.bounds.min.toArray().every(Number.isFinite) && this.bounds.max.toArray().every(Number.isFinite);
+    if (this.outline.visible) this.outline.updateMatrixWorld(true);
+  }
+  frame(): void {
+    if (this.cameraVersion !== this.graph.cameraVersion) {
+      this.cameraVersion = this.graph.cameraVersion;
+      this.orbit.target.copy(this.graph.cameraTarget);
+      this.orbit.update();
+    }
+    this.orbit.update();
+    const id = this.store.getSnapshot().selection.activeId;
+    const rootId = this.store.getSnapshot().document.project.model.rootNodeId;
+    this.updateOutline(id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
+  }
+  fit(): void {
+    const state = this.store.getSnapshot();
+    const selected = state.selection.activeId ? this.graph.objects.get(state.selection.activeId)?.object : undefined;
+    const root = this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
+    const target = selected?.visible ? selected : root;
+    if (!target) { this.reset(); return; }
+    visibleBounds(target, this.bounds);
+    if (this.bounds.isEmpty()) { this.reset(); return; }
+    const center = this.bounds.getCenter(new T.Vector3());
+    const size = this.bounds.getSize(new T.Vector3());
+    const radius = Math.max(size.length() / 2, 0.05);
+    const camera = this.graph.camera;
+    const halfFov = T.MathUtils.degToRad(camera.fov / 2);
+    const distance = Math.min(100000, Math.max(0.1, radius * 1.5 / Math.sin(Math.atan(Math.tan(halfFov) * Math.min(1, camera.aspect)))));
+    const direction = camera.position.clone().sub(this.orbit.target).normalize();
+    if (!direction.toArray().every(Number.isFinite) || direction.lengthSq() < EPS) direction.set(1, 0.7, 1).normalize();
+    camera.position.copy(center).addScaledVector(direction, distance);
+    camera.near = Math.max(0.001, (distance - radius * 2) / 100);
+    camera.far = Math.max(camera.near + 1, distance + radius * 4);
+    camera.updateProjectionMatrix();
+    this.orbit.target.copy(center); this.orbit.update();
+  }
+  reset(): void {
+    const camera = this.store.getSnapshot().document.project.scene.camera;
+    this.graph.camera.position.fromArray(camera.position);
+    this.graph.camera.near = camera.near; this.graph.camera.far = camera.far; this.graph.camera.fov = camera.fovDegrees;
+    this.graph.camera.updateProjectionMatrix();
+    this.orbit.target.fromArray(camera.target); this.orbit.update();
+  }
+  dispose(): void {
+    if (this.disposed) return;
+    this.cancel(); this.disposed = true; this.unsubscribe();
+    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
+    this.canvas.removeEventListener("pointerup", this.onPointerUp);
+    this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
+    window.removeEventListener("keydown", this.onKeyDown);
+    this.gizmo.removeEventListener("mouseDown", this.onGizmoDown);
+    this.gizmo.removeEventListener("mouseUp", this.onGizmoUp);
+    this.gizmo.removeEventListener("dragging-changed", this.onDraggingChanged);
+    this.gizmo.detach(); this.gizmo.getHelper().removeFromParent(); this.gizmo.dispose();
+    this.outline.removeFromParent(); this.outline.geometry.dispose(); (this.outline.material as T.Material).dispose();
+    this.orbit.dispose();
+  }
 }
 </file>
 
@@ -8444,6 +8762,169 @@ The earlier illustrative example used `formatVersion`, `projectId`, and `scene.m
 ## Error codes
 
 FILE_INVALID / SCHEMA_UNSUPPORTED / GEOMETRY_NON_MANIFOLD / GEOMETRY_DEGENERATE / JOB_CANCELLED / ASSET_DECODE_FAILED / EXPORT_UNSUPPORTED / IMPORT_UNRECOGNIZED_CODE / INVALID_REFERENCE.
+</file>
+
+<file path="src/renderer/scene-sync.ts">
+import * as T from "three";
+import type { DeepReadonly } from "../app/editor-store";
+import type { Project, Transform, Material } from "../domain/types";
+import { decodeStaticGlb } from "../importers/gltf/import-glb";
+import { disposeObject } from "../assets/three-resources";
+import { primitiveGeometry } from "./primitive";
+import { SurfaceQuery } from "../geometry/surface-query";
+
+export type RenderProject = DeepReadonly<Project>;
+export type AssetReader = (id: string) => Uint8Array | undefined;
+export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
+type Entry = { object: T.Group; key: string; sourceKey: string; content?: T.Object3D; loading: boolean; error?: string };
+export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
+const decode: AssetDecoder = async bytes => {
+  const result = await decodeStaticGlb(bytes);
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value.root;
+};
+
+export function applyTransform(object: T.Object3D, transform: Transform): void {
+  const { position, rotationQuat, scale } = transform;
+  const length = Math.hypot(...rotationQuat);
+  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
+  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
+  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
+  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
+  object.updateMatrix();
+}
+function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
+  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
+    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+}
+function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
+  const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
+  content.traverse(object => { if (!(object instanceof T.Mesh)) return;
+    for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
+      oldMaterials.add(old);
+      for (const value of Object.values(old)) if (value instanceof T.Texture) oldTextures.add(value);
+    }
+    object.material = values.length > 1 ? values.map(value => material(value)) : material(values[0]);
+  });
+  for (const old of oldMaterials) old.dispose();
+  for (const texture of oldTextures) { texture.dispose(); if (typeof ImageBitmap !== "undefined" && texture.image instanceof ImageBitmap) texture.image.close(); }
+}
+
+export class SceneSync {
+  readonly surfaces = new SurfaceQuery(undefined, undefined, () => this.emit());
+  readonly scene = new T.Scene();
+  readonly camera = new T.PerspectiveCamera();
+  readonly cameraTarget = new T.Vector3();
+  cameraVersion = 0;
+  readonly objects = new Map<string, Entry>();
+  private lights = new T.Group();
+  private projectId = "";
+  private epoch: object | undefined;
+  private lightKey = "";
+  private cameraKey = "";
+  private diagnostics: string[] = [];
+  private closed = false;
+  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
+    this.diagnostics = [];
+    const camera = project.scene.camera;
+    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
+      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
+    const cameraKey = JSON.stringify(camera);
+    if (cameraKey !== this.cameraKey) {
+      this.cameraKey = cameraKey;
+      this.cameraTarget.fromArray(camera.target);
+      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
+      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+      this.cameraVersion += 1;
+    }
+    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
+    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
+    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
+    if (project.modifiers.some(m => m.enabled)) this.diagnostics.push("Предпросмотр исходной геометрии: модификаторы пока не вычисляются.");
+    const lightKey = JSON.stringify(project.scene.lights);
+    if (lightKey !== this.lightKey) {
+      this.lights.clear(); this.lightKey = lightKey;
+      for (const light of project.scene.lights) {
+        const color = new T.Color(...light.color);
+        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
+          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
+        object.position.fromArray(light.position);
+        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
+        this.lights.add(object);
+      }
+    }
+    const ids = new Set(project.nodes.map(n => n.id));
+    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); }
+    for (const node of project.nodes) {
+      let entry = this.objects.get(node.id);
+      if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
+      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
+      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
+      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
+      const source = node.kind === "mesh" ? node.meshSource : null;
+      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
+      const key = JSON.stringify([source, asset, materials]);
+      if (key === entry.key) continue;
+      const sourceKey = JSON.stringify([source, asset]);
+      if (entry.content && entry.sourceKey === sourceKey && (source?.kind === "primitive" || materials.length > 0)) {
+        replaceMaterials(entry.content, materials);
+        entry.key = key;
+        continue;
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      // Replacement token prevents late assets from attaching after delete, undo, or another source.
+      const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
+      if (!source) continue;
+      const assign = (content: T.Object3D) => {
+        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
+        next.content = content; next.loading = false; next.object.add(content);
+        this.surfaces.register(node.id, next.object, content); this.emit();
+      };
+      try {
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
+        else {
+          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
+          const bytes = readAsset(source.assetId);
+          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
+          next.loading = true;
+          void this.decoder(bytes).then(content => {
+            // Keep imported materials when there is no explicit domain slot assignment.
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
+            assign(content);
+          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
+        }
+      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
+    }
+    for (const node of project.nodes) {
+      const object = this.objects.get(node.id)!.object;
+      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
+      if (parent && object.parent !== parent) parent.add(object);
+    }
+    for (const node of project.nodes) {
+      const parent = this.objects.get(node.id)?.object;
+      if (!parent) continue;
+      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
+      if (ordered.some((item, i) => parent.children[i] !== item)) {
+        for (const item of ordered) parent.remove(item);
+        for (const item of ordered) parent.add(item);
+      }
+    }
+    this.scene.updateMatrixWorld(true);
+    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
+    this.emit();
+  }
+  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
+    errors: [...this.objects.values()].filter(e => e.error).length,
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
+  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.surfaces.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+}
 </file>
 
 <file path="src/domain/command-bus.ts">
@@ -9438,7 +9919,8 @@ export const selectCanRedo = (state: EditorState) => state.history.canRedo;
     "manifold-3d": "^3.5.4",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
-    "three": "0.186.1"
+    "three": "0.186.1",
+    "three-mesh-bvh": "^0.9.16"
   }
 }
 </file>
@@ -9577,99 +10059,6 @@ button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 .object-row .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .object-row .tree-icon { width: 24px; padding: 0; }
 .tree-measure { display: none; }
-</file>
-
-<file path="docs/implementation-status.md">
-# Implementation status
-
-## TASK-018 — Inspector трансформаций и параметров примитивов
-
-- Правая панель показывает числовые Position/Rotation/Scale в local/world, mixed values, reset, видимость/блокировку и контекстную геометрию. Редактирование нескольких узлов проходит одной атомарной транзакцией; числовой ввод использует короткий preview debounce и один Undo-шаг на сеанс поля. Esc и отклонённый ввод удаляют предпросмотр и его запись истории через `cancelGesture`.
-- World-преобразования пересчитываются в локальные через матрицу родителя и отклоняются при shear, вырождении или отрицательном детерминанте. Одновременная world-правка предка и потомка явно запрещена. Формы защищены от устаревшей ревизии, смены проекта, выделения и режима.
-- Шесть примитивов остаются параметрическими; GLB отображается как readonly. Параметры куба канонизируются при переходе от `size` к отдельным размерам. Scene mode сохраняет Inspector только для просмотра модели.
-- Проверки: typecheck, lint, 61 целевой Vitest тест и production build прошли. Встроенный браузер с desktop viewport подтвердил создание куба, изменение положения, Undo/Redo, редактирование размера, ошибку нулевого масштаба и откат предпросмотра по Esc. Полный сценарий gizmo/group/save/reopen в браузере не проверен. Большой Vite chunk остаётся прежним предупреждением.
-
-## TASK-014 — Three.js renderer adapter
-
-- The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.
-- GPU geometry, materials, and textures are disposed when sources disappear or change, and asynchronous GLB results cannot attach after project replacement or viewport teardown. The renderer owns its canvas, resize observer, frame loop, and context-loss listeners. A graphics failure stops rendering and offers explicit retry from the current Project snapshot.
-- Scene mode labels the primary model as a preview; it does not synthesize serialized instances. HDRI environment assets, Scene instances, material textures, and modifier evaluation are not yet rendered, with visible diagnostics. Actual device loss and cross-browser recovery remain unverified on hardware; the loss handler and retry were tested in isolation.
-- In the in-app Chromium desktop viewport, Auto selected WebGPU and forced WebGL2 selected WebGL2. A local static GLB rendered, Undo/Redo changed the preview, and switching Model/Scene kept one canvas. Save/Open UI, dock resizing, and actual device loss were not browser-tested in this run.
-
-## TASK-013 — Unsaved changes and RAM-only lifecycle
-
-- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
-- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
-
-## TASK-012 — Desktop workspace and topbar
-
-- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
-- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
-- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
-
-## TASK-011 — Undo/Redo delta history
-
-- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
-- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
-- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
-
-## TASK-010B — Basic static GLB import
-
-- Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.
-- A confirmed import registers SHA-256 asset metadata and an identity transform mesh node in one domain transaction; bytes stay in RAM and round-trip through `.triad3d`. The Russian UI offers a separate import action, confirmation, diagnostics and a visible model entry.
-- TASK-010 / FR-064 remain partial: broader glTF scene and animation import, editable imported materials, and production 3D rendering are not implemented.
-
-## TASK-010A — Native project archive and manual file actions
-
-- Added `.triad3d` ZIP save/open with `manifest.json`, `document.json`, SHA-256 verified binary assets, strict entry/path checks, and bounded streaming extraction. Asset bytes remain in RAM and are excluded from JSON and command history.
-- EditorStore now replaces a validated loaded project and its asset store in one publication, resets selection/history, keeps serialized `model.revision`, and rejects stale asynchronous replacements. Confirmed File System Access writes mark the captured revision clean; browser download fallback reports only that download was initiated.
-- Added Russian save/open controls and status messages. Security limits are temporary protective bounds pending performance profiling: 128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest.
-- TASK-010 remains partial: the GLB/GLTF import adapter is not included in TASK-010A.
-
-## TASK-009 — Versioned project JSON serialization
-
-- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
-- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
-- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
-
-## TASK-007 — Domain commands and transactions
-
-- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
-- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
-- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
-- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
-
-## TASK-004 — TSX export harness spike
-
-- Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.
-- Targeted export tests, domain regression, root typecheck/lint/build, and WebGL smoke passed. Supported fields and omissions are recorded in [tsx-export-feasibility.md](tsx-export-feasibility.md). Production TASK-044 remains open.
-
-## TASK-003 — CSG/Manifold WASM spike
-
-- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
-- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
-
-## TASK-002 — Renderer/PBR spike
-
-- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
-- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
-- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
-
-## TASK-006 — React/Vite foundation
-
-- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
-- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
-- The document remains in memory only. No browser storage or backend is used.
-- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
-- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
-- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
-
-## TASK-016 — Параметрическая библиотека примитивов (FR-012, FR-024)
-
-- Добавлены единые определения и валидация шести примитивов в `src/geometry/primitives.ts`; фабрика Three.js использует их для вычисления геометрии по изменению source. Доменная проверка отклоняет неверные размеры, сегменты, неизвестные ключи и вырожденный цилиндр до фиксации проекта.
-- Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
-- Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
-- Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
 </file>
 
 <file path="src/ui/App.tsx">
@@ -9961,6 +10350,106 @@ function EditorShell() {
     </div>
   );
 }
+</file>
+
+<file path="docs/implementation-status.md">
+# Implementation status
+
+## TASK-018 — Inspector трансформаций и параметров примитивов
+
+- Правая панель показывает числовые Position/Rotation/Scale в local/world, mixed values, reset, видимость/блокировку и контекстную геометрию. Редактирование нескольких узлов проходит одной атомарной транзакцией; числовой ввод использует короткий preview debounce и один Undo-шаг на сеанс поля. Esc и отклонённый ввод удаляют предпросмотр и его запись истории через `cancelGesture`.
+- World-преобразования пересчитываются в локальные через матрицу родителя и отклоняются при shear, вырождении или отрицательном детерминанте. Одновременная world-правка предка и потомка явно запрещена. Формы защищены от устаревшей ревизии, смены проекта, выделения и режима.
+- Шесть примитивов остаются параметрическими; GLB отображается как readonly. Параметры куба канонизируются при переходе от `size` к отдельным размерам. Scene mode сохраняет Inspector только для просмотра модели.
+- Проверки: typecheck, lint, 61 целевой Vitest тест и production build прошли. Встроенный браузер с desktop viewport подтвердил создание куба, изменение положения, Undo/Redo, редактирование размера, ошибку нулевого масштаба и откат предпросмотра по Esc. Полный сценарий gizmo/group/save/reopen в браузере не проверен. Большой Vite chunk остаётся прежним предупреждением.
+
+## TASK-014 — Three.js renderer adapter
+
+- The editor stage now renders the committed Project graph with a persistent WebGPURenderer, WebGPU preferred and forced WebGL2 diagnostics. Stable node IDs retain Object3D instances across ordinary revisions; local transforms, visibility, camera, background, lights, primitives, domain PBR fields, and RAM-backed static GLB are reflected in the preview.
+- GPU geometry, materials, and textures are disposed when sources disappear or change, and asynchronous GLB results cannot attach after project replacement or viewport teardown. The renderer owns its canvas, resize observer, frame loop, and context-loss listeners. A graphics failure stops rendering and offers explicit retry from the current Project snapshot.
+- Scene mode labels the primary model as a preview; it does not synthesize serialized instances. HDRI environment assets, Scene instances, material textures, and modifier evaluation are not yet rendered, with visible diagnostics. Actual device loss and cross-browser recovery remain unverified on hardware; the loss handler and retry were tested in isolation.
+- In the in-app Chromium desktop viewport, Auto selected WebGPU and forced WebGL2 selected WebGL2. A local static GLB rendered, Undo/Redo changed the preview, and switching Model/Scene kept one canvas. Save/Open UI, dock resizing, and actual device loss were not browser-tested in this run.
+
+## TASK-013 — Unsaved changes and RAM-only lifecycle
+
+- The editor registers a `beforeunload` guard only while the document is dirty, removes it when clean or unmounted, and checks the current store snapshot before requesting the browser confirmation. New/Open confirmations and manual save semantics remain unchanged.
+- The project and history remain in tab memory. A confirmed reload starts a fresh session; reopening a saved project requires explicit file selection. Browser dialog behavior still requires a desktop browser smoke check.
+
+## TASK-012 — Desktop workspace and topbar
+
+- Completed the Russian editor shell controls: model/scene mode, new project with dirty confirmation, library tab, resizable docks, collapsible timeline, Ctrl+S, accessible status messages, and a narrow-window notice.
+- Reused EditorStore for mode/view and atomic project replacement. File actions share a synchronous UI lock; native save confirmation and download fallback retain their existing semantics. Production viewport, inspector, timeline editing, and export remain future tasks.
+- Typecheck, lint, targeted EditorStore/archive/GLB tests, and production build pass. Narrow-screen notice was visually checked in the in-app browser; desktop-width browser smoke is still unverified in that browser's fixed narrow viewport.
+
+## TASK-011 — Undo/Redo delta history
+
+- Added a cursor over reversible command deltas, validated atomic replay through the existing CommandBus, redo branch truncation, and explicit gesture grouping. Session revisions remain monotonic while the serialized model revision follows the replayed patch.
+- Saved state tracks a RAM-only history position. GLB bytes remain available for redo and are released when their history branch is discarded or the project is replaced. Undo/Redo buttons and keyboard shortcuts are available in the Russian topbar.
+- Targeted tests cover 100 undo/redo steps, transaction and gesture grouping, checkpoints, stale revisions, lock flags, GLB replay and archive round-trip. No history is serialized.
+
+## TASK-010B — Basic static GLB import
+
+- Added bounded GLB 2.0 preflight and `GLTFLoader` geometry check, rejecting external URIs, extensions, animations and unsupported scene structures before commit.
+- A confirmed import registers SHA-256 asset metadata and an identity transform mesh node in one domain transaction; bytes stay in RAM and round-trip through `.triad3d`. The Russian UI offers a separate import action, confirmation, diagnostics and a visible model entry.
+- TASK-010 / FR-064 remain partial: broader glTF scene and animation import, editable imported materials, and production 3D rendering are not implemented.
+
+## TASK-010A — Native project archive and manual file actions
+
+- Added `.triad3d` ZIP save/open with `manifest.json`, `document.json`, SHA-256 verified binary assets, strict entry/path checks, and bounded streaming extraction. Asset bytes remain in RAM and are excluded from JSON and command history.
+- EditorStore now replaces a validated loaded project and its asset store in one publication, resets selection/history, keeps serialized `model.revision`, and rejects stale asynchronous replacements. Confirmed File System Access writes mark the captured revision clean; browser download fallback reports only that download was initiated.
+- Added Russian save/open controls and status messages. Security limits are temporary protective bounds pending performance profiling: 128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest.
+- TASK-010 remains partial: the GLB/GLTF import adapter is not included in TASK-010A.
+
+## TASK-009 — Versioned project JSON serialization
+
+- Added strict JSON Schema 2020-12 contracts for `Project` document v1 and native manifest v1, with Ajv 8 validation, domain integrity checks, bounded input scanning, typed errors, and a pure migration chain API. No older migration is registered.
+- Serializing and parsing stay pure and disconnected from EditorStore. ZIP packaging, asset bytes/checksums, file dialogs, and replacement of the active project remain TASK-010.
+- Targeted round-trip and malformed-input tests cover geometry hierarchy, materials, animation, modifiers, references, version handling, numeric corruption, nesting, and unsafe archive paths.
+
+## TASK-007 — Domain commands and transactions
+
+- Implemented a typed, in-memory Command Bus for adding leaf nodes, renaming, transforms, and visibility/lock flags. Commands validate targets and permissions, stage an isolated candidate, and commit once after `validateProject` succeeds.
+- Session transaction revision starts at zero; successful content changes advance it once and also advance `model.revision` once for these model-node commands. Semantic no-ops advance neither.
+- Forward and inverse field/node deltas can be replayed with `applyProjectPatch`; snapshots and command results are defensive copies. Editor store, history, and UI integration remain future tasks.
+- Verification: 28 targeted domain tests, typecheck, lint, and production build passed.
+
+## TASK-004 — TSX export harness spike
+
+- Completed a narrow Project-to-TSX generator and an isolated React/Three Vite harness. The automatically generated component passes TypeScript and production build after `npm ci` in a directory outside the repository.
+- Targeted export tests, domain regression, root typecheck/lint/build, and WebGL smoke passed. Supported fields and omissions are recorded in [tsx-export-feasibility.md](tsx-export-feasibility.md). Production TASK-044 remains open.
+
+## TASK-003 — CSG/Manifold WASM spike
+
+- Изолированный прототип `src/spikes/csg/`, dev-маршрут `/?spike=csg`, целевые тесты и отчёт [csg-feasibility.md](csg-feasibility.md).
+- Subtract/union/intersect и базовая проверка сетки прошли; UV и исходные нормали не сохраняются. ADR-003 остаётся PROPOSED.
+
+## TASK-002 — Renderer/PBR spike
+
+- Изолированный dev-прототип `/?spike=renderer` с WebGPU preferred и Forced WebGL2, локальным CC0 HDRI и диагностикой backend.
+- Встроенный браузер Codex: фактически WebGPU и WebGL2, обе эталонные сцены сняты при 1280×800; подробности в [renderer-decision.md](renderer-decision.md).
+- `npm run typecheck`, `npm run lint`, `npm test` (9 тестов), `npm run build` проходят. ADR-004 остаётся PROPOSED до проверки в Chrome/Edge и на других GPU.
+
+## TASK-006 — React/Vite foundation
+
+- Integrated the existing domain API and design tokens into a single React/Vite/TypeScript SPA.
+- The initial Russian desktop screen is structural; rendering, editing, timeline controls, and persistence are future tasks.
+- The document remains in memory only. No browser storage or backend is used.
+- `nodes` is a flat entity collection with `parentId`/`children` hierarchy links. This supports stable IDs and serialization. TASK-007 commands must update both links atomically and validate before commit; renderer synchronization should derive from committed domain revisions. No blocking architectural conflict found.
+- TASK-001 and TASK-005 files remain intact. The token fixture is served by Vite at `/tests/visual/design-tokens.html`.
+- Verification: `npm run typecheck`, `npm run lint`, `npm test` (9 tests), and `npm run build` pass. Vite HTTP smoke confirmed the SPA and token fixture load. The available in-app browser has a narrow viewport; full desktop-width visual QA remains open.
+
+## TASK-016 — Параметрическая библиотека примитивов (FR-012, FR-024)
+
+- Добавлены единые определения и валидация шести примитивов в `src/geometry/primitives.ts`; фабрика Three.js использует их для вычисления геометрии по изменению source. Доменная проверка отклоняет неверные размеры, сегменты, неизвестные ключи и вырожденный цилиндр до фиксации проекта.
+- Через левую «Библиотеку» можно создать примитив в корне Model с выделением; правая панель применяет числовые параметры отдельной обратимой командой. `SET_PRIMITIVE_PARAMETERS` соблюдает inherited lock/visibility, не изменяет asset-backed mesh и поддерживает Undo/Redo. Save/Open сохраняют source в схеме 1.0.0 без миграции.
+- Изменены `src/geometry/primitives.ts`, `src/renderer/primitive.ts`, `src/domain/{command-bus,validate-project}.ts`, `src/ui/App.tsx`, `src/ui/styles/app.css`; добавлен `tests/renderer/primitives.test.ts`.
+- Проверки: typecheck, lint, 84 целевых Vitest теста, build — успешно. Браузерный smoke UNVERIFIED: встроенный браузер доступен только в узком viewport и показывает desktop-only notice. Существующее предупреждение Vite о размере bundle остаётся. Полный Inspector и production TSX export остаются отдельными задачами.
+
+## TASK-019 — BVH и Surface Picking (MVP)
+
+- Добавлен runtime `SurfaceQuery`: ближайшее пересечение мирового луча с видимым статическим Mesh, координаты world/mesh-local/node-local, геометрическая нормаль, faceIndex и UV при наличии. Viewport использует этот API для выбора узлов.
+- `three-mesh-bvh@0.9.16` подключён локально к поддерживаемым Mesh без изменения прототипов Three.js. Для сеток от 20 000 треугольников BVH строится одним переиспользуемым Worker; проверка и копирование входных буферов выполняются порциями. Порог является начальной эвристикой. Пока BVH не готов или построение завершилось ошибкой, используется штатный raycast; ошибка отражается в диагностике viewport.
+- Индексы живут только в runtime. SceneSync освобождает их при замене геометрии, удалении узла, смене проекта и dispose. Изменение transform или материала не перестраивает BVH. Skinned/morph Mesh, повреждённые сетки и сетки более 2 млн треугольников не индексируются; повреждённые сетки не участвуют в запросе.
+- Целевые тесты покрывают indexed/non-indexed, шесть примитивов, вложенные трансформации, normal matrix, видимость предков, locked selection, worker success/failure/late result и жизненный цикл геометрии. Browser smoke и замер ускорения отдельно не подтверждены.
 </file>
 
 </files>
