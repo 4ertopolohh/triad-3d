@@ -1,5 +1,12 @@
 # Implementation status
 
+## CODEX-024A — Editable mesh domain foundation (часть TASK-024)
+
+- Project schema 1.1.0 stores JSON editable positions, triangle indices and optional UV. Strict v1.0 documents migrate in memory; ZIP manifest remains 1.0.0. Invalid geometry is rejected before project replacement.
+- Explicit primitive conversion and local vertex translation use CommandBus patches with Undo/Redo. Coincident render vertices at UV seams move together; invalid or degenerate geometry rolls back. SceneSync and ModifierEvaluator derive detached geometry from Project. Inspector identifies editable meshes; spike TSX rejects them explicitly.
+- Active modifier stacks and Boolean dependents block these edit commands until pre-commit derived validation is available. Visual sub-selection, gizmos, extrude and topology tools remain in TASK-024. Browser smoke verified desktop layout, schema 1.1.0 and cube creation in WebGPU; editable geometry was verified through renderer tests because this stage has no conversion/edit UI.
+- Final checks: `npm run typecheck`, `npm run lint`, `npm run build`, and `npm test` PASS (31 files, 246 tests; isolated TSX harness typecheck/build PASS). Build retains the existing large-chunk warning. CODEX-024A acceptance is covered at API, serialization, renderer and evaluator levels; full TASK-024 and FR-013 remain partial.
+
 ## CODEX-023C — Mirror commands и Inspector (TASK-023)
 
 - Добавлены типизированные ADD/UPDATE Mirror команды с проверкой параметров, доступности mesh, уникальности ID, версий и обратимых патчей. Общие команды стека работают с Mirror без отдельной истории.

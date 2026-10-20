@@ -96,6 +96,7 @@ export interface MaterialSlot {
 
 export type MeshSource =
   | { kind: "primitive"; primitive: "cube" | "sphere" | "torus" | "cylinder" | "cone" | "plane"; parameters: Record<string, number> }
+  | { kind: "editable"; positions: number[]; indices: number[]; uv?: number[] }
   | { kind: "asset"; assetId: EntityId };
 
 export interface Modifier {

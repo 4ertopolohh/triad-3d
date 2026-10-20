@@ -93,7 +93,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
     <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
     {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
       <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
-      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
+      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
       <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
         {transformReason && <p className="panel-hint">{transformReason}</p>}
         {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}

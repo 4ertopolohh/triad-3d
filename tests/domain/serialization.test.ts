@@ -54,7 +54,7 @@ describe("project document schema v1", () => {
     if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
   });
 
-  it.each(["2.0.0", "1.1.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+  it.each(["2.0.0", "1.2.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
     const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
@@ -80,7 +80,7 @@ describe("project document schema v1", () => {
     expect(deserializeProjectDocument(deep).ok).toBe(false);
   });
 
-  it("provides pure migration chaining without an invented built-in migration", () => {
+  it("provides pure migration chaining through the built-in v1 migration", () => {
     const old = { ...emptyProject, schemaVersion: "0.9.0" };
     const before = clone(old);
     const migration = { from: "0.9.0", to: "1.0.0", migrate: (input: unknown) => ({ ...(input as object), schemaVersion: "1.0.0" }) };

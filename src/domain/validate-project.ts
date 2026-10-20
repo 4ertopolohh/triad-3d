@@ -1,5 +1,6 @@
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
+import { validateEditableSource } from "../geometry/mesh-edit";
 import { parseArrayParameters } from "../geometry/modifiers/array";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 
@@ -86,8 +87,11 @@ export function validateProject(project: Project): ValidationIssue[] {
     checkTransform(node, finite, `nodes.${node.id}.transform`);
     if (node.kind === "mesh") {
       if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else {
+      else if (node.meshSource.kind === "primitive") {
         const message = validatePrimitiveSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      } else {
+        const message = validateEditableSource(node.meshSource);
         if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
       }
     }

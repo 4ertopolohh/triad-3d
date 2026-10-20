@@ -14,7 +14,7 @@ export type BooleanChange =
 
 export function booleanOperandReason(node: DeepReadonly<MeshNode>): string | null {
   if (node.meshSource.kind === "asset") return "Boolean для импортированного GLB пока недоступен: нет resolver геометрии.";
-  if (node.meshSource.primitive === "plane") return "Плоскость не является замкнутым объёмом.";
+  if (node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane") return "Плоскость не является замкнутым объёмом.";
   return null;
 }
 

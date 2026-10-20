@@ -1,4 +1,4 @@
-import type { Asset, EntityId, MeshNode, Modifier, Node, Project, Transform } from "./types";
+import type { Asset, EntityId, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import type { ArrayParameters } from "../geometry/modifiers/types";
@@ -6,6 +6,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
+import { convertPrimitiveToEditable, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
@@ -15,6 +16,8 @@ export type ProjectCommand =
   | { commandId: string; type: "SET_NODE_TRANSFORM"; targetIds: [EntityId]; payload: { nodeId: EntityId; transform: Transform } }
   | { commandId: string; type: "SET_NODE_FLAGS"; targetIds: [EntityId]; payload: { nodeId: EntityId; visible?: boolean; locked?: boolean } }
   | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
+  | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
+  | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
@@ -51,7 +54,7 @@ export type PatchChange =
   | { kind: "setModifier"; modifierId: EntityId; before: Modifier; after: Modifier }
   | { kind: "setModifierIds"; nodeId: EntityId; before: EntityId[]; after: EntityId[] }
   | { kind: "setNode"; nodeId: EntityId; field: "name" | "transform" | "visible" | "locked" | "children" | "parentId"; before: Node["name"] | Transform | boolean | EntityId[] | EntityId | null; after: Node["name"] | Transform | boolean | EntityId[] | EntityId | null }
-  | { kind: "setPrimitiveSource"; nodeId: EntityId; before: PrimitiveSource; after: PrimitiveSource }
+  | { kind: "setMeshSource"; nodeId: EntityId; before: MeshSource; after: MeshSource }
   | { kind: "modelRevision"; before: number; after: number };
 export interface ProjectPatch { changes: PatchChange[] }
 
@@ -99,6 +102,7 @@ function validNode(value: unknown): value is Node {
   const source = value.meshSource;
   if (!record(source)) return false;
   if (source.kind === "asset") return ownKeys(source, ["kind", "assetId"]) && id(source.assetId);
+  if (source.kind === "editable") return validateEditableSource(source) === null;
   return source.kind === "primitive" && ownKeys(source, ["kind", "primitive", "parameters"])
     && validatePrimitiveSource(source) === null;
 }
@@ -160,6 +164,11 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!id(payload.nodeId) || value.targetIds.length !== 1 || value.targetIds[0] !== payload.nodeId
     || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   switch (value.type) {
+    case "CONVERT_PRIMITIVE_TO_EDITABLE": return ownKeys(payload, ["nodeId"]);
+    case "TRANSLATE_EDITABLE_VERTICES": return ownKeys(payload, ["nodeId", "vertexIndices", "delta"])
+      && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
+      && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
+      && numbers(payload.delta, 3);
     case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
     case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
     case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
@@ -250,6 +259,10 @@ function normalizeOrders(project: Project, node: MeshNode): boolean {
 function meshOperand(project: Project, nodeId: string): MeshNode | undefined {
   const node = nodeById(project, nodeId);
   return node?.kind === "mesh" && !(node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane") ? node : undefined;
+}
+
+function activeDependents(project: Project, nodeId: string): boolean {
+  return project.modifiers.some(m => m.enabled && m.kind === "boolean" && m.parameters.cutterNodeId === nodeId);
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
@@ -434,6 +447,24 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Тип примитива нельзя изменить командой параметров.");
       next = samePrimitive(current.meshSource, command.payload.source) ? current
         : { ...current, meshSource: structuredClone(command.payload.source) }; break;
+    case "CONVERT_PRIMITIVE_TO_EDITABLE":
+      if (current.kind !== "mesh" || current.meshSource.kind !== "primitive")
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Преобразование требует параметрический примитив.");
+      if (current.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled) || activeDependents(project, current.id))
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перед преобразованием отключите активные модификаторы и зависимые Boolean.");
+      try { next = { ...current, meshSource: convertPrimitiveToEditable(current.meshSource) }; }
+      catch (error) { return failure(command.commandId, CommandErrorCode.VALIDATION_FAILED, error instanceof Error ? error.message : "Геометрия недопустима."); }
+      break;
+    case "TRANSLATE_EDITABLE_VERTICES":
+      if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перенос требует редактируемую сетку.");
+      try {
+        const source = translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta);
+        if (source !== current.meshSource && (current.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled) || activeDependents(project, current.id)))
+          return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перед редактированием отключите активные модификаторы и зависимые Boolean.");
+        next = source === current.meshSource ? current : { ...current, meshSource: source };
+      } catch (error) { return failure(command.commandId, CommandErrorCode.VALIDATION_FAILED, error instanceof Error ? error.message : "Геометрия недопустима."); }
+      break;
     case "SET_NODE_FLAGS": next = { ...current,
       visible: command.payload.visible ?? current.visible,
       locked: command.payload.locked ?? current.locked }; break;
@@ -463,8 +494,8 @@ function diff(before: Project, after: Project): ProjectPatch {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
     }
-    if (old.kind === "mesh" && node.kind === "mesh" && old.meshSource.kind === "primitive" && node.meshSource.kind === "primitive" && !same(old.meshSource, node.meshSource))
-      changes.push({ kind: "setPrimitiveSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
+    if (old.kind === "mesh" && node.kind === "mesh" && !same(old.meshSource, node.meshSource))
+      changes.push({ kind: "setMeshSource", nodeId: node.id, before: structuredClone(old.meshSource), after: structuredClone(node.meshSource) });
   }
   for (const [index, modifier] of [...before.modifiers.entries()].reverse()) if (!after.modifiers.some(item => item.id === modifier.id))
     changes.push({ kind: "removeModifier", modifier: structuredClone(modifier), index });
@@ -489,7 +520,7 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
     if (change.kind === "setModifier") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setModifierIds") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
-    if (change.kind === "setPrimitiveSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    if (change.kind === "setMeshSource") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
   }) };
 }
@@ -531,9 +562,9 @@ export function applyProjectPatch(project: Project, patch: ProjectPatch): Projec
     } else if (change.kind === "modelRevision") {
       if (result.model.revision !== change.before) throw new Error("Patch revision conflict");
       result.model.revision = change.after;
-    } else if (change.kind === "setPrimitiveSource") {
+    } else if (change.kind === "setMeshSource") {
       const node = result.nodes.find((entry) => entry.id === change.nodeId);
-      if (!node || node.kind !== "mesh" || node.meshSource.kind !== "primitive" || !same(node.meshSource, change.before)) throw new Error("Patch primitive conflict");
+      if (!node || node.kind !== "mesh" || !same(node.meshSource, change.before)) throw new Error("Patch mesh source conflict");
       node.meshSource = structuredClone(change.after);
     } else {
       const node = result.nodes.find((entry) => entry.id === change.nodeId);

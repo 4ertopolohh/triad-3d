@@ -4,6 +4,7 @@ import type { Project, Transform, Material } from "../domain/types";
 import { decodeStaticGlb } from "../importers/gltf/import-glb";
 import { disposeObject } from "../assets/three-resources";
 import { primitiveGeometry } from "./primitive";
+import { editableGeometry } from "../geometry/mesh-edit";
 import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
 
@@ -108,7 +109,7 @@ export class SceneSync {
       const key = JSON.stringify([source, asset, materials]);
       if (key === entry.key) continue;
       const sourceKey = JSON.stringify([source, asset]);
-      if (entry.content && entry.sourceKey === sourceKey && (source?.kind === "primitive" || materials.length > 0)) {
+      if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
         replaceMaterials(entry.content, materials);
         entry.key = key;
         continue;
@@ -124,6 +125,7 @@ export class SceneSync {
       };
       try {
         if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
+        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), material(materials[0])));
         else {
           if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
           const bytes = readAsset(source.assetId);

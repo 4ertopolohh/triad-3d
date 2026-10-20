@@ -1,6 +1,7 @@
 import { Matrix4, Quaternion, Vector3 } from "three";
 import type { MeshNode, Modifier, Node, Project } from "../../domain/types";
 import { primitiveGeometry } from "../../renderer/primitive";
+import { editableMeshData } from "../mesh-edit";
 import { CsgError, CsgService, fromThree, validateMesh, type MeshData } from "../csg";
 import type { AssetGeometryResolver, BooleanParameters, EvaluationResult, GeometryAttributes, ModifierDiagnostic, ModifierErrorCode, ModifierWarning } from "./types";
 import { ArrayError, evaluateArray, parseArrayParameters } from "./array";
@@ -135,6 +136,11 @@ export class ModifierEvaluator {
         catch (error) { throw new EvaluationFailure("FILE_INVALID", error instanceof Error ? error.message : String(error), nodeId); }
         try { mesh = fromThree(geometry); attributes = { uv: geometry.hasAttribute("uv"), normals: geometry.hasAttribute("normal"), materialGroups: geometry.groups.length > 0, materialSlots: node.materialSlots.length }; }
         finally { geometry.dispose(); }
+        fingerprint = stable(source);
+      } else if (source.kind === "editable") {
+        try { mesh = editableMeshData(source); }
+        catch (error) { throw new EvaluationFailure("FILE_INVALID", error instanceof Error ? error.message : "Некорректная редактируемая сетка.", nodeId); }
+        attributes = { uv: !!source.uv, normals: false, materialSlots: node.materialSlots.length };
         fingerprint = stable(source);
       } else {
         const asset = ctx.project.assets.find((a) => a.id === source.assetId);

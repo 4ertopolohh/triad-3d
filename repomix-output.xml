@@ -78,6 +78,7 @@ src/
     boolean-actions.ts
     editor-store.ts
     job-controller.ts
+    mirror-actions.ts
     use-editor-store.ts
   assets/
     asset-bytes.ts
@@ -143,6 +144,7 @@ src/
     inspector-logic.ts
     Inspector.tsx
     JobOverlay.tsx
+    MirrorEditor.tsx
     ObjectTree.tsx
   main.tsx
   vite-env.d.ts
@@ -152,6 +154,7 @@ tests/
     boolean-actions.test.ts
     editor-store.test.ts
     job-controller.test.ts
+    mirror-actions.test.ts
   assets/
     native-project-archive.test.ts
   csg/
@@ -164,6 +167,7 @@ tests/
     boolean-commands.test.ts
     commands.test.ts
     hierarchy.test.ts
+    mirror-commands.test.ts
     project.test.ts
     serialization.test.ts
   export/
@@ -3657,6 +3661,76 @@ export function createJobController(host: Host): JobController {
 }
 </file>
 
+<file path="src/app/mirror-actions.ts">
+import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
+import type { Project } from "../domain/types";
+import { ModifierEvaluator } from "../geometry/modifiers";
+import type { MirrorParameters } from "../geometry/modifiers/types";
+import type { EditorStore } from "./editor-store";
+import type { JobOutcome } from "./job-controller";
+
+export type MirrorChange =
+  | { type: "add"; targetId: string; parameters: MirrorParameters }
+  | { type: "update"; targetId: string; modifierId: string; parameters: MirrorParameters }
+  | { type: "enable"; targetId: string; modifierId: string; enabled: boolean }
+  | { type: "move"; targetId: string; modifierId: string; toIndex: number }
+  | { type: "remove"; targetId: string; modifierId: string };
+
+const failure = (id: string, message: string): JobOutcome => ({ ok: false, id, status: "validation_failed", error: { code: "VALIDATION_FAILED", message } });
+
+/** Checks the complete resulting stack on a detached document before committing one history step. */
+export async function applyMirrorChange(store: EditorStore, change: MirrorChange,
+  evaluatorFactory: () => ModifierEvaluator = () => new ModifierEvaluator()): Promise<JobOutcome> {
+  const snapshot = store.getSnapshot();
+  const epoch = store.getProjectEpoch();
+  const project = snapshot.document.project;
+  const target = project.nodes.find(node => node.id === change.targetId);
+  const id = crypto.randomUUID();
+  if (!target || target.kind !== "mesh") return failure(id, "Выберите один mesh.");
+  if (target.meshSource.kind === "asset") return failure(id, "Mirror для импортированного GLB пока недоступен: нет resolver геометрии.");
+  if (change.type !== "add" && (!target.modifierIds.includes(change.modifierId)
+    || project.modifiers.find(item => item.id === change.modifierId)?.kind !== "mirror"))
+    return failure(id, "Mirror не принадлежит выбранному mesh.");
+  const commandId = crypto.randomUUID();
+  let command: ProjectCommand;
+  if (change.type === "add") {
+    const modifierId = crypto.randomUUID();
+    command = { commandId, type: "ADD_MIRROR_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, parameters: change.parameters } };
+  } else if (change.type === "update") command = { commandId, type: "UPDATE_MIRROR_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, parameters: change.parameters } };
+  else if (change.type === "enable") command = { commandId, type: "SET_MODIFIER_ENABLED", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, enabled: change.enabled } };
+  else if (change.type === "move") command = { commandId, type: "MOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, toIndex: change.toIndex } };
+  else command = { commandId, type: "REMOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId } };
+  const commands = [command];
+  let candidate: Project;
+  try {
+    const bus = createCommandBus(structuredClone(project) as Project);
+    const prepared = bus.executeTransaction(commands, bus.getRevision(), id);
+    if (!prepared.ok) return failure(id, `${prepared.code}: ${prepared.message}${prepared.issues?.[0] ? ` ${prepared.issues[0].message}` : ""}`);
+    if (!prepared.changed) return { ok: true, id, status: "succeeded", committed: false };
+    candidate = prepared.project;
+  } catch (error) { return failure(id, error instanceof Error ? error.message : "Не удалось проверить Mirror."); }
+  const candidateTarget = candidate.nodes.find(node => node.id === target.id);
+  if (candidateTarget?.kind === "mesh" && !candidateTarget.modifierIds.some(modifierId => candidate.modifiers.find(item => item.id === modifierId)?.enabled)) {
+    if (store.getProjectEpoch() !== epoch) return failure(id, "Проект заменён до применения изменения.");
+    const committed = store.executeTransaction(commands, snapshot.document.revision, id);
+    return committed.ok ? { ok: true, id, status: "succeeded", committed: committed.changed } : failure(id, committed.message);
+  }
+  const evaluator = evaluatorFactory();
+  try {
+    return await store.jobs.run({
+      id, name: "Проверка зеркалирования", cancellable: true,
+      validate: input => store.getProjectEpoch() === epoch && input.revision === snapshot.document.revision && input.projectId === project.id
+        ? null : { code: "STALE_PROJECT", message: "Проект изменился до вычисления." },
+      compute: async (_input, signal) => {
+        const result = await evaluator.evaluate(candidate, target.id, signal);
+        return result.ok ? { ok: true as const, value: commands }
+          : { ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` } };
+      }, commands: value => value,
+    });
+  } finally { evaluator.dispose(); }
+}
+</file>
+
 <file path="src/app/use-editor-store.ts">
 import { useSyncExternalStore } from "react";
 import type { EditorState, EditorStore } from "./editor-store";
@@ -6019,6 +6093,71 @@ export function JobOverlay({ job, cancel }: { job: JobState; cancel: () => void 
 }
 </file>
 
+<file path="src/ui/MirrorEditor.tsx">
+import { useRef, useState } from "react";
+import { applyMirrorChange, type MirrorChange } from "../app/mirror-actions";
+import type { DeepReadonly, EditorStore } from "../app/editor-store";
+import type { Modifier } from "../domain/types";
+import { parseMirrorParameters } from "../geometry/modifiers/mirror";
+import type { MirrorParameters } from "../geometry/modifiers/types";
+
+const defaults: MirrorParameters = { axes: "x", pivot: [0, 0, 0], mergeSeam: false };
+const axes: MirrorParameters["axes"][] = ["x", "y", "z", "xy", "xz", "yz", "xyz"];
+
+export function MirrorAdd({ store, targetId, disabled, reason }: { store: EditorStore; targetId: string; disabled: boolean; reason: string }) {
+  const [message, setMessage] = useState("");
+  async function add() {
+    setMessage("");
+    const result = await applyMirrorChange(store, { type: "add", targetId, parameters: defaults });
+    setMessage(result.ok ? result.committed ? "Зеркалирование добавлено." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
+  }
+  return <section className="boolean-editor" aria-label="Зеркалирование"><h4>Зеркалирование</h4>
+    {reason && <p className="primitive-error" role="alert">{reason}</p>}
+    <button type="button" disabled={disabled || !!reason} onClick={() => void add()}>Добавить зеркалирование</button>
+    {message && <p className={message === "Зеркалирование добавлено." || message === "Изменений нет." ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
+  </section>;
+}
+
+export function MirrorItem({ store, targetId, modifier, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; index: number; length: number; disabled: boolean; reason: string }) {
+  const [message, setMessage] = useState("");
+  const editing = useRef<{ revision: number; epoch: object; selection: string; version: number } | null>(null);
+  let params: MirrorParameters;
+  try { params = parseMirrorParameters(modifier.parameters); }
+  catch { return <p className="primitive-error" role="alert">{index + 1}. Параметры Mirror повреждены.</p>; }
+  async function run(change: MirrorChange) {
+    setMessage("");
+    const result = await applyMirrorChange(store, change);
+    setMessage(result.ok ? result.committed ? "Зеркалирование изменено." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
+  }
+  function update(parameters: MirrorParameters) { void run({ type: "update", targetId, modifierId: modifier.id, parameters }); }
+  return <div className="boolean-stack-item">
+    <strong>{index + 1}. Зеркалирование</strong>
+    <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!reason} onChange={event => void run({ type: "enable", targetId, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
+    <label>Плоскости отражения<select value={params.axes} disabled={disabled || !!reason} onChange={event => update({ ...params, axes: event.target.value as MirrorParameters["axes"] })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>
+    <p className="panel-hint">Отражение выполняется относительно локальных плоскостей выбранного объекта.</p>
+    <div><span>Pivot</span><div className="boolean-stack-actions">{(["X", "Y", "Z"] as const).map((axis, component) => <label key={axis}>{axis}<input key={`${modifier.version}-${axis}`} type="number" defaultValue={params.pivot[component]} disabled={disabled || !!reason}
+      onFocus={() => { const current = store.getSnapshot(); editing.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), selection: current.selection.ids.join("\u0000"), version: modifier.version }; }}
+      onBlur={event => {
+        const session = editing.current; editing.current = null;
+        const current = store.getSnapshot();
+        if (!session) return;
+        if (disabled || store.getProjectEpoch() !== session.epoch || current.document.revision !== session.revision
+          || current.selection.ids.join("\u0000") !== session.selection || current.tool.mode !== "model"
+          || current.document.project.modifiers.find(item => item.id === modifier.id)?.version !== session.version) {
+          event.currentTarget.value = String(params.pivot[component]); setMessage("Данные изменились. Повторите ввод."); return;
+        }
+        const value = event.currentTarget.valueAsNumber;
+        if (!Number.isFinite(value)) { event.currentTarget.value = String(params.pivot[component]); setMessage("Введите конечное число."); return; }
+        if (value !== params.pivot[component]) update({ ...params, pivot: params.pivot.map((item, at) => at === component ? value : item) as [number, number, number] });
+      }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { event.currentTarget.value = String(params.pivot[component]); editing.current = null; event.currentTarget.blur(); } }} /></label>)}</div></div>
+    <label className="boolean-check"><input type="checkbox" checked={params.mergeSeam} disabled={disabled || !!reason} onChange={event => update({ ...params, mergeSeam: event.target.checked })} />Объединять объёмы через CSG</label>
+    <p className="panel-hint">Доступно для корректных замкнутых тел. Операция не обрезает исходную геометрию по плоскости и не гарантирует автоматическую сшивку шва.</p>
+    <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!reason || index === 0} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!reason || index === length - 1} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!reason} onClick={() => void run({ type: "remove", targetId, modifierId: modifier.id })}>Удалить</button></div>
+    {message && <p className={message === "Зеркалирование изменено." || message === "Изменений нет." ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
+  </div>;
+}
+</file>
+
 <file path="src/ui/ObjectTree.tsx">
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import type { EditorStore, DeepReadonly } from "../app/editor-store";
@@ -6477,6 +6616,106 @@ describe("transactional heavy jobs", () => {
 });
 </file>
 
+<file path="tests/app/mirror-actions.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { applyMirrorChange } from "../../src/app/mirror-actions";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import type { ModifierEvaluator } from "../../src/geometry/modifiers";
+import type { MirrorParameters } from "../../src/geometry/modifiers/types";
+
+const parameters: MirrorParameters = { axes: "x", pivot: [0, 0, 0], mergeSeam: false };
+function fixture(primitive: "cube" | "plane" = "cube") {
+  const project = createProject(() => crypto.randomUUID());
+  const root = project.nodes[0]!;
+  const node = createPrimitiveNode(primitive, root.id, "target");
+  project.nodes.push(node); root.children.push(node.id);
+  return createEditorStore(project);
+}
+const change = (modifierId: string) => ({ type: "update" as const, targetId: "target", modifierId, parameters: { ...parameters, pivot: [1, 0, 0] as const } });
+
+describe("Mirror user actions", () => {
+  it("adds, updates, toggles, moves and removes in single undo steps", async () => {
+    const store = fixture();
+    expect(await applyMirrorChange(store, { type: "add", targetId: "target", parameters })).toMatchObject({ ok: true, committed: true });
+    const first = store.getSnapshot().document.project.modifiers[0]!.id;
+    expect(await applyMirrorChange(store, change(first))).toMatchObject({ ok: true, committed: true });
+    const before = store.getSnapshot();
+    expect(await applyMirrorChange(store, change(first))).toMatchObject({ ok: true, committed: false });
+    expect(store.getSnapshot().document.revision).toBe(before.document.revision);
+    expect(store.getSnapshot().history.entries).toHaveLength(before.history.entries.length);
+    expect(await applyMirrorChange(store, { type: "add", targetId: "target", parameters })).toMatchObject({ ok: true });
+    expect(await applyMirrorChange(store, { type: "move", targetId: "target", modifierId: first, toIndex: 1 })).toMatchObject({ ok: true });
+    expect(store.getSnapshot().document.project.nodes.find(n => n.id === "target")?.modifierIds[1]).toBe(first);
+    expect(await applyMirrorChange(store, { type: "enable", targetId: "target", modifierId: first, enabled: false })).toMatchObject({ ok: true });
+    expect(await applyMirrorChange(store, { type: "remove", targetId: "target", modifierId: first })).toMatchObject({ ok: true });
+    const revision = store.getSnapshot().document.revision;
+    expect(store.undo(revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.modifiers.some(item => item.id === first)).toBe(true);
+    expect(store.redo(revision + 1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.modifiers.some(item => item.id === first)).toBe(false);
+  });
+  it("rejects invalid input and a modifier owned by another mesh without history changes", async () => {
+    const store = fixture();
+    const original = store.getSnapshot();
+    expect((await applyMirrorChange(store, { type: "add", targetId: "target", parameters: { ...parameters, axes: "bad" as "x" } })).ok).toBe(false);
+    expect(store.getSnapshot().document.revision).toBe(original.document.revision);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(await applyMirrorChange(store, { type: "add", targetId: "target", parameters })).toMatchObject({ ok: true });
+    const id = store.getSnapshot().document.project.modifiers[0]!.id;
+    expect((await applyMirrorChange(store, { type: "update", targetId: "other", modifierId: id, parameters })).ok).toBe(false);
+  });
+  it("rolls back failed geometry checks and ignores an evaluator fallback", async () => {
+    const store = fixture();
+    const before = store.getSnapshot();
+    const dispose = vi.fn();
+    const evaluatorFactory = () => ({ evaluate: vi.fn(async () => ({ ok: false, fallback: true, error: { code: "GEOMETRY_NON_MANIFOLD", message: "Открытая сетка." }, warnings: [], appliedModifierIds: [] })), dispose }) as unknown as ModifierEvaluator;
+    const result = await applyMirrorChange(store, { type: "add", targetId: "target", parameters: { ...parameters, mergeSeam: true } }, evaluatorFactory);
+    expect(result.ok).toBe(false);
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(store.getSnapshot().document.project).toEqual(before.document.project);
+    expect(store.getSnapshot().history).toEqual(before.history);
+    expect(store.getSnapshot().document.dirty).toBe(before.document.dirty);
+  });
+  it("checks the remaining active stack before removing Mirror", async () => {
+    const store = fixture();
+    expect(await applyMirrorChange(store, { type: "add", targetId: "target", parameters })).toMatchObject({ ok: true });
+    const mirrorId = store.getSnapshot().document.project.modifiers[0]!.id;
+    const snapshot = store.getSnapshot();
+    expect(store.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_ARRAY_MODIFIER", targetIds: ["target", "array"],
+      payload: { nodeId: "target", modifierId: "array", parameters: { mode: "linear", count: 2, axis: "x", step: 1, offset: [0, 0, 0] } } }, snapshot.document.revision).ok).toBe(true);
+    const before = store.getSnapshot();
+    const evaluate = vi.fn(async () => ({ ok: false, fallback: true, error: { code: "RESOURCE_TOO_LARGE", message: "Лимит." }, warnings: [], appliedModifierIds: [] }));
+    const factory = () => ({ evaluate, dispose: vi.fn() }) as unknown as ModifierEvaluator;
+    expect((await applyMirrorChange(store, { type: "remove", targetId: "target", modifierId: mirrorId }, factory)).ok).toBe(false);
+    expect(evaluate).toHaveBeenCalledOnce();
+    expect(store.getSnapshot().document.project).toEqual(before.document.project);
+    expect(store.getSnapshot().history).toEqual(before.history);
+  });
+  it("rejects CSG on an open plane while ordinary Mirror still works", async () => {
+    const store = fixture("plane");
+    expect((await applyMirrorChange(store, { type: "add", targetId: "target", parameters: { ...parameters, mergeSeam: true } })).ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(await applyMirrorChange(store, { type: "add", targetId: "target", parameters })).toMatchObject({ ok: true, committed: true });
+  });
+  it("cancels a pending check without a late commit", async () => {
+    const store = fixture();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const evaluatorFactory = () => ({ evaluate: async () => { await pending; return { ok: true }; }, dispose: vi.fn() }) as unknown as ModifierEvaluator;
+    const operation = applyMirrorChange(store, { type: "add", targetId: "target", parameters }, evaluatorFactory);
+    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("running"));
+    expect(store.jobs.cancelJob()).toBe(true);
+    const outcome = await operation;
+    expect(outcome).toMatchObject({ ok: false, status: "cancelled" });
+    release();
+    await Promise.resolve();
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+  });
+});
+</file>
+
 <file path="tests/csg/benchmark.test.ts">
 import { it } from "vitest";
 import { compute, makeInputs, manifoldModule } from "../../src/spikes/csg/core";
@@ -6921,6 +7160,68 @@ describe("hierarchy commands", () => {
 });
 </file>
 
+<file path="tests/domain/mirror-commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { createCommandBus, type ProjectCommand } from "../../src/domain/command-bus";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import type { MirrorParameters } from "../../src/geometry/modifiers/types";
+
+const parameters: MirrorParameters = { axes: "x", pivot: [0, 0, 0], mergeSeam: false };
+function fixture() {
+  const project = createProject(() => crypto.randomUUID());
+  const root = project.nodes[0]!;
+  for (const id of ["a", "b"]) { const node = createPrimitiveNode("cube", root.id, id); project.nodes.push(node); root.children.push(id); }
+  return createCommandBus(project);
+}
+const add = (nodeId = "a", modifierId = "mirror", params = parameters): ProjectCommand =>
+  ({ commandId: crypto.randomUUID(), type: "ADD_MIRROR_MODIFIER", targetIds: [nodeId, modifierId], payload: { nodeId, modifierId, parameters: params } });
+const update = (params: MirrorParameters, modifierId = "mirror"): ProjectCommand =>
+  ({ commandId: crypto.randomUUID(), type: "UPDATE_MIRROR_MODIFIER", targetIds: [modifierId], payload: { modifierId, parameters: params } });
+
+describe("Mirror commands", () => {
+  it("adds and updates with reversible patches, versions and semantic no-op", () => {
+    const bus = fixture();
+    const added = bus.executeCommand(add(), 0);
+    expect(added.ok && added.changed).toBe(true);
+    if (!added.ok) return;
+    const next = { axes: "xyz", pivot: [1, 2, 3], mergeSeam: true } as const;
+    const edited = bus.executeCommand(update(next), added.revision);
+    expect(edited.ok && edited.changed).toBe(true);
+    if (!edited.ok) return;
+    expect(edited.project.modifiers[0]).toMatchObject({ kind: "mirror", version: 1, parameters: next });
+    const noOp = bus.executeCommand(update({ mergeSeam: true, pivot: [1, 2, 3], axes: "xyz" }), edited.revision);
+    expect(noOp).toMatchObject({ ok: true, changed: false, revision: edited.revision });
+    const undone = bus.applyHistoryPatch(edited.undoPatch, edited.revision);
+    expect(undone.ok && undone.project.modifiers[0]?.parameters).toEqual(parameters);
+    if (!undone.ok) return;
+    const redone = bus.applyHistoryPatch(edited.patch, undone.revision);
+    expect(redone.ok && redone.project.modifiers[0]?.parameters).toEqual(next);
+  });
+  it("rejects bad parameters, duplicate IDs, wrong type and locked targets", () => {
+    const bus = fixture();
+    for (const params of [{ ...parameters, axes: "yx" }, { ...parameters, pivot: [Infinity, 0, 0] }, { ...parameters, extra: 1 }])
+      expect(bus.executeCommand(add("a", "invalid", params as MirrorParameters), bus.getRevision()).ok).toBe(false);
+    expect(bus.getRevision()).toBe(0);
+    expect(bus.executeCommand(add(), 0).ok).toBe(true);
+    expect(bus.executeCommand(add("b", "mirror"), bus.getRevision()).ok).toBe(false);
+    const flag = bus.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: ["b"], payload: { nodeId: "b", locked: true } }, bus.getRevision());
+    expect(flag.ok).toBe(true);
+    expect(bus.executeCommand(add("b", "second"), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(update(parameters, "missing"), bus.getRevision()).ok).toBe(false);
+    expect(bus.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_ARRAY_MODIFIER", targetIds: ["a", "array"],
+      payload: { nodeId: "a", modifierId: "array", parameters: { mode: "linear", count: 2, axis: "x", step: 1, offset: [0, 0, 0] } } }, bus.getRevision()).ok).toBe(true);
+    expect(bus.executeCommand(update(parameters, "array"), bus.getRevision())).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+  });
+  it("rejects hidden targets", () => {
+    const bus = fixture();
+    expect(bus.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: ["a"],
+      payload: { nodeId: "a", visible: false } }, 0).ok).toBe(true);
+    expect(bus.executeCommand(add(), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+  });
+});
+</file>
+
 <file path="tests/domain/project.test.ts">
 import { describe, expect, it } from "vitest";
 import { createProject } from "../../src/domain/create-project";
@@ -6993,94 +7294,6 @@ describe("project document graph", () => {
   it("reports missing references", () => {
     expect(validateProject(createMissingReferenceProject()).some((issue) => issue.code === "MISSING_REFERENCE")).toBe(true);
   });
-});
-</file>
-
-<file path="tests/export/generate-tsx.test.ts">
-import { execFileSync } from "node:child_process";
-import { describe, expect, it } from "vitest";
-import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
-import {
-  createInvalidHierarchyProject, createInvalidNumberProject, createMaterialAnimationProject,
-  createNestedMeshProject,
-} from "../fixtures/projects";
-
-describe("TASK-004 TSX export spike", () => {
-  it("generates code from a nested cube and preserves local hierarchy", () => {
-    const project = createNestedMeshProject();
-    const group = project.nodes.find((node) => node.id === "nested-group")!;
-    group.transform.position = [2, 3, 4];
-    const result = generateSpikeTsx(project);
-    expect(result.source).toContain("new THREE.BoxGeometry(...node.dimensions)");
-    expect(result.source).toContain('"position":[2,3,4]');
-    expect(result.source).toContain("parent.add(object)");
-    expect(result.source).toContain('"dimensions":[1,1,1]');
-    expect(result.dependencies).toEqual({ react: "19.3.1", three: "0.186.1" });
-    expect(result.source).not.toMatch(/from ["'][^"']*src\//);
-  });
-
-  it("responds to supported geometry, transform, visibility and material values", () => {
-    const project = createMaterialAnimationProject();
-    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
-    const before = generateSpikeTsx(project).source;
-    if (mesh.meshSource.kind !== "primitive") throw new Error("Invalid fixture");
-    mesh.meshSource.parameters.size = 2;
-    mesh.transform.position = [1, 0, 0];
-    mesh.visible = false;
-    project.materials[0]!.roughness = 0.4;
-    const after = generateSpikeTsx(project).source;
-    expect(after).not.toBe(before);
-    expect(after).toContain('"dimensions":[2,2,2]');
-    expect(after).toContain('"position":[1,0,0]');
-    expect(after).toContain('"visible":false');
-    expect(after).toContain('"roughness":0.4');
-  });
-
-  it("is deterministic and does not mutate its input", () => {
-    const project = createMaterialAnimationProject();
-    const original = structuredClone(project);
-    expect(generateSpikeTsx(project)).toEqual(generateSpikeTsx(project));
-    expect(project).toEqual(original);
-  });
-
-  it("rejects invalid numbers and hierarchy without mutation", () => {
-    for (const project of [createInvalidNumberProject(), createInvalidHierarchyProject()]) {
-      const original = structuredClone(project);
-      expect(() => generateSpikeTsx(project)).toThrowError(SpikeExportError);
-      expect(project).toEqual(original);
-    }
-  });
-
-  it("rejects unsupported mesh and modifiers, diagnoses omitted animation", () => {
-    const animated = generateSpikeTsx(createMaterialAnimationProject());
-    expect(animated.diagnostics).toContainEqual(expect.objectContaining({ code: "ANIMATION_OMITTED" }));
-    const project = createNestedMeshProject();
-    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
-    mesh.meshSource = { kind: "primitive", primitive: "sphere", parameters: { radius: 1 } };
-    expect(() => generateSpikeTsx(project)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
-    const modified = createNestedMeshProject();
-    const modifiedMesh = modified.nodes.find((node) => node.kind === "mesh")!;
-    modifiedMesh.modifierIds.push("modifier-1");
-    modified.modifiers.push({ id: "modifier-1", nodeId: modifiedMesh.id, kind: "mirror", order: 0, enabled: true, version: 1, parameters: {} });
-    expect(() => generateSpikeTsx(modified)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
-    const missingMaterial = createMaterialAnimationProject();
-    missingMaterial.materials.length = 0;
-    expect(() => generateSpikeTsx(missingMaterial)).toThrowError(expect.objectContaining({ code: "INVALID_PROJECT" }));
-  });
-
-  it("escapes user strings as data", () => {
-    const project = createNestedMeshProject();
-    project.nodes[1]!.name = '</script><script>alert("x")</script>';
-    const source = generateSpikeTsx(project).source;
-    expect(source).not.toContain("</script>");
-    expect(source).toContain("\\u003c/script\\u003e");
-  });
-
-  it("typechecks and builds the generated component outside the repository", () => {
-    execFileSync(process.execPath, ["scripts/check-export-harness.mjs"], {
-      cwd: process.cwd(), stdio: "inherit", timeout: 180_000,
-    });
-  }, 200_000);
 });
 </file>
 
@@ -8850,68 +9063,6 @@ export default function CsgSpike() {
 }
 </file>
 
-<file path="src/ui/BooleanEditor.tsx">
-import { useState } from "react";
-import { applyBooleanChange, booleanOperandReason, type BooleanChange } from "../app/boolean-actions";
-import type { DeepReadonly, EditorStore } from "../app/editor-store";
-import type { MeshNode, Project } from "../domain/types";
-import type { BooleanParameters } from "../geometry/modifiers/types";
-import { accessReason } from "./inspector-logic";
-import { ArrayAdd, ArrayItem } from "./ArrayEditor";
-
-const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
-type Operation = BooleanParameters["operation"];
-
-export function BooleanEditor({ store, project, target, disabled, reason }: { store: EditorStore; project: DeepReadonly<Project>; target: DeepReadonly<MeshNode>; disabled: boolean; reason: string }) {
-  const [operation, setOperation] = useState<Operation>("subtract");
-  const [cutterId, setCutterId] = useState("");
-  const [hideCutter, setHideCutter] = useState(false);
-  const [message, setMessage] = useState("");
-  const cutters = project.nodes.filter((node): node is DeepReadonly<MeshNode> => node.kind === "mesh" && node.id !== target.id);
-  const selectedCutter = cutters.find(node => node.id === cutterId);
-  const targetReason = booleanOperandReason(target) || reason;
-  const cutterReason = selectedCutter ? booleanOperandReason(selectedCutter) : null;
-  const canHide = selectedCutter && selectedCutter.visible && !selectedCutter.locked && !accessReason(project, selectedCutter);
-  const available = cutters.filter(node => !booleanOperandReason(node));
-  async function run(change: BooleanChange) {
-    setMessage("");
-    const outcome = await applyBooleanChange(store, change);
-    setMessage(outcome.ok ? "Boolean применён." : `${outcome.error.code}: ${outcome.error.message}`);
-  }
-  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier !== undefined);
-  return <section aria-label="Модификаторы" className="boolean-editor">
-    <h4>Булевы операции</h4>
-    <p className="panel-hint">Выберите второй замкнутый mesh. Геометрия резака остаётся редактируемой; результат пересчитывается при его перемещении.</p>
-    {targetReason && <p className="primitive-error" role="alert">{targetReason}</p>}
-    <label>Операция<select value={operation} disabled={disabled || !!targetReason} onChange={event => setOperation(event.target.value as Operation)}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-    <label>Режущий объект<select value={cutterId} disabled={disabled || !!targetReason} onChange={event => { setCutterId(event.target.value); setHideCutter(false); }}><option value="">Выберите mesh</option>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
-    {!available.length && <p className="panel-hint">Нет подходящего резака. Добавьте куб, сферу, тор, цилиндр или конус.</p>}
-    {cutterReason && <p className="primitive-error" role="alert">{cutterReason}</p>}
-    <label className="boolean-check"><input type="checkbox" checked={hideCutter} disabled={disabled || !canHide} onChange={event => setHideCutter(event.target.checked)} />Скрыть резак после применения</label>
-    {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
-    <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
-    <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
-    <h4>Стек модификаторов</h4>
-    {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
-    {stack.map((modifier, index) => {
-      if (!modifier) return null;
-      if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
-      const params = modifier.parameters;
-      const linked = project.nodes.find(node => node.id === params.cutterNodeId);
-      return <div className="boolean-stack-item" key={modifier.id}>
-        <strong>{index + 1}. {operations[params.operation as Operation] ?? "Boolean"} · {linked?.name ?? "Резак не найден"}</strong>
-        <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!targetReason} onChange={event => void run({ type: "enable", targetId: target.id, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
-        <label>Операция<select value={String(params.operation)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: event.target.value as Operation, cutterId: String(params.cutterNodeId) })}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-        <label>Резак<select value={String(params.cutterNodeId)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: params.operation as Operation, cutterId: event.target.value })}>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
-        <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!targetReason || index === 0} aria-label={`Поднять ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!targetReason || index === stack.length - 1} aria-label={`Опустить ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!targetReason} onClick={() => void run({ type: "remove", targetId: target.id, modifierId: modifier.id })}>Удалить</button></div>
-      </div>;
-    })}
-    {message && <p className={message.startsWith("Boolean применён") ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
-    <p className="panel-hint">CSG пересчитывает нормали. UV и группы материалов на поверхности результата не сохраняются; несколько material slots не переносятся по граням.</p>
-  </section>;
-}
-</file>
-
 <file path="src/ui/Inspector.tsx">
 import { useEffect, useRef, useState } from "react";
 import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
@@ -9516,6 +9667,94 @@ describe("native manifest v1", () => {
     expect(validateNativeManifest({ ...manifest, assets: [...manifest.assets, { id: "other", path: "ASSETS/IMAGE.PNG", sha256 }] }).ok).toBe(false);
     expect(validateNativeManifest({ ...manifest, document: { ...manifest.document, sha256: "bad" } }).ok).toBe(false);
   });
+});
+</file>
+
+<file path="tests/export/generate-tsx.test.ts">
+import { execFileSync } from "node:child_process";
+import { describe, expect, it } from "vitest";
+import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
+import {
+  createInvalidHierarchyProject, createInvalidNumberProject, createMaterialAnimationProject,
+  createNestedMeshProject,
+} from "../fixtures/projects";
+
+describe("TASK-004 TSX export spike", () => {
+  it("generates code from a nested cube and preserves local hierarchy", () => {
+    const project = createNestedMeshProject();
+    const group = project.nodes.find((node) => node.id === "nested-group")!;
+    group.transform.position = [2, 3, 4];
+    const result = generateSpikeTsx(project);
+    expect(result.source).toContain("new THREE.BoxGeometry(...node.dimensions)");
+    expect(result.source).toContain('"position":[2,3,4]');
+    expect(result.source).toContain("parent.add(object)");
+    expect(result.source).toContain('"dimensions":[1,1,1]');
+    expect(result.dependencies).toEqual({ react: "19.3.1", three: "0.186.1" });
+    expect(result.source).not.toMatch(/from ["'][^"']*src\//);
+  });
+
+  it("responds to supported geometry, transform, visibility and material values", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
+    const before = generateSpikeTsx(project).source;
+    if (mesh.meshSource.kind !== "primitive") throw new Error("Invalid fixture");
+    mesh.meshSource.parameters.size = 2;
+    mesh.transform.position = [1, 0, 0];
+    mesh.visible = false;
+    project.materials[0]!.roughness = 0.4;
+    const after = generateSpikeTsx(project).source;
+    expect(after).not.toBe(before);
+    expect(after).toContain('"dimensions":[2,2,2]');
+    expect(after).toContain('"position":[1,0,0]');
+    expect(after).toContain('"visible":false');
+    expect(after).toContain('"roughness":0.4');
+  });
+
+  it("is deterministic and does not mutate its input", () => {
+    const project = createMaterialAnimationProject();
+    const original = structuredClone(project);
+    expect(generateSpikeTsx(project)).toEqual(generateSpikeTsx(project));
+    expect(project).toEqual(original);
+  });
+
+  it("rejects invalid numbers and hierarchy without mutation", () => {
+    for (const project of [createInvalidNumberProject(), createInvalidHierarchyProject()]) {
+      const original = structuredClone(project);
+      expect(() => generateSpikeTsx(project)).toThrowError(SpikeExportError);
+      expect(project).toEqual(original);
+    }
+  });
+
+  it("rejects unsupported mesh and modifiers, diagnoses omitted animation", () => {
+    const animated = generateSpikeTsx(createMaterialAnimationProject());
+    expect(animated.diagnostics).toContainEqual(expect.objectContaining({ code: "ANIMATION_OMITTED" }));
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh")!;
+    mesh.meshSource = { kind: "primitive", primitive: "sphere", parameters: { radius: 1 } };
+    expect(() => generateSpikeTsx(project)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
+    const modified = createNestedMeshProject();
+    const modifiedMesh = modified.nodes.find((node) => node.kind === "mesh")!;
+    modifiedMesh.modifierIds.push("modifier-1");
+    modified.modifiers.push({ id: "modifier-1", nodeId: modifiedMesh.id, kind: "mirror", order: 0, enabled: true, version: 1, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
+    expect(() => generateSpikeTsx(modified)).toThrowError(expect.objectContaining({ code: "EXPORT_UNSUPPORTED" }));
+    const missingMaterial = createMaterialAnimationProject();
+    missingMaterial.materials.length = 0;
+    expect(() => generateSpikeTsx(missingMaterial)).toThrowError(expect.objectContaining({ code: "INVALID_PROJECT" }));
+  });
+
+  it("escapes user strings as data", () => {
+    const project = createNestedMeshProject();
+    project.nodes[1]!.name = '</script><script>alert("x")</script>';
+    const source = generateSpikeTsx(project).source;
+    expect(source).not.toContain("</script>");
+    expect(source).toContain("\\u003c/script\\u003e");
+  });
+
+  it("typechecks and builds the generated component outside the repository", () => {
+    execFileSync(process.execPath, ["scripts/check-export-harness.mjs"], {
+      cwd: process.cwd(), stdio: "inherit", timeout: 180_000,
+    });
+  }, 200_000);
 });
 </file>
 
@@ -10511,6 +10750,72 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
       {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
       {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
     </div>
+  </section>;
+}
+</file>
+
+<file path="src/ui/BooleanEditor.tsx">
+import { useState } from "react";
+import { applyBooleanChange, booleanOperandReason, type BooleanChange } from "../app/boolean-actions";
+import type { DeepReadonly, EditorStore } from "../app/editor-store";
+import type { MeshNode, Project } from "../domain/types";
+import type { BooleanParameters } from "../geometry/modifiers/types";
+import { accessReason } from "./inspector-logic";
+import { ArrayAdd, ArrayItem } from "./ArrayEditor";
+import { MirrorAdd, MirrorItem } from "./MirrorEditor";
+
+const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
+type Operation = BooleanParameters["operation"];
+
+export function BooleanEditor({ store, project, target, disabled, reason }: { store: EditorStore; project: DeepReadonly<Project>; target: DeepReadonly<MeshNode>; disabled: boolean; reason: string }) {
+  const [operation, setOperation] = useState<Operation>("subtract");
+  const [cutterId, setCutterId] = useState("");
+  const [hideCutter, setHideCutter] = useState(false);
+  const [message, setMessage] = useState("");
+  const cutters = project.nodes.filter((node): node is DeepReadonly<MeshNode> => node.kind === "mesh" && node.id !== target.id);
+  const selectedCutter = cutters.find(node => node.id === cutterId);
+  const targetReason = booleanOperandReason(target) || reason;
+  const cutterReason = selectedCutter ? booleanOperandReason(selectedCutter) : null;
+  const canHide = selectedCutter && selectedCutter.visible && !selectedCutter.locked && !accessReason(project, selectedCutter);
+  const available = cutters.filter(node => !booleanOperandReason(node));
+  async function run(change: BooleanChange) {
+    setMessage("");
+    const outcome = await applyBooleanChange(store, change);
+    setMessage(outcome.ok ? "Boolean применён." : `${outcome.error.code}: ${outcome.error.message}`);
+  }
+  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier !== undefined);
+  return <section aria-label="Модификаторы" className="boolean-editor">
+    <h4>Булевы операции</h4>
+    <p className="panel-hint">Выберите второй замкнутый mesh. Геометрия резака остаётся редактируемой; результат пересчитывается при его перемещении.</p>
+    {targetReason && <p className="primitive-error" role="alert">{targetReason}</p>}
+    <label>Операция<select value={operation} disabled={disabled || !!targetReason} onChange={event => setOperation(event.target.value as Operation)}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+    <label>Режущий объект<select value={cutterId} disabled={disabled || !!targetReason} onChange={event => { setCutterId(event.target.value); setHideCutter(false); }}><option value="">Выберите mesh</option>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
+    {!available.length && <p className="panel-hint">Нет подходящего резака. Добавьте куб, сферу, тор, цилиндр или конус.</p>}
+    {cutterReason && <p className="primitive-error" role="alert">{cutterReason}</p>}
+    <label className="boolean-check"><input type="checkbox" checked={hideCutter} disabled={disabled || !canHide} onChange={event => setHideCutter(event.target.checked)} />Скрыть резак после применения</label>
+    {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
+    <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
+    <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
+    <MirrorAdd store={store} targetId={target.id} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />
+    <h4>Стек модификаторов</h4>
+    {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
+    {stack.map((modifier, index) => {
+      if (!modifier) return null;
+      if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
+      if (modifier.kind === "mirror") return <MirrorItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />;
+      if (modifier.kind !== "boolean") return <p key={modifier.id} className="primitive-error" role="alert">{index + 1}. Тип модификатора не поддерживается.</p>;
+      const params = modifier.parameters;
+      const linked = project.nodes.find(node => node.id === params.cutterNodeId);
+      return <div className="boolean-stack-item" key={modifier.id}>
+        <strong>{index + 1}. {operations[params.operation as Operation] ?? "Boolean"} · {linked?.name ?? "Резак не найден"}</strong>
+        <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!targetReason} onChange={event => void run({ type: "enable", targetId: target.id, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
+        <label>Операция<select value={String(params.operation)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: event.target.value as Operation, cutterId: String(params.cutterNodeId) })}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label>Резак<select value={String(params.cutterNodeId)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: params.operation as Operation, cutterId: event.target.value })}>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
+        <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!targetReason || index === 0} aria-label={`Поднять ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!targetReason || index === stack.length - 1} aria-label={`Опустить ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!targetReason} onClick={() => void run({ type: "remove", targetId: target.id, modifierId: modifier.id })}>Удалить</button></div>
+      </div>;
+    })}
+    {message && <p className={message.startsWith("Boolean применён") ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
+    <p className="panel-hint">CSG пересчитывает нормали. UV и группы материалов на поверхности результата не сохраняются; несколько material slots не переносятся по граням.</p>
   </section>;
 }
 </file>
@@ -11915,12 +12220,54 @@ export const selectCanUndo = (state: EditorState) => state.history.canUndo;
 export const selectCanRedo = (state: EditorState) => state.history.canRedo;
 </file>
 
+<file path="package.json">
+{
+  "name": "triad-3d",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "export:check": "node scripts/check-export-harness.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/three": "0.186.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.72.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@zip.js/zip.js": "^2.24.0",
+    "ajv": "^8.20.0",
+    "manifold-3d": "^3.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "three": "0.186.1",
+    "three-mesh-bvh": "^0.9.16"
+  }
+}
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { Asset, EntityId, MeshNode, Modifier, Node, Project, Transform } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import type { ArrayParameters } from "../geometry/modifiers/types";
 import { parseArrayParameters } from "../geometry/modifiers/array";
+import type { MirrorParameters } from "../geometry/modifiers/types";
+import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
@@ -11939,6 +12286,8 @@ export type ProjectCommand =
   | { commandId: string; type: "UPDATE_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
   | { commandId: string; type: "ADD_ARRAY_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: ArrayParameters } }
   | { commandId: string; type: "UPDATE_ARRAY_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: ArrayParameters } }
+  | { commandId: string; type: "ADD_MIRROR_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: MirrorParameters } }
+  | { commandId: string; type: "UPDATE_MIRROR_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
   | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
   | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
@@ -12030,6 +12379,12 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (value.type === "ADD_ARRAY_MODIFIER" || value.type === "UPDATE_ARRAY_MODIFIER") {
     try { parseArrayParameters(payload.parameters); } catch { return false; }
     return value.type === "ADD_ARRAY_MODIFIER"
+      ? ownKeys(payload, ["nodeId", "modifierId", "parameters"]) && id(payload.nodeId) && id(payload.modifierId) && same(value.targetIds, [payload.nodeId, payload.modifierId])
+      : ownKeys(payload, ["modifierId", "parameters"]) && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
+  }
+  if (value.type === "ADD_MIRROR_MODIFIER" || value.type === "UPDATE_MIRROR_MODIFIER") {
+    try { parseMirrorParameters(payload.parameters); } catch { return false; }
+    return value.type === "ADD_MIRROR_MODIFIER"
       ? ownKeys(payload, ["nodeId", "modifierId", "parameters"]) && id(payload.nodeId) && id(payload.modifierId) && same(value.targetIds, [payload.nodeId, payload.modifierId])
       : ownKeys(payload, ["modifierId", "parameters"]) && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
   }
@@ -12239,17 +12594,18 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     project.nodes.push(structuredClone(node));
     return null;
   }
-  if (command.type === "ADD_ARRAY_MODIFIER") {
+  if (command.type === "ADD_ARRAY_MODIFIER" || command.type === "ADD_MIRROR_MODIFIER") {
     const { nodeId, modifierId, parameters } = command.payload;
     const target = nodeById(project, nodeId);
-    if (!target || target.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Массив требует существующий mesh.");
+    if (!target || target.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор требует существующий mesh.");
     if (entityIds(project).has(modifierId)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID модификатора уже используется.");
     const block = blocked(project, target);
     if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
     const last = project.modifiers.find(item => item.id === target.modifierIds.at(-1));
     const order = last ? last.order + 1 : 0;
     if (!Number.isSafeInteger(order)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок стека переполнен.");
-    project.modifiers.push({ id: modifierId, nodeId, kind: "array", order, enabled: true, version: 0, parameters: structuredClone(parseArrayParameters(parameters)) });
+    project.modifiers.push({ id: modifierId, nodeId, kind: command.type === "ADD_ARRAY_MODIFIER" ? "array" : "mirror", order, enabled: true, version: 0,
+      parameters: structuredClone(command.type === "ADD_ARRAY_MODIFIER" ? parseArrayParameters(parameters) : parseMirrorParameters(parameters)) });
     target.modifierIds.push(modifierId);
     return null;
   }
@@ -12267,7 +12623,7 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     target.modifierIds.push(modifierId);
     return null;
   }
-  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "UPDATE_ARRAY_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
+  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "UPDATE_ARRAY_MODIFIER" || command.type === "UPDATE_MIRROR_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
     || command.type === "MOVE_MODIFIER" || command.type === "REMOVE_MODIFIER") {
     const modifier = project.modifiers.find(item => item.id === command.payload.modifierId);
     if (!modifier) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор не найден.");
@@ -12280,6 +12636,13 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       if (modifier.kind !== "array") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является массивом.");
       const parameters = parseArrayParameters(command.payload.parameters);
       if (!same(parseArrayParameters(modifier.parameters), parameters)) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.parameters = structuredClone(parameters);
+      }
+    } else if (command.type === "UPDATE_MIRROR_MODIFIER") {
+      if (modifier.kind !== "mirror") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является Mirror.");
+      const parameters = parseMirrorParameters(command.payload.parameters);
+      if (!same(parseMirrorParameters(modifier.parameters), parameters)) {
         if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
         modifier.parameters = structuredClone(parameters);
       }
@@ -12506,46 +12869,6 @@ export function createCommandBus(initialProject: Project): CommandBus {
       }
     },
   };
-}
-</file>
-
-<file path="package.json">
-{
-  "name": "triad-3d",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "test": "vitest run",
-    "export:check": "node scripts/check-export-harness.mjs"
-  },
-  "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@types/three": "0.186.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "eslint": "^10.13.0",
-    "globals": "^17.13.0",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.72.0",
-    "vite": "^8.3.4",
-    "vitest": "^5.0.5"
-  },
-  "dependencies": {
-    "@zip.js/zip.js": "^2.24.0",
-    "ajv": "^8.20.0",
-    "manifold-3d": "^3.5.4",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "three": "0.186.1",
-    "three-mesh-bvh": "^0.9.16"
-  }
 }
 </file>
 
@@ -13000,6 +13323,12 @@ function EditorShell() {
 
 <file path="docs/implementation-status.md">
 # Implementation status
+
+## CODEX-023C — Mirror commands и Inspector (TASK-023)
+
+- Добавлены типизированные ADD/UPDATE Mirror команды с проверкой параметров, доступности mesh, уникальности ID, версий и обратимых патчей. Общие команды стека работают с Mirror без отдельной истории.
+- `mirror-actions` проверяет изолированный кандидат и полный итоговый активный стек до единственного commit; ошибка evaluator, отмена и устаревшая ревизия не фиксируют изменения. Inspector показывает русскоязычные параметры Mirror и явно различает Boolean, Array и Mirror. Добавление Mirror к GLB отключено до реализации resolver геометрии.
+- FR-017, FR-019 и TST-009 реализованы на уровне команд, транзакций, вычислителя и UI. Полный набор до последнего расширения целевых тестов: 232 passed; typecheck, lint и build прошли. Browser smoke остаётся UNVERIFIED: встроенный браузер показывает только сообщение о недостаточной ширине desktop viewport. Ограничения CSG и `MeshData` описаны ниже. Статус TASK-023: IMPLEMENTED_UNVERIFIED.
 
 ## CODEX-023B — Детерминированное ядро Mirror (часть TASK-023)
 
