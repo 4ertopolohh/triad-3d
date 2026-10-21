@@ -62,6 +62,35 @@ describe("Displace Brush", () => {
     expect(source).toEqual(original);
   });
 
+  it("mirrors around each mesh-local plane and uses maximum influence in overlaps", () => {
+    const { source } = fixture();
+    const before = structuredClone(source);
+    const point = source.positions.slice(0, 3) as [number, number, number];
+    for (const [axis, index] of [["x", 0], ["y", 1], ["z", 2]] as const) {
+      const reflected = [...point] as [number, number, number]; reflected[index] *= -1;
+      const mirrored = displaceStroke(source, [point], 0.35, 0.06, axis);
+      const separate = displaceStroke(source, [point, reflected], 0.35, 0.06);
+      expect(mirrored).toEqual(separate);
+      expect(brushAffectedVertices(source, point, 0.35, axis)).toEqual(
+        brushAffectedVertices(source, point, 0.35).concat(brushAffectedVertices(source, reflected, 0.35))
+          .filter((value, position, values) => values.indexOf(value) === position).sort((a, b) => a - b));
+      expect(mirrored.positions).not.toEqual(displaceStroke(source, [point], 0.35, 0.06).positions);
+      expect(mirrored.indices).toEqual(source.indices);
+      expect(mirrored.uv).toEqual(source.uv);
+      expect(validateEditableSource(mirrored)).toBeNull();
+    }
+    const onPlane: [number, number, number] = [0, point[1], point[2]];
+    expect(displaceStroke(source, [onPlane], 0.75, 0.06, "x")).toEqual(displaceStroke(source, [onPlane], 0.75, 0.06));
+    const overlapping: [number, number, number] = [0.1, point[1], point[2]];
+    const reflected: [number, number, number] = [-0.1, point[1], point[2]];
+    expect(displaceStroke(source, [overlapping], 1.2, 0.06, "x")).toEqual(displaceStroke(source, [overlapping, reflected, overlapping], 1.2, 0.06));
+    expect(displaceStroke(source, [overlapping, overlapping], 1.2, 0.06, "x")).toEqual(displaceStroke(source, [overlapping], 1.2, 0.06, "x"));
+    const shifted = { ...source, positions: source.positions.map((value, i) => value + (i % 3 === 0 ? 5 : 0)) };
+    const shiftedPoint: [number, number, number] = [point[0] + 5, point[1], point[2]];
+    expect(displaceStroke(shifted, [shiftedPoint], 0.35, 0.06, "x")).toEqual(displaceStroke(shifted, [shiftedPoint], 0.35, 0.06));
+    expect(source).toEqual(before);
+  });
+
   it("records one reversible command and archives the result", async () => {
     const { project, source } = fixture();
     const node = project.nodes.find(n => n.id === "cube")!;
@@ -95,6 +124,34 @@ describe("Displace Brush", () => {
     const reopened = await openNativeProjectArchive(archive.value);
     expect(reopened.ok).toBe(true);
     if (reopened.ok) expect(reopened.value.project).toEqual(changed);
+    const validSymmetric = store.executeCommand({ ...command, commandId: "symmetry", payload: { ...command.payload, symmetry: "x" } }, store.getSnapshot().document.revision);
+    expect(validSymmetric).toMatchObject({ ok: true, changed: true });
+    const historyLength = store.getSnapshot().history.entries.length;
+    const symmetricProject = store.captureDocument().project;
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.captureDocument().project).toEqual(symmetricProject);
+    const snapshot = store.captureDocument();
+    const symmetricArchive = await createNativeProjectArchive(symmetricProject, new AssetBytes(), "0.1.0");
+    expect(symmetricArchive.ok).toBe(true);
+    if (symmetricArchive.ok) {
+      const reopenedSymmetric = await openNativeProjectArchive(symmetricArchive.value);
+      expect(reopenedSymmetric.ok && reopenedSymmetric.value.project).toEqual(symmetricProject);
+    }
+    for (const symmetry of [null, "invalid", 4, undefined]) {
+      const invalid = { ...command, commandId: `bad-${String(symmetry)}`, payload: { ...command.payload, symmetry } };
+      expect(store.executeCommand(invalid as typeof command, store.getSnapshot().document.revision).ok).toBe(false);
+      expect(store.captureDocument()).toEqual(snapshot);
+      expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
+    }
+    expect(store.executeCommand({ ...command, commandId: "extra", payload: { ...command.payload, symmetry: "x", extra: true } } as typeof command,
+      store.getSnapshot().document.revision).ok).toBe(false);
+    expect(store.captureDocument()).toEqual(snapshot);
+    expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
+    const noop = store.executeCommand({ ...command, commandId: "noop", payload: { ...command.payload, samples: [[100, 100, 100]], symmetry: "x" } },
+      store.getSnapshot().document.revision);
+    expect(noop).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
     scene.dispose();
   });
 });

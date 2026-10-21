@@ -8,7 +8,7 @@ import { vertexRepresentatives } from "../geometry/vertex-selection";
 import { pickEditableVertex } from "./vertex-picking";
 import { buildMeshTopology, type MeshTopology } from "../geometry/mesh-topology";
 import { pickEditableEdge } from "./sub-element-picking";
-import { brushAffectedVertices, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES } from "../geometry/displace-brush";
+import { brushAffectedVertices, brushCenters, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES, type BrushSymmetry } from "../geometry/displace-brush";
 import type { SurfaceHit } from "../geometry/surface-query";
 
 export function brushUnavailable(state: EditorState, blocked: boolean): string | null {
@@ -29,7 +29,7 @@ export function brushUnavailable(state: EditorState, blocked: boolean): string |
 }
 
 type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
-type Stroke = { id: string; revision: number; epoch: object; pointerId: number; samples: [number, number, number][] };
+type Stroke = { id: string; revision: number; epoch: object; pointerId: number; radius: number; strength: number; symmetry: BrushSymmetry; samples: [number, number, number][] };
 const EPS = 1e-6;
 
 export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
@@ -97,6 +97,7 @@ export class ViewportInteractions {
   private stroke: Stroke | null = null;
   private brushRadius = 0.35;
   private brushStrength = 0.06;
+  private brushSymmetry: BrushSymmetry = "off";
   private brushValid = true;
   private brushPoints: T.Points | null = null;
 
@@ -176,6 +177,7 @@ export class ViewportInteractions {
       const hit = this.brushHit(event);
       if (brushUnavailable(state, this.blocked) || !hit) return;
       this.stroke = { id: hit.nodeId, revision: state.document.revision, epoch: this.store.getProjectEpoch(), pointerId: event.pointerId,
+        radius: this.brushRadius, strength: this.brushStrength, symmetry: this.brushSymmetry,
         samples: [hit.pointNodeLocal.toArray() as [number, number, number]] };
       this.orbit.enabled = false;
       this.canvas.setPointerCapture(event.pointerId);
@@ -192,11 +194,11 @@ export class ViewportInteractions {
     const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
     return hit?.nodeId === this.store.getSnapshot().selection.activeId ? hit : null;
   }
-  setBrush(radius: number, strength: number): void {
-    if (this.stroke) this.cancel("Мазок отменён: параметры кисти изменились.");
+  setBrush(radius: number, strength: number, symmetry: BrushSymmetry = "off"): void {
+    if (this.stroke && (radius !== this.brushRadius || strength !== this.brushStrength || symmetry !== this.brushSymmetry))
+      this.cancel("Мазок отменён: параметры кисти изменились.");
     this.brushValid = brushParameters(radius, strength);
-    if (!this.brushValid) { this.clearBrushPreview(); return; }
-    this.brushRadius = radius; this.brushStrength = strength;
+    this.brushRadius = radius; this.brushStrength = strength; this.brushSymmetry = symmetry;
     this.clearBrushPreview();
   }
   private clearBrushPreview(): void {
@@ -212,11 +214,14 @@ export class ViewportInteractions {
     const wrapper = hit && this.graph.objects.get(hit.nodeId)?.object;
     if (!hit || !wrapper || node?.kind !== "mesh" || node.meshSource.kind !== "editable") { this.clearBrushPreview(); return; }
     const source = node.meshSource;
-    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), this.brushRadius);
+    const symmetry = this.stroke?.symmetry ?? this.brushSymmetry;
+    const radius = this.stroke?.radius ?? this.brushRadius;
+    const centers = brushCenters(hit.pointNodeLocal.toArray(), symmetry);
+    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), radius, symmetry);
     if (!this.brushPoints || this.brushPoints.parent !== wrapper) {
       this.clearBrushPreview();
       const geometry = new T.BufferGeometry();
-      geometry.setAttribute("position", new T.BufferAttribute(new Float32Array(source.positions.length + 3), 3));
+      geometry.setAttribute("position", new T.BufferAttribute(new Float32Array(source.positions.length + 6), 3));
       const material = new T.PointsMaterial({ color: 0xff9a24, size: 9, sizeAttenuation: false, depthTest: false, depthWrite: false, toneMapped: false });
       this.brushPoints = new T.Points(geometry, material);
       this.brushPoints.raycast = () => {};
@@ -224,10 +229,10 @@ export class ViewportInteractions {
       wrapper.add(this.brushPoints);
     }
     const attr = this.brushPoints.geometry.getAttribute("position") as T.BufferAttribute;
-    attr.setXYZ(0, hit.pointNodeLocal.x, hit.pointNodeLocal.y, hit.pointNodeLocal.z);
-    affected.forEach((i, k) => attr.setXYZ(k + 1, source.positions[3 * i]!, source.positions[3 * i + 1]!, source.positions[3 * i + 2]!));
+    centers.forEach((center, k) => attr.setXYZ(k, center[0]!, center[1]!, center[2]!));
+    affected.forEach((i, k) => attr.setXYZ(k + centers.length, source.positions[3 * i]!, source.positions[3 * i + 1]!, source.positions[3 * i + 2]!));
     attr.needsUpdate = true;
-    this.brushPoints.geometry.setDrawRange(0, affected.length + 1);
+    this.brushPoints.geometry.setDrawRange(0, affected.length + centers.length);
     this.brushPoints.geometry.computeBoundingSphere();
   }
   private onPointerMove = (event: PointerEvent) => {
@@ -239,7 +244,7 @@ export class ViewportInteractions {
     this.showBrush(hit);
     const samples = this.stroke.samples, previous = new T.Vector3(...samples.at(-1)!);
     const next = hit.pointNodeLocal;
-    const distance = previous.distanceTo(next), spacing = Math.max(0.005, this.brushRadius * 0.25);
+    const distance = previous.distanceTo(next), spacing = Math.max(0.005, this.stroke.radius * 0.25);
     const steps = Math.ceil(distance / spacing);
     if (steps > MAX_BRUSH_SAMPLES - samples.length) { this.cancel("Мазок слишком длинный; начните новый."); return; }
     for (let i = 1; i <= steps; i++) samples.push(previous.clone().lerp(next, i / steps).toArray() as [number, number, number]);
@@ -258,7 +263,7 @@ export class ViewportInteractions {
         this.clearBrushPreview(); this.report("Мазок отменён: проект или объект изменился."); return;
       }
       const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "APPLY_DISPLACE_STROKE", targetIds: [stroke.id],
-        payload: { nodeId: stroke.id, samples: stroke.samples, radius: this.brushRadius, strength: this.brushStrength } }, stroke.revision);
+        payload: { nodeId: stroke.id, samples: stroke.samples, radius: stroke.radius, strength: stroke.strength, symmetry: stroke.symmetry } }, stroke.revision);
       this.clearBrushPreview(); this.report(result.ok ? result.changed ? "Рельеф применён." : "Мазок не изменил сетку." : result.message);
       return;
     }

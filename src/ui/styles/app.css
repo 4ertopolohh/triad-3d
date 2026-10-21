@@ -97,8 +97,9 @@ body { margin: 0; }
 .viewport-tools { display: inline-flex; gap: 2px; }
 .brush-settings { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding-left: var(--space-2); color: var(--color-text-secondary); }
 .brush-settings label { display: inline-flex; align-items: center; gap: var(--space-1); }
-.brush-settings input { width: 66px; min-height: 28px; box-sizing: border-box; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
-.brush-settings input:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.brush-settings input, .brush-settings select { min-height: 28px; box-sizing: border-box; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.brush-settings input { width: 66px; }
+.brush-settings input:focus-visible, .brush-settings select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
 .renderer-toolbar button { padding: 0 var(--space-2); cursor: pointer; }
 .renderer-toolbar button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
 .renderer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }

@@ -4,7 +4,7 @@ import { useEditorStore } from "../app/use-editor-store";
 import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
 import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
-import { brushParameters } from "../geometry/displace-brush";
+import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
 
 export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
@@ -14,6 +14,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   const [snap, setSnap] = useState(false);
   const [radiusText, setRadiusText] = useState("0.35");
   const [strengthText, setStrengthText] = useState("0.06");
+  const [symmetry, setSymmetry] = useState<BrushSymmetry>("off");
   const brushRadius = Number(radiusText), brushStrength = Number(strengthText);
   const validBrush = radiusText.trim() !== "" && strengthText.trim() !== "" && brushParameters(brushRadius, brushStrength);
   const blockedRef = useRef(blocked);
@@ -49,7 +50,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
       const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
       controller.setSnap(snapRef.current);
       interactions.current = controller;
-      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength);
+      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry);
       adapter.setFrameHook(() => controller.frame());
     });
     sync();
@@ -59,7 +60,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   }, [store, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
-  useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength); }, [validBrush, brushRadius, brushStrength]);
+  useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry); }, [validBrush, brushRadius, brushStrength, symmetry]);
   const canTransform = editable(state, state.selection.activeId, blocked);
   const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
@@ -84,6 +85,12 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
         {state.tool.active === "displace" && <span className="brush-settings">
           <label>Радиус <input type="number" min="0.01" max="10" step="0.01" value={radiusText} onChange={event => setRadiusText(event.target.value)} /></label>
           <label>Сила <input type="number" min="-0.5" max="0.5" step="0.01" value={strengthText} onChange={event => setStrengthText(event.target.value)} /></label>
+          <label>Симметрия <select value={symmetry} onChange={event => setSymmetry(event.target.value as BrushSymmetry)}
+            title="Плоскость проходит через локальное начало координат объекта">
+            <option value="off">Выключена</option><option value="x">X · плоскость YZ</option>
+            <option value="y">Y · плоскость XZ</option><option value="z">Z · плоскость XY</option>
+          </select></label>
+          <span title="Плоскость проходит через локальное начало координат объекта">Через локальное начало объекта.</span>
           <span>Положительная сила — выступ, отрицательная — углубление.</span>
           {!validBrush && <span role="alert">Радиус: 0,01–10; сила: −0,5…0,5.</span>}
         </span>}
