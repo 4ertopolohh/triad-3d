@@ -8,8 +8,28 @@ import { vertexRepresentatives } from "../geometry/vertex-selection";
 import { pickEditableVertex } from "./vertex-picking";
 import { buildMeshTopology, type MeshTopology } from "../geometry/mesh-topology";
 import { pickEditableEdge } from "./sub-element-picking";
+import { brushAffectedVertices, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES } from "../geometry/displace-brush";
+import type { SurfaceHit } from "../geometry/surface-query";
+
+export function brushUnavailable(state: EditorState, blocked: boolean): string | null {
+  if (state.tool.mode !== "model") return "Кисть доступна в режиме «Модель».";
+  if (blocked) return "Дождитесь завершения операции.";
+  if (state.selection.ids.length !== 1 || !state.selection.activeId) return "Выберите одну редактируемую сетку.";
+  const node = state.document.project.nodes.find(item => item.id === state.selection.activeId);
+  if (node?.kind !== "mesh") return "Выберите Mesh.";
+  if (node.meshSource.kind === "primitive") return "Сначала преобразуйте примитив в Editable Mesh.";
+  if (node.meshSource.kind !== "editable") return "GLB-сетка пока недоступна для кисти.";
+  if (node.meshSource.positions.length / 3 > MAX_BRUSH_VERTICES) return `Кисть поддерживает не более ${MAX_BRUSH_VERTICES} вершин.`;
+  if (node.modifierIds.some(id => state.document.project.modifiers.find(m => m.id === id)?.enabled)
+    || state.document.project.modifiers.some(m => m.enabled && m.kind === "boolean" && m.parameters.cutterNodeId === node.id))
+    return "Отключите активные модификаторы и зависимые Boolean.";
+  if (!editable(state, node.id, blocked)) return "Объект или его предок скрыт либо заблокирован.";
+  if (state.meshEdit.mode !== "object") return "Выйдите из режима редактирования элементов.";
+  return null;
+}
 
 type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
+type Stroke = { id: string; revision: number; epoch: object; pointerId: number; samples: [number, number, number][] };
 const EPS = 1e-6;
 
 export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
@@ -74,6 +94,11 @@ export class ViewportInteractions {
   private markerKey = "";
   private topologySource: object | null = null;
   private topology: MeshTopology | null = null;
+  private stroke: Stroke | null = null;
+  private brushRadius = 0.35;
+  private brushStrength = 0.06;
+  private brushValid = true;
+  private brushPoints: T.Points | null = null;
 
   constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
     private report: (message: string | null) => void, blocked: boolean) {
@@ -90,7 +115,10 @@ export class ViewportInteractions {
     this.gizmo.addEventListener("mouseDown", this.onGizmoDown);
     this.gizmo.addEventListener("mouseUp", this.onGizmoUp);
     this.gizmo.addEventListener("dragging-changed", this.onDraggingChanged);
-    canvas.addEventListener("pointerdown", this.onPointerDown);
+    canvas.addEventListener("pointerdown", this.onPointerDown, true);
+    canvas.addEventListener("pointermove", this.onPointerMove);
+    canvas.addEventListener("pointerleave", this.onPointerLeave);
+    canvas.addEventListener("lostpointercapture", this.onLostCapture);
     canvas.addEventListener("pointerup", this.onPointerUp);
     canvas.addEventListener("pointercancel", this.onPointerCancel);
     window.addEventListener("keydown", this.onKeyDown);
@@ -132,13 +160,108 @@ export class ViewportInteractions {
     if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
   }
   cancel(message: string | null = null): void {
+    if (this.stroke) {
+      const pointerId = this.stroke.pointerId;
+      this.stroke = null; this.orbit.enabled = true; this.clearBrushPreview();
+      if (this.canvas.hasPointerCapture(pointerId)) this.canvas.releasePointerCapture(pointerId);
+    }
     if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
     if (message) this.report(message);
   }
   private onPointerDown = (event: PointerEvent) => {
+    if (this.store.getSnapshot().tool.active === "displace") {
+      event.stopImmediatePropagation();
+      if (event.button !== 0 || this.stroke || !this.brushValid) return;
+      const state = this.store.getSnapshot();
+      const hit = this.brushHit(event);
+      if (brushUnavailable(state, this.blocked) || !hit) return;
+      this.stroke = { id: hit.nodeId, revision: state.document.revision, epoch: this.store.getProjectEpoch(), pointerId: event.pointerId,
+        samples: [hit.pointNodeLocal.toArray() as [number, number, number]] };
+      this.orbit.enabled = false;
+      this.canvas.setPointerCapture(event.pointerId);
+      this.report("Выполняется мазок…");
+      return;
+    }
     if (event.button === 0) this.down = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
   };
+  private brushHit(event: PointerEvent): SurfaceHit | null {
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) return null;
+    this.raycaster.setFromCamera(new T.Vector2((event.clientX - rect.left) / rect.width * 2 - 1,
+      -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
+    const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
+    return hit?.nodeId === this.store.getSnapshot().selection.activeId ? hit : null;
+  }
+  setBrush(radius: number, strength: number): void {
+    if (this.stroke) this.cancel("Мазок отменён: параметры кисти изменились.");
+    this.brushValid = brushParameters(radius, strength);
+    if (!this.brushValid) { this.clearBrushPreview(); return; }
+    this.brushRadius = radius; this.brushStrength = strength;
+    this.clearBrushPreview();
+  }
+  private clearBrushPreview(): void {
+    if (!this.brushPoints) return;
+    this.brushPoints.removeFromParent();
+    this.brushPoints.geometry.dispose();
+    (this.brushPoints.material as T.Material).dispose();
+    this.brushPoints = null;
+  }
+  private showBrush(hit: SurfaceHit | null): void {
+    const state = this.store.getSnapshot();
+    const node = state.document.project.nodes.find(n => n.id === hit?.nodeId);
+    const wrapper = hit && this.graph.objects.get(hit.nodeId)?.object;
+    if (!hit || !wrapper || node?.kind !== "mesh" || node.meshSource.kind !== "editable") { this.clearBrushPreview(); return; }
+    const source = node.meshSource;
+    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), this.brushRadius);
+    if (!this.brushPoints || this.brushPoints.parent !== wrapper) {
+      this.clearBrushPreview();
+      const geometry = new T.BufferGeometry();
+      geometry.setAttribute("position", new T.BufferAttribute(new Float32Array(source.positions.length + 3), 3));
+      const material = new T.PointsMaterial({ color: 0xff9a24, size: 9, sizeAttenuation: false, depthTest: false, depthWrite: false, toneMapped: false });
+      this.brushPoints = new T.Points(geometry, material);
+      this.brushPoints.raycast = () => {};
+      this.brushPoints.renderOrder = 1001;
+      wrapper.add(this.brushPoints);
+    }
+    const attr = this.brushPoints.geometry.getAttribute("position") as T.BufferAttribute;
+    attr.setXYZ(0, hit.pointNodeLocal.x, hit.pointNodeLocal.y, hit.pointNodeLocal.z);
+    affected.forEach((i, k) => attr.setXYZ(k + 1, source.positions[3 * i]!, source.positions[3 * i + 1]!, source.positions[3 * i + 2]!));
+    attr.needsUpdate = true;
+    this.brushPoints.geometry.setDrawRange(0, affected.length + 1);
+    this.brushPoints.geometry.computeBoundingSphere();
+  }
+  private onPointerMove = (event: PointerEvent) => {
+    if (this.store.getSnapshot().tool.active !== "displace") return;
+    const hit = this.brushHit(event);
+    if (!this.stroke) { this.showBrush(!this.brushValid || brushUnavailable(this.store.getSnapshot(), this.blocked) ? null : hit); return; }
+    if (event.pointerId !== this.stroke.pointerId) return;
+    if (!hit) { this.clearBrushPreview(); return; }
+    this.showBrush(hit);
+    const samples = this.stroke.samples, previous = new T.Vector3(...samples.at(-1)!);
+    const next = hit.pointNodeLocal;
+    const distance = previous.distanceTo(next), spacing = Math.max(0.005, this.brushRadius * 0.25);
+    const steps = Math.ceil(distance / spacing);
+    if (steps > MAX_BRUSH_SAMPLES - samples.length) { this.cancel("Мазок слишком длинный; начните новый."); return; }
+    for (let i = 1; i <= steps; i++) samples.push(previous.clone().lerp(next, i / steps).toArray() as [number, number, number]);
+  };
+  private onPointerLeave = () => { if (!this.stroke) this.clearBrushPreview(); };
+  private onLostCapture = () => { if (this.stroke) this.cancel("Мазок отменён: потерян захват указателя."); };
   private onPointerUp = (event: PointerEvent) => {
+    if (this.store.getSnapshot().tool.active === "displace" || this.stroke) {
+      const stroke = this.stroke;
+      if (!stroke || stroke.pointerId !== event.pointerId) return;
+      this.stroke = null; this.orbit.enabled = true;
+      if (this.canvas.hasPointerCapture(event.pointerId)) this.canvas.releasePointerCapture(event.pointerId);
+      const state = this.store.getSnapshot();
+      if (state.document.revision !== stroke.revision || this.store.getProjectEpoch() !== stroke.epoch
+        || state.selection.activeId !== stroke.id || state.tool.active !== "displace" || brushUnavailable(state, this.blocked)) {
+        this.clearBrushPreview(); this.report("Мазок отменён: проект или объект изменился."); return;
+      }
+      const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "APPLY_DISPLACE_STROKE", targetIds: [stroke.id],
+        payload: { nodeId: stroke.id, samples: stroke.samples, radius: this.brushRadius, strength: this.brushStrength } }, stroke.revision);
+      this.clearBrushPreview(); this.report(result.ok ? result.changed ? "Рельеф применён." : "Мазок не изменил сетку." : result.message);
+      return;
+    }
     const down = this.down; this.down = null;
     const gizmoPress = this.gizmoPress; this.gizmoPress = false;
     if (!down || down.pointerId !== event.pointerId || event.button !== 0 || gizmoPress || this.gizmo.dragging || this.drag
@@ -182,8 +305,13 @@ export class ViewportInteractions {
       this.store.setSelection(next, next.includes(id) ? id : next[0] ?? null);
     } else this.store.setSelection(id ? [id] : []);
   };
-  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel("Преобразование отменено."); };
+  private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel(this.stroke ? "Мазок отменён." : "Преобразование отменено."); };
   private onKeyDown = (event: KeyboardEvent) => {
+    if (this.store.getSnapshot().tool.active === "displace") {
+      if (event.key === "Escape") { if (this.stroke) this.cancel("Мазок отменён."); else this.store.setTool({ active: "select" }); event.preventDefault(); }
+      else if (["g", "r", "s", "Delete"].includes(event.key)) event.preventDefault();
+      return;
+    }
     const target = event.target as HTMLElement | null;
     if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
     const meshEdit = this.store.getSnapshot().meshEdit;
@@ -230,14 +358,19 @@ export class ViewportInteractions {
   private sync = () => {
     if (this.disposed) return;
     const state = this.store.getSnapshot();
+    if (this.stroke && (state.document.revision !== this.stroke.revision || this.store.getProjectEpoch() !== this.stroke.epoch
+      || state.tool.active !== "displace" || state.selection.activeId !== this.stroke.id || brushUnavailable(state, this.blocked)))
+      this.cancel("Мазок отменён: состояние проекта изменилось.");
+    if (state.tool.active !== "displace" || brushUnavailable(state, this.blocked)) this.clearBrushPreview();
     if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
       || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
       || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
       this.cancel("Изменение отменено: состояние проекта изменилось.");
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
+    this.gizmo.enabled = state.tool.active !== "displace";
     this.gizmo.detach();
-    if (object && state.meshEdit.mode === "object" && editable(state, id, this.blocked) && state.tool.active !== "select") {
+    if (object && state.meshEdit.mode === "object" && editable(state, id, this.blocked) && state.tool.active !== "select" && state.tool.active !== "displace") {
       this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
       this.gizmo.setSpace(state.tool.space);
       this.gizmo.attach(object);
@@ -378,7 +511,11 @@ export class ViewportInteractions {
     if (this.disposed) return;
     this.cancel(); this.disposed = true; this.unsubscribe();
     this.clearMarkers();
-    this.canvas.removeEventListener("pointerdown", this.onPointerDown);
+    this.clearBrushPreview();
+    this.canvas.removeEventListener("pointerdown", this.onPointerDown, true);
+    this.canvas.removeEventListener("pointermove", this.onPointerMove);
+    this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
+    this.canvas.removeEventListener("lostpointercapture", this.onLostCapture);
     this.canvas.removeEventListener("pointerup", this.onPointerUp);
     this.canvas.removeEventListener("pointercancel", this.onPointerCancel);
     window.removeEventListener("keydown", this.onKeyDown);

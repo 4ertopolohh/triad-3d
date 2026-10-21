@@ -11,6 +11,7 @@ import type { BendParameters, TwistParameters, TaperParameters, BevelParameters 
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
+import { displaceStroke, brushParameters, MAX_BRUSH_SAMPLES } from "../geometry/displace-brush";
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
@@ -22,6 +23,7 @@ export type ProjectCommand =
   | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
+  | { commandId: string; type: "APPLY_DISPLACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; samples: Vec3[]; radius: number; strength: number } }
   | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
   | { commandId: string; type: "EXTRUDE_EDITABLE_FACE"; targetIds: [EntityId]; payload: { nodeId: EntityId; faceId: number; distance: number } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
@@ -187,6 +189,10 @@ function validCommand(value: unknown): value is ProjectCommand {
     || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   switch (value.type) {
     case "CONVERT_PRIMITIVE_TO_EDITABLE": return ownKeys(payload, ["nodeId"]);
+    case "APPLY_DISPLACE_STROKE": return ownKeys(payload, ["nodeId", "samples", "radius", "strength"])
+      && brushParameters(payload.radius as number, payload.strength as number)
+      && Array.isArray(payload.samples) && payload.samples.length > 0 && payload.samples.length <= MAX_BRUSH_SAMPLES
+      && payload.samples.every((point: unknown) => numbers(point, 3));
     case "TRANSLATE_EDITABLE_VERTICES": return ownKeys(payload, ["nodeId", "vertexIndices", "delta"])
       && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
       && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
@@ -496,12 +502,15 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       catch (error) { return failure(command.commandId, CommandErrorCode.VALIDATION_FAILED, error instanceof Error ? error.message : "Геометрия недопустима."); }
       break;
     case "TRANSLATE_EDITABLE_VERTICES":
+    case "APPLY_DISPLACE_STROKE":
     case "SCALE_EDITABLE_VERTICES":
     case "EXTRUDE_EDITABLE_FACE":
       if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
-        const source = command.type === "TRANSLATE_EDITABLE_VERTICES"
+        const source = command.type === "APPLY_DISPLACE_STROKE"
+          ? displaceStroke(current.meshSource, command.payload.samples, command.payload.radius, command.payload.strength)
+          : command.type === "TRANSLATE_EDITABLE_VERTICES"
           ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
           : command.type === "SCALE_EDITABLE_VERTICES"
             ? scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors)

@@ -15,7 +15,7 @@ export interface EditorState {
   readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
   readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
   readonly meshEdit: { readonly mode: "object" | "vertex" | "edge" | "face"; readonly nodeId: EntityId | null; readonly vertexIndices: readonly number[]; readonly edgeIds: readonly string[]; readonly faceIds: readonly number[] };
-  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
+  readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale" | "displace"; readonly space: "local" | "world" };
   readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
   readonly job: JobState;
   readonly history: { readonly entries: readonly HistoryEntry[]; readonly cursor: number; readonly canUndo: boolean; readonly canRedo: boolean };

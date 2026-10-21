@@ -210,6 +210,7 @@ tests/
     vertex-edit.test.ts
     viewport-interactions.test.ts
   ui/
+    bevel-editor.test.tsx
     inspector.test.ts
   visual/
     design-tokens.html
@@ -3473,87 +3474,6 @@ export async function applyArrayChange(store: EditorStore, change: ArrayChange, 
 }
 </file>
 
-<file path="src/app/deform-actions.ts">
-import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
-import type { Project } from "../domain/types";
-import { ModifierEvaluator } from "../geometry/modifiers";
-import type { BendParameters, TaperParameters, TwistParameters } from "../geometry/modifiers/types";
-import type { EditorStore } from "./editor-store";
-import { isJobActive, type JobOutcome } from "./job-controller";
-
-export type DeformKind = "bend" | "twist" | "taper";
-export type DeformChange =
-  | { type: "add"; targetId: string; kind: "bend"; parameters: BendParameters }
-  | { type: "add"; targetId: string; kind: "twist"; parameters: TwistParameters }
-  | { type: "add"; targetId: string; kind: "taper"; parameters: TaperParameters }
-  | { type: "update"; targetId: string; modifierId: string; parameters: BendParameters | TwistParameters | TaperParameters }
-  | { type: "enable"; targetId: string; modifierId: string; enabled: boolean }
-  | { type: "move"; targetId: string; modifierId: string; toIndex: number }
-  | { type: "remove"; targetId: string; modifierId: string };
-
-const failure = (id: string, message: string): JobOutcome => ({ ok: false, id, status: "validation_failed", error: { code: "VALIDATION_FAILED", message } });
-
-export async function applyDeformChange(store: EditorStore, change: DeformChange,
-  evaluatorFactory: () => ModifierEvaluator = () => new ModifierEvaluator()): Promise<JobOutcome> {
-  const snapshot = store.getSnapshot();
-  const epoch = store.getProjectEpoch();
-  const project = snapshot.document.project;
-  const target = project.nodes.find(node => node.id === change.targetId);
-  const id = crypto.randomUUID();
-  if (isJobActive(snapshot.job.status)) return failure(id, "Дождитесь завершения операции.");
-  if (snapshot.tool.mode !== "model" || snapshot.meshEdit.mode !== "object" || snapshot.selection.ids.length !== 1
-    || snapshot.selection.activeId !== change.targetId) return failure(id, "Выберите один mesh в режиме «Модель».");
-  if (!target || target.kind !== "mesh") return failure(id, "Выберите один mesh.");
-  if (target.meshSource.kind === "asset") return failure(id, "Деформации импортированного GLB пока недоступны: нет resolver геометрии.");
-  if (change.type !== "add" && (!target.modifierIds.includes(change.modifierId)
-    || !["bend", "twist", "taper"].includes(project.modifiers.find(item => item.id === change.modifierId)?.kind ?? "")))
-    return failure(id, "Деформация не принадлежит выбранному mesh.");
-  const commandId = crypto.randomUUID();
-  let command: ProjectCommand;
-  if (change.type === "add") {
-    const modifierId = crypto.randomUUID();
-    if (change.kind === "bend") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "bend", parameters: change.parameters } };
-    else if (change.kind === "twist") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "twist", parameters: change.parameters } };
-    else command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "taper", parameters: change.parameters } };
-  } else if (change.type === "update") command = { commandId, type: "UPDATE_DEFORM_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, parameters: change.parameters } };
-  else if (change.type === "enable") command = { commandId, type: "SET_MODIFIER_ENABLED", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, enabled: change.enabled } };
-  else if (change.type === "move") command = { commandId, type: "MOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, toIndex: change.toIndex } };
-  else command = { commandId, type: "REMOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId } };
-  const commands = [command];
-  let candidate: Project;
-  try {
-    const bus = createCommandBus(structuredClone(project) as Project);
-    const prepared = bus.executeTransaction(commands, bus.getRevision(), id);
-    if (!prepared.ok) return failure(id, `${prepared.code}: ${prepared.message}${prepared.issues?.[0] ? ` ${prepared.issues[0].message}` : ""}`);
-    if (!prepared.changed) return { ok: true, id, status: "succeeded", committed: false };
-    candidate = prepared.project;
-  } catch (error) { return failure(id, error instanceof Error ? error.message : "Не удалось проверить деформацию."); }
-  const current = () => {
-    const state = store.getSnapshot();
-    return store.getProjectEpoch() === epoch && state.document.revision === snapshot.document.revision
-      && state.document.project.id === project.id && state.selection.ids.length === 1
-      && state.selection.activeId === target.id && state.tool.mode === "model" && state.meshEdit.mode === "object";
-  };
-  const candidateTarget = candidate.nodes.find(node => node.id === target.id);
-  if (candidateTarget?.kind === "mesh" && !candidateTarget.modifierIds.some(modifierId => candidate.modifiers.find(item => item.id === modifierId)?.enabled)) {
-    if (!current()) return failure(id, "Проект или выделение изменились до применения.");
-    const committed = store.executeTransaction(commands, snapshot.document.revision, id);
-    return committed.ok ? { ok: true, id, status: "succeeded", committed: committed.changed } : failure(id, committed.message);
-  }
-  const evaluator = evaluatorFactory();
-  try {
-    return await store.jobs.run({ id, name: "Проверка деформации", cancellable: true,
-      validate: () => current() ? null : { code: "STALE_PROJECT", message: "Проект или выделение изменились до вычисления." },
-      compute: async (_input, signal) => {
-        const result = await evaluator.evaluate(candidate, target.id, signal);
-        return result.ok ? { ok: true as const, value: commands }
-          : { ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` } };
-      }, commands: value => current() ? value : [],
-    });
-  } finally { evaluator.dispose(); }
-}
-</file>
-
 <file path="src/app/job-controller.ts">
 import type { ProjectCommand, CommandResult } from "../domain/command-bus";
 import type { Project } from "../domain/types";
@@ -6748,137 +6668,6 @@ export function ArrayItem({ store, targetId, modifier, index, length, disabled, 
 }
 </file>
 
-<file path="src/ui/DeformEditor.tsx">
-import { useEffect, useRef, useState } from "react";
-import { applyDeformChange, type DeformChange, type DeformKind } from "../app/deform-actions";
-import type { DeepReadonly, EditorStore } from "../app/editor-store";
-import type { Modifier } from "../domain/types";
-import { parseBendParameters, parseTaperParameters, parseTwistParameters } from "../geometry/modifiers/deform";
-import type { BendParameters, DeformAxis, TaperParameters, TwistParameters } from "../geometry/modifiers/types";
-import { parseNumber } from "./inspector-logic";
-
-type Parameters = BendParameters | TwistParameters | TaperParameters;
-type Draft = { axis: DeformAxis; direction: DeformAxis; angleDegrees: string; startScale: string; endScale: string; pivot: [string, string, string] };
-type Session = { epoch: object; revision: number; selection: string; modifierVersion?: number };
-const labels = { bend: "Изгиб", twist: "Скручивание", taper: "Сужение / расширение" } as const;
-const axes: DeformAxis[] = ["x", "y", "z"];
-const defaults: Record<DeformKind, Parameters> = {
-  bend: { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] },
-  twist: { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] },
-  taper: { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] },
-};
-function makeDraft(kind: DeformKind, parameters: Parameters): Draft {
-  return { axis: parameters.axis, direction: kind === "bend" && "direction" in parameters ? parameters.direction : "x",
-    angleDegrees: "angleDegrees" in parameters ? String(parameters.angleDegrees) : "0",
-    startScale: "startScale" in parameters ? String(parameters.startScale) : "1",
-    endScale: "endScale" in parameters ? String(parameters.endScale) : "0.8",
-    pivot: parameters.pivot.map(String) as [string, string, string] };
-}
-function parseDraft(kind: "bend", draft: Draft): BendParameters;
-function parseDraft(kind: "twist", draft: Draft): TwistParameters;
-function parseDraft(kind: "taper", draft: Draft): TaperParameters;
-function parseDraft(kind: DeformKind, draft: Draft): Parameters;
-function parseDraft(kind: DeformKind, draft: Draft): Parameters {
-  const numeric = (text: string) => { const result = parseNumber(text); if (!result.ok) throw new Error(result.message); return result.value; };
-  const pivot = draft.pivot.map(numeric) as [number, number, number];
-  if (kind === "bend") return parseBendParameters({ axis: draft.axis, direction: draft.direction, angleDegrees: numeric(draft.angleDegrees), pivot });
-  if (kind === "twist") return parseTwistParameters({ axis: draft.axis, angleDegrees: numeric(draft.angleDegrees), pivot });
-  return parseTaperParameters({ axis: draft.axis, startScale: numeric(draft.startScale), endScale: numeric(draft.endScale), pivot });
-}
-function capture(store: EditorStore, version?: number): Session {
-  const state = store.getSnapshot();
-  return { epoch: store.getProjectEpoch(), revision: state.document.revision, selection: state.selection.ids.join("\u0000"), ...(version === undefined ? {} : { modifierVersion: version }) };
-}
-function fresh(store: EditorStore, session: Session, modifierId?: string): boolean {
-  const state = store.getSnapshot();
-  return store.getProjectEpoch() === session.epoch && state.document.revision === session.revision
-    && state.selection.ids.join("\u0000") === session.selection && state.tool.mode === "model" && state.meshEdit.mode === "object"
-    && (modifierId === undefined || state.document.project.modifiers.find(item => item.id === modifierId)?.version === session.modifierVersion);
-}
-
-function Fields({ kind, draft, setDraft, disabled }: { kind: DeformKind; draft: Draft; setDraft: (value: Draft) => void; disabled: boolean }) {
-  const number = (label: string, key: "angleDegrees" | "startScale" | "endScale") =>
-    <label>{label}<input type="text" inputMode="decimal" value={draft[key]} disabled={disabled} onChange={event => setDraft({ ...draft, [key]: event.target.value })} onKeyDown={event => event.stopPropagation()} /></label>;
-  return <>
-    <label>Ось<select value={draft.axis} disabled={disabled} onChange={event => setDraft({ ...draft, axis: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>
-    {kind === "bend" && <label>Направление изгиба<select value={draft.direction} disabled={disabled} onChange={event => setDraft({ ...draft, direction: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>}
-    {kind !== "taper" ? number("Угол, °", "angleDegrees") : <>{number("Начальный масштаб", "startScale")}{number("Конечный масштаб", "endScale")}</>}
-    <span>Pivot</span><div className="boolean-stack-actions">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>{axis}<input type="text" inputMode="decimal" value={draft.pivot[index]} disabled={disabled}
-      onChange={event => setDraft({ ...draft, pivot: draft.pivot.map((value, at) => at === index ? event.target.value : value) as [string, string, string] })}
-      onKeyDown={event => event.stopPropagation()} /></label>)}</div>
-  </>;
-}
-
-export function DeformAdd({ store, targetId, disabled, reason }: { store: EditorStore; targetId: string; disabled: boolean; reason: string }) {
-  const [kind, setKind] = useState<DeformKind>("bend");
-  const [draft, setDraft] = useState(() => makeDraft("bend", defaults.bend));
-  const [message, setMessage] = useState("");
-  const session = useRef<Session | null>(null);
-  function change(value: Draft) { session.current ??= capture(store); setDraft(value); setMessage(""); }
-  function reset(nextKind: DeformKind) { setKind(nextKind); setDraft(makeDraft(nextKind, defaults[nextKind])); session.current = null; setMessage(""); }
-  async function add() {
-    if (session.current && !fresh(store, session.current)) { setMessage("Данные изменились. Повторите ввод."); return; }
-    let change: DeformChange;
-    try {
-      if (kind === "bend") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
-      else if (kind === "twist") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
-      else change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Недопустимые параметры."); return; }
-    const result = await applyDeformChange(store, change);
-    setMessage(result.ok ? result.committed ? "Деформация добавлена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
-    session.current = null;
-  }
-  return <section className="boolean-editor" aria-label="Деформации"><h4>Деформации</h4>
-    <label>Операция<select value={kind} disabled={disabled || !!reason} onChange={event => reset(event.target.value as DeformKind)}>{Object.entries(labels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
-    <div onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); void add(); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDraft(makeDraft(kind, defaults[kind])); session.current = null; setMessage(""); } }}>
-      <Fields kind={kind} draft={draft} setDraft={change} disabled={disabled || !!reason} />
-    </div>
-    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void add()}>Добавить деформацию</button>
-    {reason && <p className="panel-hint">{reason}</p>}{message && <p className="primitive-error" role="status">{message}</p>}
-    <p className="panel-hint">Деформация пересчитывает нормали. Исходные UV, авторские нормали и группы материалов в MeshData результата не сохраняются.</p>
-  </section>;
-}
-
-export function DeformItem({ store, targetId, modifier, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; index: number; length: number; disabled: boolean; reason: string }) {
-  const kind = modifier.kind;
-  if (kind !== "bend" && kind !== "twist" && kind !== "taper") return null;
-  return <DeformItemForm key={`${modifier.id}:${modifier.version}`} store={store} targetId={targetId} modifier={modifier} kind={kind} index={index} length={length} disabled={disabled} reason={reason} />;
-}
-function DeformItemForm({ store, targetId, modifier, kind, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; kind: DeformKind; index: number; length: number; disabled: boolean; reason: string }) {
-  const [message, setMessage] = useState("");
-  const session = useRef<Session | null>(null);
-  const renderedEpoch = useRef(store.getProjectEpoch());
-  const parameters = (() => { try { return kind === "bend" ? parseBendParameters(modifier.parameters) : kind === "twist" ? parseTwistParameters(modifier.parameters) : parseTaperParameters(modifier.parameters); } catch { return null; } })();
-  const [draft, setDraft] = useState(() => makeDraft(kind, parameters ?? defaults[kind]));
-  useEffect(() => { session.current = null; }, [modifier.id, modifier.version]);
-  if (!parameters) return <p className="primitive-error" role="alert">{index + 1}. Параметры деформации повреждены.</p>;
-  function change(value: Draft) { session.current ??= capture(store, modifier.version); setDraft(value); setMessage(""); }
-  async function run(action: DeformChange) {
-    const current = store.getSnapshot();
-    if (store.getProjectEpoch() !== renderedEpoch.current || current.document.project.modifiers.find(item => item.id === modifier.id)?.version !== modifier.version
-      || current.selection.ids.length !== 1 || current.selection.activeId !== targetId) { setMessage("Данные изменились. Повторите действие."); return; }
-    setMessage("");
-    const result = await applyDeformChange(store, action);
-    setMessage(result.ok ? result.committed ? "Деформация изменена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
-  }
-  function update() {
-    if (session.current && !fresh(store, session.current, modifier.id)) { setMessage("Данные изменились. Повторите ввод."); return; }
-    try { void run({ type: "update", targetId, modifierId: modifier.id, parameters: parseDraft(kind, draft) }); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Недопустимые параметры."); }
-  }
-  return <div className="boolean-stack-item">
-    <strong>{index + 1}. {labels[kind]}</strong>
-    <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!reason} title={reason || undefined} onChange={event => void run({ type: "enable", targetId, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
-    <div onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); update(); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDraft(makeDraft(kind, parameters)); session.current = null; setMessage(""); } }}>
-      <Fields kind={kind} draft={draft} setDraft={change} disabled={disabled || !!reason} />
-    </div>
-    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={update}>Применить параметры</button>
-    <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!reason || index === 0} title={reason || undefined} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!reason || index === length - 1} title={reason || undefined} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void run({ type: "remove", targetId, modifierId: modifier.id })}>Удалить</button></div>
-    {message && <p className="primitive-error" role="status">{message}</p>}
-  </div>;
-}
-</file>
-
 <file path="src/ui/inspector-logic.ts">
 import { Euler, Matrix4, Quaternion, Vector3 } from "three";
 import type { DeepReadonly, EditorState } from "../app/editor-store";
@@ -7442,98 +7231,6 @@ describe("Boolean user actions", () => {
     expect((await applyBooleanChange(store, { type: "enable", targetId: "target", modifierId: ids[0]!, enabled: false }, factory)).ok).toBe(true);
     expect((await applyBooleanChange(store, { type: "remove", targetId: "target", modifierId: ids[0]! }, factory)).ok).toBe(true);
     expect(store.getSnapshot().document.project.modifiers).toHaveLength(1);
-  });
-});
-</file>
-
-<file path="tests/app/deform-actions.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import { applyDeformChange } from "../../src/app/deform-actions";
-import { createEditorStore } from "../../src/app/editor-store";
-import { createProject } from "../../src/domain/create-project";
-import { createPrimitiveNode } from "../../src/geometry/primitives";
-import type { ModifierEvaluator } from "../../src/geometry/modifiers";
-
-const bend = { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } as const;
-const twist = { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] } as const;
-const taper = { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } as const;
-function fixture() {
-  const project = createProject(() => crypto.randomUUID());
-  const root = project.nodes[0]!;
-  const node = createPrimitiveNode("cube", root.id, "target");
-  project.nodes.push(node); root.children.push(node.id);
-  const store = createEditorStore(project);
-  store.setSelection(["target"]);
-  return store;
-}
-
-describe("deformation actions", () => {
-  it("commits ordered Bend, Twist, Taper and supports update, toggle, reorder, remove and undo", async () => {
-    const store = fixture();
-    for (const change of [{ type: "add" as const, targetId: "target", kind: "bend" as const, parameters: bend },
-      { type: "add" as const, targetId: "target", kind: "twist" as const, parameters: twist },
-      { type: "add" as const, targetId: "target", kind: "taper" as const, parameters: taper }])
-      expect(await applyDeformChange(store, change)).toMatchObject({ ok: true, committed: true });
-    const [first, second] = store.getSnapshot().document.project.modifiers;
-    expect(store.getSnapshot().document.project.modifiers.map(item => item.kind)).toEqual(["bend", "twist", "taper"]);
-    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: first!.id, parameters: { ...bend, angleDegrees: 60 } })).toMatchObject({ ok: true, committed: true });
-    const before = store.getSnapshot();
-    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: first!.id, parameters: { ...bend, angleDegrees: 60 } })).toMatchObject({ ok: true, committed: false });
-    expect(store.getSnapshot().history.entries).toHaveLength(before.history.entries.length);
-    expect(await applyDeformChange(store, { type: "move", targetId: "target", modifierId: first!.id, toIndex: 2 })).toMatchObject({ ok: true, committed: true });
-    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "target")?.modifierIds[2]).toBe(first!.id);
-    expect(await applyDeformChange(store, { type: "enable", targetId: "target", modifierId: second!.id, enabled: false })).toMatchObject({ ok: true, committed: true });
-    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: first!.id })).toMatchObject({ ok: true, committed: true });
-    const revision = store.getSnapshot().document.revision;
-    expect(store.undo(revision).ok).toBe(true);
-    expect(store.getSnapshot().document.project.modifiers.some(item => item.id === first!.id)).toBe(true);
-    expect(store.redo(revision + 1).ok).toBe(true);
-  });
-  it("leaves document and history untouched after failed evaluation", async () => {
-    const store = fixture();
-    const before = store.getSnapshot();
-    const dispose = vi.fn();
-    const factory = () => ({ evaluate: vi.fn(async () => ({ ok: false, error: { code: "GEOMETRY_DEGENERATE", message: "Некорректная сетка." } })), dispose }) as unknown as ModifierEvaluator;
-    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend }, factory)).ok).toBe(false);
-    expect(dispose).toHaveBeenCalledOnce();
-    expect(store.getSnapshot().document).toEqual(before.document);
-    expect(store.getSnapshot().history).toEqual(before.history);
-  });
-  it("removes the last active deformation without running an evaluator", async () => {
-    const store = fixture();
-    expect(await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend })).toMatchObject({ ok: true });
-    const id = store.getSnapshot().document.project.modifiers[0]!.id;
-    const factory = vi.fn();
-    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: id }, factory)).toMatchObject({ ok: true, committed: true });
-    expect(factory).not.toHaveBeenCalled();
-    expect(store.getSnapshot().document.project.modifiers).toHaveLength(0);
-  });
-  it("blocks an asset-backed mesh without a runtime resolver", async () => {
-    const project = createProject(() => crypto.randomUUID());
-    const root = project.nodes[0]!;
-    const node = createPrimitiveNode("cube", root.id, "target");
-    node.meshSource = { kind: "asset", assetId: "asset" };
-    project.assets.push({ id: "asset", hash: "hash", mediaType: "model/gltf-binary", path: "assets/model.glb", colorSpace: "none" });
-    project.nodes.push(node); root.children.push(node.id);
-    const store = createEditorStore(project); store.setSelection(["target"]);
-    const before = store.getSnapshot();
-    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend })).ok).toBe(false);
-    expect(store.getSnapshot().document).toEqual(before.document);
-  });
-  it("cancels pending work and ignores late results", async () => {
-    const store = fixture();
-    let release!: () => void;
-    const pending = new Promise<void>(resolve => { release = resolve; });
-    const dispose = vi.fn();
-    const factory = () => ({ evaluate: async () => { await pending; return { ok: true }; }, dispose }) as unknown as ModifierEvaluator;
-    const operation = applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend }, factory);
-    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("running"));
-    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "twist", parameters: twist })).ok).toBe(false);
-    expect(store.jobs.cancelJob()).toBe(true);
-    expect(await operation).toMatchObject({ ok: false, status: "cancelled" });
-    release(); await Promise.resolve();
-    expect(store.getSnapshot().history.entries).toHaveLength(0);
-    expect(dispose).toHaveBeenCalledOnce();
   });
 });
 </file>
@@ -8191,69 +7888,6 @@ describe("transactional Boolean commands", () => {
     const locked = fixture();
     locked.nodes.find(node => node.id === "mesh-node")!.locked = true;
     expect(createCommandBus(locked).executeCommand(add("a"), 0)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
-  });
-});
-</file>
-
-<file path="tests/domain/deform-commands.test.ts">
-import { describe, expect, it } from "vitest";
-import { createCommandBus, type ProjectCommand } from "../../src/domain/command-bus";
-import { createProject } from "../../src/domain/create-project";
-import { createPrimitiveNode } from "../../src/geometry/primitives";
-import type { BendParameters, TwistParameters, TaperParameters } from "../../src/geometry/modifiers/types";
-
-const bend = { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } as const;
-const twist = { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] } as const;
-const taper = { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } as const;
-function fixture() {
-  const project = createProject(() => crypto.randomUUID());
-  const root = project.nodes[0]!;
-  for (const id of ["a", "b"]) { const node = createPrimitiveNode("cube", root.id, id); project.nodes.push(node); root.children.push(id); }
-  return createCommandBus(project);
-}
-const add = (kind: "bend" | "twist" | "taper", id: string, nodeId = "a"): ProjectCommand => {
-  const common = { commandId: crypto.randomUUID(), type: "ADD_DEFORM_MODIFIER" as const, targetIds: [nodeId, id] as [string, string] };
-  if (kind === "bend") return { ...common, payload: { nodeId, modifierId: id, kind, parameters: bend } };
-  if (kind === "twist") return { ...common, payload: { nodeId, modifierId: id, kind, parameters: twist } };
-  return { ...common, payload: { nodeId, modifierId: id, kind, parameters: taper } };
-};
-const update = (id: string, parameters: BendParameters | TwistParameters | TaperParameters): ProjectCommand =>
-  ({ commandId: crypto.randomUUID(), type: "UPDATE_DEFORM_MODIFIER", targetIds: [id], payload: { modifierId: id, parameters } });
-
-describe("deformation commands", () => {
-  it("adds every kind, updates without changing ID, orders and replays patches", () => {
-    const bus = fixture();
-    for (const [kind, id] of [["bend", "bend1"], ["twist", "twist1"], ["taper", "taper1"]] as const)
-      expect(bus.executeCommand(add(kind, id), bus.getRevision())).toMatchObject({ ok: true, changed: true });
-    expect(bus.getSnapshot().nodes.find(node => node.id === "a")?.modifierIds).toEqual(["bend1", "twist1", "taper1"]);
-    expect(bus.getSnapshot().modifiers.map(item => item.order)).toEqual([0, 1, 2]);
-    const changed = bus.executeCommand(update("bend1", { ...bend, angleDegrees: 60 }), bus.getRevision());
-    expect(changed).toMatchObject({ ok: true, changed: true });
-    if (!changed.ok) return;
-    expect(changed.project.modifiers.find(item => item.id === "bend1")).toMatchObject({ version: 1, parameters: { angleDegrees: 60 } });
-    expect(bus.executeCommand(update("bend1", { ...bend, angleDegrees: 60 }), bus.getRevision())).toMatchObject({ ok: true, changed: false });
-    const undo = bus.applyHistoryPatch(changed.undoPatch, bus.getRevision());
-    expect(undo.ok && undo.project.modifiers.find(item => item.id === "bend1")?.parameters.angleDegrees).toBe(30);
-    if (undo.ok) expect(bus.applyHistoryPatch(changed.patch, undo.revision)).toMatchObject({ ok: true });
-    expect(bus.executeCommand({ commandId: "move", type: "MOVE_MODIFIER", targetIds: ["bend1"], payload: { modifierId: "bend1", toIndex: 2 } }, bus.getRevision())).toMatchObject({ ok: true });
-    expect(bus.getSnapshot().nodes.find(node => node.id === "a")?.modifierIds).toEqual(["twist1", "taper1", "bend1"]);
-  });
-  it("rejects invalid shape, values, references, duplicate ID and inaccessible targets", () => {
-    const bus = fixture();
-    const malformed = { ...add("bend", "bad"), payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: twist } } as ProjectCommand;
-    expect(bus.executeCommand(malformed, 0).ok).toBe(false);
-    expect(bus.executeCommand({ commandId: "wrong-targets", type: "ADD_DEFORM_MODIFIER", targetIds: ["wrong", "bad"], payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: bend } }, 0).ok).toBe(false);
-    expect(bus.executeCommand({ ...add("bend", "bad"), payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: { ...bend, angleDegrees: Infinity } } } as ProjectCommand, 0).ok).toBe(false);
-    expect(bus.executeCommand(add("bend", "bad", "missing"), 0).ok).toBe(false);
-    expect(bus.executeCommand(add("bend", "bend1"), 0).ok).toBe(true);
-    expect(bus.executeCommand(add("twist", "bend1"), bus.getRevision()).ok).toBe(false);
-    expect(bus.executeCommand(update("bend1", twist), bus.getRevision()).ok).toBe(false);
-    expect(bus.executeCommand(update("missing", bend), bus.getRevision()).ok).toBe(false);
-    for (const [nodeId, field] of [["a", "locked"], ["b", "visible"]] as const) {
-      expect(bus.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: [nodeId], payload: { nodeId, [field]: field === "locked" } }, bus.getRevision()).ok).toBe(true);
-    }
-    expect(bus.executeCommand(update("bend1", { ...bend, angleDegrees: 90 }), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_LOCKED" });
-    expect(bus.executeCommand(add("taper", "new", "b"), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
   });
 });
 </file>
@@ -9778,6 +9412,37 @@ describe("vertex editing session", () => {
 });
 </file>
 
+<file path="tests/ui/bevel-editor.test.tsx">
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import { createEditorStore } from "../../src/app/editor-store";
+import { BooleanEditor } from "../../src/ui/BooleanEditor";
+
+describe("Bevel Inspector", () => {
+  it("renders Bevel in the shared stack with the effective 30° threshold", () => {
+    const project = createProject(() => crypto.randomUUID());
+    const root = project.nodes[0]!;
+    const node = createPrimitiveNode("cube", root.id, "cube");
+    root.children.push(node.id);
+    node.modifierIds.push("bevel");
+    project.nodes.push(node);
+    project.modifiers.push({ id: "bevel", nodeId: node.id, kind: "bevel", parameters: { width: 0.1 }, enabled: true, order: 0, version: 0 });
+    const store = createEditorStore(project);
+    store.setSelection([node.id]);
+    const snapshot = store.getSnapshot();
+    const target = snapshot.document.project.nodes.find(item => item.id === node.id);
+    if (!target || target.kind !== "mesh") throw new Error("Missing mesh");
+    const html = renderToStaticMarkup(<BooleanEditor store={store} project={snapshot.document.project} target={target} disabled={false} reason="" />);
+    expect(html).toContain("Фаска (Bevel)");
+    expect(html).toContain("Ширина фаски");
+    expect(html).toContain('value="30"');
+    expect(html).toContain("1. Фаска (Bevel)");
+  });
+});
+</file>
+
 <file path="tests/ui/inspector.test.ts">
 import { describe, expect, it } from "vitest";
 import { Quaternion, Vector3 } from "three";
@@ -10355,6 +10020,89 @@ export async function applyBooleanChange(store: EditorStore, change: BooleanChan
         return result.ok ? { ok: true as const, value: commands } : { ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` } };
       },
       commands: value => value,
+    });
+  } finally { evaluator.dispose(); }
+}
+</file>
+
+<file path="src/app/deform-actions.ts">
+import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
+import type { Project } from "../domain/types";
+import { ModifierEvaluator } from "../geometry/modifiers";
+import type { BendParameters, TaperParameters, TwistParameters, BevelParameters } from "../geometry/modifiers/types";
+import type { EditorStore } from "./editor-store";
+import { isJobActive, type JobOutcome } from "./job-controller";
+
+export type DeformKind = "bend" | "twist" | "taper" | "bevel";
+export type DeformChange =
+  | { type: "add"; targetId: string; kind: "bend"; parameters: BendParameters }
+  | { type: "add"; targetId: string; kind: "twist"; parameters: TwistParameters }
+  | { type: "add"; targetId: string; kind: "taper"; parameters: TaperParameters }
+  | { type: "add"; targetId: string; kind: "bevel"; parameters: BevelParameters }
+  | { type: "update"; targetId: string; modifierId: string; parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters }
+  | { type: "enable"; targetId: string; modifierId: string; enabled: boolean }
+  | { type: "move"; targetId: string; modifierId: string; toIndex: number }
+  | { type: "remove"; targetId: string; modifierId: string };
+
+const failure = (id: string, message: string): JobOutcome => ({ ok: false, id, status: "validation_failed", error: { code: "VALIDATION_FAILED", message } });
+
+export async function applyDeformChange(store: EditorStore, change: DeformChange,
+  evaluatorFactory: () => ModifierEvaluator = () => new ModifierEvaluator()): Promise<JobOutcome> {
+  const snapshot = store.getSnapshot();
+  const epoch = store.getProjectEpoch();
+  const project = snapshot.document.project;
+  const target = project.nodes.find(node => node.id === change.targetId);
+  const id = crypto.randomUUID();
+  if (isJobActive(snapshot.job.status)) return failure(id, "Дождитесь завершения операции.");
+  if (snapshot.tool.mode !== "model" || snapshot.meshEdit.mode !== "object" || snapshot.selection.ids.length !== 1
+    || snapshot.selection.activeId !== change.targetId) return failure(id, "Выберите один mesh в режиме «Модель».");
+  if (!target || target.kind !== "mesh") return failure(id, "Выберите один mesh.");
+  if (target.meshSource.kind === "asset") return failure(id, "Деформации импортированного GLB пока недоступны: нет resolver геометрии.");
+  if (change.type !== "add" && (!target.modifierIds.includes(change.modifierId)
+    || !["bend", "twist", "taper", "bevel"].includes(project.modifiers.find(item => item.id === change.modifierId)?.kind ?? "")))
+    return failure(id, "Деформация не принадлежит выбранному mesh.");
+  const commandId = crypto.randomUUID();
+  let command: ProjectCommand;
+  if (change.type === "add") {
+    const modifierId = crypto.randomUUID();
+    if (change.kind === "bend") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "bend", parameters: change.parameters } };
+    else if (change.kind === "twist") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "twist", parameters: change.parameters } };
+    else if (change.kind === "taper") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "taper", parameters: change.parameters } };
+    else command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "bevel", parameters: change.parameters } };
+  } else if (change.type === "update") command = { commandId, type: "UPDATE_DEFORM_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, parameters: change.parameters } };
+  else if (change.type === "enable") command = { commandId, type: "SET_MODIFIER_ENABLED", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, enabled: change.enabled } };
+  else if (change.type === "move") command = { commandId, type: "MOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, toIndex: change.toIndex } };
+  else command = { commandId, type: "REMOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId } };
+  const commands = [command];
+  let candidate: Project;
+  try {
+    const bus = createCommandBus(structuredClone(project) as Project);
+    const prepared = bus.executeTransaction(commands, bus.getRevision(), id);
+    if (!prepared.ok) return failure(id, `${prepared.code}: ${prepared.message}${prepared.issues?.[0] ? ` ${prepared.issues[0].message}` : ""}`);
+    if (!prepared.changed) return { ok: true, id, status: "succeeded", committed: false };
+    candidate = prepared.project;
+  } catch (error) { return failure(id, error instanceof Error ? error.message : "Не удалось проверить деформацию."); }
+  const current = () => {
+    const state = store.getSnapshot();
+    return store.getProjectEpoch() === epoch && state.document.revision === snapshot.document.revision
+      && state.document.project.id === project.id && state.selection.ids.length === 1
+      && state.selection.activeId === target.id && state.tool.mode === "model" && state.meshEdit.mode === "object";
+  };
+  const candidateTarget = candidate.nodes.find(node => node.id === target.id);
+  if (candidateTarget?.kind === "mesh" && !candidateTarget.modifierIds.some(modifierId => candidate.modifiers.find(item => item.id === modifierId)?.enabled)) {
+    if (!current()) return failure(id, "Проект или выделение изменились до применения.");
+    const committed = store.executeTransaction(commands, snapshot.document.revision, id);
+    return committed.ok ? { ok: true, id, status: "succeeded", committed: committed.changed } : failure(id, committed.message);
+  }
+  const evaluator = evaluatorFactory();
+  try {
+    return await store.jobs.run({ id, name: "Проверка деформации", cancellable: true,
+      validate: () => current() ? null : { code: "STALE_PROJECT", message: "Проект или выделение изменились до вычисления." },
+      compute: async (_input, signal) => {
+        const result = await evaluator.evaluate(candidate, target.id, signal);
+        return result.ok ? { ok: true as const, value: commands }
+          : { ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` } };
+      }, commands: value => current() ? value : [],
     });
   } finally { evaluator.dispose(); }
 }
@@ -11180,6 +10928,260 @@ export default function CsgSpike() {
 }
 </file>
 
+<file path="src/ui/DeformEditor.tsx">
+import { useEffect, useRef, useState } from "react";
+import { applyDeformChange, type DeformChange, type DeformKind } from "../app/deform-actions";
+import type { DeepReadonly, EditorStore } from "../app/editor-store";
+import type { Modifier } from "../domain/types";
+import { parseBendParameters, parseTaperParameters, parseTwistParameters } from "../geometry/modifiers/deform";
+import { parseBevelParameters } from "../geometry/modifiers/bevel";
+import type { BendParameters, DeformAxis, TaperParameters, TwistParameters, BevelParameters } from "../geometry/modifiers/types";
+import { parseNumber } from "./inspector-logic";
+
+type Parameters = BendParameters | TwistParameters | TaperParameters | BevelParameters;
+type Draft = { axis: DeformAxis; direction: DeformAxis; width: string; angleDegrees: string; startScale: string; endScale: string; pivot: [string, string, string] };
+type Session = { epoch: object; revision: number; selection: string; modifierVersion?: number };
+const labels = { bend: "Изгиб", twist: "Скручивание", taper: "Сужение / расширение", bevel: "Фаска (Bevel)" } as const;
+const axes: DeformAxis[] = ["x", "y", "z"];
+const defaults: Record<DeformKind, Parameters> = {
+  bend: { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] },
+  twist: { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] },
+  taper: { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] },
+  bevel: { width: 0.1, angleDegrees: 30 },
+};
+function makeDraft(kind: DeformKind, parameters: Parameters): Draft {
+  return { axis: "axis" in parameters ? parameters.axis : "y", direction: kind === "bend" && "direction" in parameters ? parameters.direction : "x",
+    width: "width" in parameters ? String(parameters.width) : "0.1",
+    angleDegrees: "angleDegrees" in parameters && parameters.angleDegrees !== undefined ? String(parameters.angleDegrees) : kind === "bevel" ? "30" : "0",
+    startScale: "startScale" in parameters ? String(parameters.startScale) : "1",
+    endScale: "endScale" in parameters ? String(parameters.endScale) : "0.8",
+    pivot: "pivot" in parameters ? parameters.pivot.map(String) as [string, string, string] : ["0", "0", "0"] };
+}
+function parseDraft(kind: "bend", draft: Draft): BendParameters;
+function parseDraft(kind: "twist", draft: Draft): TwistParameters;
+function parseDraft(kind: "taper", draft: Draft): TaperParameters;
+function parseDraft(kind: "bevel", draft: Draft): BevelParameters;
+function parseDraft(kind: DeformKind, draft: Draft): Parameters;
+function parseDraft(kind: DeformKind, draft: Draft): Parameters {
+  const numeric = (text: string) => { const result = parseNumber(text); if (!result.ok) throw new Error(result.message); return result.value; };
+  if (kind === "bevel") return parseBevelParameters({ width: numeric(draft.width), angleDegrees: numeric(draft.angleDegrees) });
+  const pivot = draft.pivot.map(numeric) as [number, number, number];
+  if (kind === "bend") return parseBendParameters({ axis: draft.axis, direction: draft.direction, angleDegrees: numeric(draft.angleDegrees), pivot });
+  if (kind === "twist") return parseTwistParameters({ axis: draft.axis, angleDegrees: numeric(draft.angleDegrees), pivot });
+  return parseTaperParameters({ axis: draft.axis, startScale: numeric(draft.startScale), endScale: numeric(draft.endScale), pivot });
+}
+function capture(store: EditorStore, version?: number): Session {
+  const state = store.getSnapshot();
+  return { epoch: store.getProjectEpoch(), revision: state.document.revision, selection: state.selection.ids.join("\u0000"), ...(version === undefined ? {} : { modifierVersion: version }) };
+}
+function fresh(store: EditorStore, session: Session, modifierId?: string): boolean {
+  const state = store.getSnapshot();
+  return store.getProjectEpoch() === session.epoch && state.document.revision === session.revision
+    && state.selection.ids.join("\u0000") === session.selection && state.tool.mode === "model" && state.meshEdit.mode === "object"
+    && (modifierId === undefined || state.document.project.modifiers.find(item => item.id === modifierId)?.version === session.modifierVersion);
+}
+
+function Fields({ kind, draft, setDraft, disabled }: { kind: DeformKind; draft: Draft; setDraft: (value: Draft) => void; disabled: boolean }) {
+  const number = (label: string, key: "width" | "angleDegrees" | "startScale" | "endScale") =>
+    <label>{label}<input type="text" inputMode="decimal" value={draft[key]} disabled={disabled} onChange={event => setDraft({ ...draft, [key]: event.target.value })} onKeyDown={event => event.stopPropagation()} /></label>;
+  if (kind === "bevel") return <>{number("Ширина фаски", "width")}{number("Порог угла, °", "angleDegrees")}</>;
+  return <>
+    <label>Ось<select value={draft.axis} disabled={disabled} onChange={event => setDraft({ ...draft, axis: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>
+    {kind === "bend" && <label>Направление изгиба<select value={draft.direction} disabled={disabled} onChange={event => setDraft({ ...draft, direction: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>}
+    {kind !== "taper" ? number("Угол, °", "angleDegrees") : <>{number("Начальный масштаб", "startScale")}{number("Конечный масштаб", "endScale")}</>}
+    <span>Pivot</span><div className="boolean-stack-actions">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>{axis}<input type="text" inputMode="decimal" value={draft.pivot[index]} disabled={disabled}
+      onChange={event => setDraft({ ...draft, pivot: draft.pivot.map((value, at) => at === index ? event.target.value : value) as [string, string, string] })}
+      onKeyDown={event => event.stopPropagation()} /></label>)}</div>
+  </>;
+}
+
+export function DeformAdd({ store, targetId, disabled, reason }: { store: EditorStore; targetId: string; disabled: boolean; reason: string }) {
+  const [kind, setKind] = useState<DeformKind>("bend");
+  const [draft, setDraft] = useState(() => makeDraft("bend", defaults.bend));
+  const [message, setMessage] = useState("");
+  const session = useRef<Session | null>(null);
+  function change(value: Draft) { session.current ??= capture(store); setDraft(value); setMessage(""); }
+  function reset(nextKind: DeformKind) { setKind(nextKind); setDraft(makeDraft(nextKind, defaults[nextKind])); session.current = null; setMessage(""); }
+  async function add() {
+    if (session.current && !fresh(store, session.current)) { setMessage("Данные изменились. Повторите ввод."); return; }
+    let change: DeformChange;
+    try {
+      if (kind === "bend") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
+      else if (kind === "twist") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
+      else if (kind === "taper") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
+      else change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Недопустимые параметры."); return; }
+    const result = await applyDeformChange(store, change);
+    setMessage(result.ok ? result.committed ? kind === "bevel" ? "Фаска добавлена." : "Деформация добавлена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
+    session.current = null;
+  }
+  return <section className="boolean-editor" aria-label="Деформации"><h4>Деформации</h4>
+    <label>Операция<select value={kind} disabled={disabled || !!reason} onChange={event => reset(event.target.value as DeformKind)}>{Object.entries(labels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
+    <div onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); void add(); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDraft(makeDraft(kind, defaults[kind])); session.current = null; setMessage(""); } }}>
+      <Fields kind={kind} draft={draft} setDraft={change} disabled={disabled || !!reason} />
+    </div>
+    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void add()}>{kind === "bevel" ? "Добавить фаску" : "Добавить деформацию"}</button>
+    {reason && <p className="panel-hint">{reason}</p>}{message && <p className="primitive-error" role="status">{message}</p>}
+    <p className="panel-hint">Деформация пересчитывает нормали. Исходные UV, авторские нормали и группы материалов в MeshData результата не сохраняются.</p>
+    {kind === "bevel" && <p className="panel-hint">Фаска рассчитана на выпуклые замкнутые ориентированные сетки: до 4096 треугольников и 256 срезов. Ширина должна быть меньше половины кратчайшего ребра. Открытые и невыпуклые сетки могут отклоняться; при изменении геометрии UV, авторские нормали и группы материалов не сохраняются.</p>}
+  </section>;
+}
+
+export function DeformItem({ store, targetId, modifier, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; index: number; length: number; disabled: boolean; reason: string }) {
+  const kind = modifier.kind;
+  if (kind !== "bend" && kind !== "twist" && kind !== "taper" && kind !== "bevel") return null;
+  return <DeformItemForm key={`${modifier.id}:${modifier.version}`} store={store} targetId={targetId} modifier={modifier} kind={kind} index={index} length={length} disabled={disabled} reason={reason} />;
+}
+function DeformItemForm({ store, targetId, modifier, kind, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; kind: DeformKind; index: number; length: number; disabled: boolean; reason: string }) {
+  const [message, setMessage] = useState("");
+  const session = useRef<Session | null>(null);
+  const renderedEpoch = useRef(store.getProjectEpoch());
+  const parameters = (() => { try { return kind === "bend" ? parseBendParameters(modifier.parameters) : kind === "twist" ? parseTwistParameters(modifier.parameters) : kind === "taper" ? parseTaperParameters(modifier.parameters) : parseBevelParameters(modifier.parameters); } catch { return null; } })();
+  const [draft, setDraft] = useState(() => makeDraft(kind, parameters ?? defaults[kind]));
+  useEffect(() => { session.current = null; }, [modifier.id, modifier.version]);
+  if (!parameters) return <p className="primitive-error" role="alert">{index + 1}. Параметры деформации повреждены.</p>;
+  function change(value: Draft) { session.current ??= capture(store, modifier.version); setDraft(value); setMessage(""); }
+  async function run(action: DeformChange) {
+    const current = store.getSnapshot();
+    if (store.getProjectEpoch() !== renderedEpoch.current || current.document.project.modifiers.find(item => item.id === modifier.id)?.version !== modifier.version
+      || current.selection.ids.length !== 1 || current.selection.activeId !== targetId) { setMessage("Данные изменились. Повторите действие."); return; }
+    setMessage("");
+    const result = await applyDeformChange(store, action);
+    setMessage(result.ok ? result.committed ? "Деформация изменена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
+  }
+  function update() {
+    if (session.current && !fresh(store, session.current, modifier.id)) { setMessage("Данные изменились. Повторите ввод."); return; }
+    try { void run({ type: "update", targetId, modifierId: modifier.id, parameters: parseDraft(kind, draft) }); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Недопустимые параметры."); }
+  }
+  return <div className="boolean-stack-item">
+    <strong>{index + 1}. {labels[kind]}</strong>
+    <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!reason} title={reason || undefined} onChange={event => void run({ type: "enable", targetId, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
+    <div onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); update(); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDraft(makeDraft(kind, parameters)); session.current = null; setMessage(""); } }}>
+      <Fields kind={kind} draft={draft} setDraft={change} disabled={disabled || !!reason} />
+    </div>
+    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={update}>Применить параметры</button>
+    <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!reason || index === 0} title={reason || undefined} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!reason || index === length - 1} title={reason || undefined} onClick={() => void run({ type: "move", targetId, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void run({ type: "remove", targetId, modifierId: modifier.id })}>Удалить</button></div>
+    {message && <p className="primitive-error" role="status">{message}</p>}
+  </div>;
+}
+</file>
+
+<file path="tests/app/deform-actions.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import { applyDeformChange } from "../../src/app/deform-actions";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import type { ModifierEvaluator } from "../../src/geometry/modifiers";
+
+const bend = { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } as const;
+const twist = { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] } as const;
+const taper = { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } as const;
+const bevel = { width: 0.1, angleDegrees: 30 } as const;
+function fixture() {
+  const project = createProject(() => crypto.randomUUID());
+  const root = project.nodes[0]!;
+  const node = createPrimitiveNode("cube", root.id, "target");
+  project.nodes.push(node); root.children.push(node.id);
+  const store = createEditorStore(project);
+  store.setSelection(["target"]);
+  return store;
+}
+
+describe("deformation actions", () => {
+  it("commits Bevel through a job and supports update, disable, remove and undo", async () => {
+    const store = fixture();
+    expect(await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel })).toMatchObject({ ok: true, committed: true });
+    const id = store.getSnapshot().document.project.modifiers[0]!.id;
+    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: id, parameters: { width: 0.15 } })).toMatchObject({ ok: true, committed: true });
+    expect(await applyDeformChange(store, { type: "enable", targetId: "target", modifierId: id, enabled: false })).toMatchObject({ ok: true, committed: true });
+    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: id })).toMatchObject({ ok: true, committed: true });
+    const revision = store.getSnapshot().document.revision;
+    expect(store.undo(revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.modifiers[0]?.id).toBe(id);
+    expect(store.redo(revision + 1).ok).toBe(true);
+    expect(store.getSnapshot().job.status).not.toBe("running");
+  });
+  it("rolls back failed Bevel geometry and invalid width", async () => {
+    const store = fixture();
+    const before = store.getSnapshot();
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: { width: 2 } })).ok).toBe(false);
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: { width: -1 } })).ok).toBe(false);
+    expect(store.getSnapshot().document).toEqual(before.document);
+    expect(store.getSnapshot().history).toEqual(before.history);
+    expect(store.getSnapshot().job.status).not.toBe("running");
+  });
+  it("commits ordered Bend, Twist, Taper and supports update, toggle, reorder, remove and undo", async () => {
+    const store = fixture();
+    for (const change of [{ type: "add" as const, targetId: "target", kind: "bend" as const, parameters: bend },
+      { type: "add" as const, targetId: "target", kind: "twist" as const, parameters: twist },
+      { type: "add" as const, targetId: "target", kind: "taper" as const, parameters: taper }])
+      expect(await applyDeformChange(store, change)).toMatchObject({ ok: true, committed: true });
+    const [first, second] = store.getSnapshot().document.project.modifiers;
+    expect(store.getSnapshot().document.project.modifiers.map(item => item.kind)).toEqual(["bend", "twist", "taper"]);
+    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: first!.id, parameters: { ...bend, angleDegrees: 60 } })).toMatchObject({ ok: true, committed: true });
+    const before = store.getSnapshot();
+    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: first!.id, parameters: { ...bend, angleDegrees: 60 } })).toMatchObject({ ok: true, committed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(before.history.entries.length);
+    expect(await applyDeformChange(store, { type: "move", targetId: "target", modifierId: first!.id, toIndex: 2 })).toMatchObject({ ok: true, committed: true });
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "target")?.modifierIds[2]).toBe(first!.id);
+    expect(await applyDeformChange(store, { type: "enable", targetId: "target", modifierId: second!.id, enabled: false })).toMatchObject({ ok: true, committed: true });
+    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: first!.id })).toMatchObject({ ok: true, committed: true });
+    const revision = store.getSnapshot().document.revision;
+    expect(store.undo(revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.modifiers.some(item => item.id === first!.id)).toBe(true);
+    expect(store.redo(revision + 1).ok).toBe(true);
+  });
+  it("leaves document and history untouched after failed evaluation", async () => {
+    const store = fixture();
+    const before = store.getSnapshot();
+    const dispose = vi.fn();
+    const factory = () => ({ evaluate: vi.fn(async () => ({ ok: false, error: { code: "GEOMETRY_DEGENERATE", message: "Некорректная сетка." } })), dispose }) as unknown as ModifierEvaluator;
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel }, factory)).ok).toBe(false);
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(store.getSnapshot().document).toEqual(before.document);
+    expect(store.getSnapshot().history).toEqual(before.history);
+  });
+  it("removes the last active deformation without running an evaluator", async () => {
+    const store = fixture();
+    expect(await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend })).toMatchObject({ ok: true });
+    const id = store.getSnapshot().document.project.modifiers[0]!.id;
+    const factory = vi.fn();
+    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: id }, factory)).toMatchObject({ ok: true, committed: true });
+    expect(factory).not.toHaveBeenCalled();
+    expect(store.getSnapshot().document.project.modifiers).toHaveLength(0);
+  });
+  it("blocks an asset-backed mesh without a runtime resolver", async () => {
+    const project = createProject(() => crypto.randomUUID());
+    const root = project.nodes[0]!;
+    const node = createPrimitiveNode("cube", root.id, "target");
+    node.meshSource = { kind: "asset", assetId: "asset" };
+    project.assets.push({ id: "asset", hash: "hash", mediaType: "model/gltf-binary", path: "assets/model.glb", colorSpace: "none" });
+    project.nodes.push(node); root.children.push(node.id);
+    const store = createEditorStore(project); store.setSelection(["target"]);
+    const before = store.getSnapshot();
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend })).ok).toBe(false);
+    expect(store.getSnapshot().document).toEqual(before.document);
+  });
+  it("cancels pending work and ignores late results", async () => {
+    const store = fixture();
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const dispose = vi.fn();
+    const factory = () => ({ evaluate: async () => { await pending; return { ok: true }; }, dispose }) as unknown as ModifierEvaluator;
+    const operation = applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel }, factory);
+    await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("running"));
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "twist", parameters: twist })).ok).toBe(false);
+    expect(store.jobs.cancelJob()).toBe(true);
+    expect(await operation).toMatchObject({ ok: false, status: "cancelled" });
+    release(); await Promise.resolve();
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+});
+</file>
+
 <file path="tests/csg/client.test.ts">
 import { afterEach, expect, it, vi } from "vitest";
 import { CsgClient } from "../../src/spikes/csg/client";
@@ -11400,6 +11402,95 @@ describe("command bus", () => {
     expect(bus.getSnapshot().nodes.find((node) => node.id === "new-leaf")?.name).toBe("Деталь");
     expect(validateProject(bus.getSnapshot())).toEqual([]);
     expect(old.nodes.find((node) => node.id === "new-leaf")).toBeUndefined();
+  });
+});
+</file>
+
+<file path="tests/domain/deform-commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { createCommandBus, type ProjectCommand } from "../../src/domain/command-bus";
+import { createProject } from "../../src/domain/create-project";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import type { BendParameters, TwistParameters, TaperParameters, BevelParameters } from "../../src/geometry/modifiers/types";
+
+const bend = { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } as const;
+const twist = { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] } as const;
+const taper = { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } as const;
+const bevel = { width: 0.1 } as const;
+function fixture() {
+  const project = createProject(() => crypto.randomUUID());
+  const root = project.nodes[0]!;
+  for (const id of ["a", "b"]) { const node = createPrimitiveNode("cube", root.id, id); project.nodes.push(node); root.children.push(id); }
+  return createCommandBus(project);
+}
+const add = (kind: "bend" | "twist" | "taper" | "bevel", id: string, nodeId = "a"): ProjectCommand => {
+  const common = { commandId: crypto.randomUUID(), type: "ADD_DEFORM_MODIFIER" as const, targetIds: [nodeId, id] as [string, string] };
+  if (kind === "bend") return { ...common, payload: { nodeId, modifierId: id, kind, parameters: bend } };
+  if (kind === "twist") return { ...common, payload: { nodeId, modifierId: id, kind, parameters: twist } };
+  if (kind === "taper") return { ...common, payload: { nodeId, modifierId: id, kind, parameters: taper } };
+  return { ...common, payload: { nodeId, modifierId: id, kind, parameters: bevel } };
+};
+const update = (id: string, parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters): ProjectCommand =>
+  ({ commandId: crypto.randomUUID(), type: "UPDATE_DEFORM_MODIFIER", targetIds: [id], payload: { modifierId: id, parameters } });
+
+describe("deformation commands", () => {
+  it("adds Bevel, treats implicit 30° as a no-op, and replays its update", () => {
+    const bus = fixture();
+    expect(bus.executeCommand(add("bevel", "bevel1"), 0)).toMatchObject({ ok: true, changed: true });
+    const revision = bus.getRevision();
+    expect(bus.executeCommand(update("bevel1", { width: 0.1, angleDegrees: 30 }), revision)).toMatchObject({ ok: true, changed: false });
+    expect(bus.getRevision()).toBe(revision);
+    const changed = bus.executeCommand(update("bevel1", { width: 0.2, angleDegrees: 45 }), revision);
+    expect(changed).toMatchObject({ ok: true, changed: true });
+    if (!changed.ok) return;
+    expect(changed.project.modifiers[0]).toMatchObject({ kind: "bevel", nodeId: "a", version: 1, parameters: { width: 0.2, angleDegrees: 45 } });
+    expect(bus.applyHistoryPatch(changed.undoPatch, bus.getRevision())).toMatchObject({ ok: true });
+    expect(bus.getSnapshot().modifiers[0]?.parameters).toEqual(bevel);
+    expect(bus.executeCommand(update("bevel1", bend), bus.getRevision()).ok).toBe(false);
+    expect(bus.executeCommand(add("bevel", "bevel1"), bus.getRevision()).ok).toBe(false);
+  });
+  it("rejects invalid Bevel parameters without changing the document", () => {
+    const bus = fixture();
+    const before = bus.getSnapshot();
+    for (const parameters of [{ width: -1 }, { width: Infinity }, { width: 0.1, angleDegrees: 181 }, { width: "0.1" }]) {
+      const command = { ...add("bevel", "bad"), payload: { nodeId: "a", modifierId: "bad", kind: "bevel", parameters } } as ProjectCommand;
+      expect(bus.executeCommand(command, bus.getRevision()).ok).toBe(false);
+    }
+    expect(bus.getSnapshot()).toEqual(before);
+  });
+  it("adds every kind, updates without changing ID, orders and replays patches", () => {
+    const bus = fixture();
+    for (const [kind, id] of [["bend", "bend1"], ["twist", "twist1"], ["taper", "taper1"]] as const)
+      expect(bus.executeCommand(add(kind, id), bus.getRevision())).toMatchObject({ ok: true, changed: true });
+    expect(bus.getSnapshot().nodes.find(node => node.id === "a")?.modifierIds).toEqual(["bend1", "twist1", "taper1"]);
+    expect(bus.getSnapshot().modifiers.map(item => item.order)).toEqual([0, 1, 2]);
+    const changed = bus.executeCommand(update("bend1", { ...bend, angleDegrees: 60 }), bus.getRevision());
+    expect(changed).toMatchObject({ ok: true, changed: true });
+    if (!changed.ok) return;
+    expect(changed.project.modifiers.find(item => item.id === "bend1")).toMatchObject({ version: 1, parameters: { angleDegrees: 60 } });
+    expect(bus.executeCommand(update("bend1", { ...bend, angleDegrees: 60 }), bus.getRevision())).toMatchObject({ ok: true, changed: false });
+    const undo = bus.applyHistoryPatch(changed.undoPatch, bus.getRevision());
+    expect(undo.ok && undo.project.modifiers.find(item => item.id === "bend1")?.parameters.angleDegrees).toBe(30);
+    if (undo.ok) expect(bus.applyHistoryPatch(changed.patch, undo.revision)).toMatchObject({ ok: true });
+    expect(bus.executeCommand({ commandId: "move", type: "MOVE_MODIFIER", targetIds: ["bend1"], payload: { modifierId: "bend1", toIndex: 2 } }, bus.getRevision())).toMatchObject({ ok: true });
+    expect(bus.getSnapshot().nodes.find(node => node.id === "a")?.modifierIds).toEqual(["twist1", "taper1", "bend1"]);
+  });
+  it("rejects invalid shape, values, references, duplicate ID and inaccessible targets", () => {
+    const bus = fixture();
+    const malformed = { ...add("bend", "bad"), payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: twist } } as ProjectCommand;
+    expect(bus.executeCommand(malformed, 0).ok).toBe(false);
+    expect(bus.executeCommand({ commandId: "wrong-targets", type: "ADD_DEFORM_MODIFIER", targetIds: ["wrong", "bad"], payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: bend } }, 0).ok).toBe(false);
+    expect(bus.executeCommand({ ...add("bend", "bad"), payload: { nodeId: "a", modifierId: "bad", kind: "bend", parameters: { ...bend, angleDegrees: Infinity } } } as ProjectCommand, 0).ok).toBe(false);
+    expect(bus.executeCommand(add("bend", "bad", "missing"), 0).ok).toBe(false);
+    expect(bus.executeCommand(add("bend", "bend1"), 0).ok).toBe(true);
+    expect(bus.executeCommand(add("twist", "bend1"), bus.getRevision()).ok).toBe(false);
+    expect(bus.executeCommand(update("bend1", twist), bus.getRevision()).ok).toBe(false);
+    expect(bus.executeCommand(update("missing", bend), bus.getRevision()).ok).toBe(false);
+    for (const [nodeId, field] of [["a", "locked"], ["b", "visible"]] as const) {
+      expect(bus.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_FLAGS", targetIds: [nodeId], payload: { nodeId, [field]: field === "locked" } }, bus.getRevision()).ok).toBe(true);
+    }
+    expect(bus.executeCommand(update("bend1", { ...bend, angleDegrees: 90 }), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(add("taper", "new", "b"), bus.getRevision())).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
   });
 });
 </file>
@@ -13010,208 +13101,6 @@ describe("domain scene synchronization", () => {
 }
 </file>
 
-<file path="src/ui/BooleanEditor.tsx">
-import { useState } from "react";
-import { applyBooleanChange, booleanOperandReason, type BooleanChange } from "../app/boolean-actions";
-import type { DeepReadonly, EditorStore } from "../app/editor-store";
-import type { MeshNode, Project } from "../domain/types";
-import type { BooleanParameters } from "../geometry/modifiers/types";
-import { accessReason } from "./inspector-logic";
-import { ArrayAdd, ArrayItem } from "./ArrayEditor";
-import { MirrorAdd, MirrorItem } from "./MirrorEditor";
-import { DeformAdd, DeformItem } from "./DeformEditor";
-
-const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
-type Operation = BooleanParameters["operation"];
-
-export function BooleanEditor({ store, project, target, disabled, reason }: { store: EditorStore; project: DeepReadonly<Project>; target: DeepReadonly<MeshNode>; disabled: boolean; reason: string }) {
-  const [operation, setOperation] = useState<Operation>("subtract");
-  const [cutterId, setCutterId] = useState("");
-  const [hideCutter, setHideCutter] = useState(false);
-  const [message, setMessage] = useState("");
-  const cutters = project.nodes.filter((node): node is DeepReadonly<MeshNode> => node.kind === "mesh" && node.id !== target.id);
-  const selectedCutter = cutters.find(node => node.id === cutterId);
-  const targetReason = booleanOperandReason(target) || reason;
-  const cutterReason = selectedCutter ? booleanOperandReason(selectedCutter) : null;
-  const canHide = selectedCutter && selectedCutter.visible && !selectedCutter.locked && !accessReason(project, selectedCutter);
-  const available = cutters.filter(node => !booleanOperandReason(node));
-  async function run(change: BooleanChange) {
-    setMessage("");
-    const outcome = await applyBooleanChange(store, change);
-    setMessage(outcome.ok ? "Boolean применён." : `${outcome.error.code}: ${outcome.error.message}`);
-  }
-  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier !== undefined);
-  return <section aria-label="Модификаторы" className="boolean-editor">
-    <h4>Булевы операции</h4>
-    <p className="panel-hint">Выберите второй замкнутый mesh. Геометрия резака остаётся редактируемой; результат пересчитывается при его перемещении.</p>
-    {targetReason && <p className="primitive-error" role="alert">{targetReason}</p>}
-    <label>Операция<select value={operation} disabled={disabled || !!targetReason} onChange={event => setOperation(event.target.value as Operation)}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-    <label>Режущий объект<select value={cutterId} disabled={disabled || !!targetReason} onChange={event => { setCutterId(event.target.value); setHideCutter(false); }}><option value="">Выберите mesh</option>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
-    {!available.length && <p className="panel-hint">Нет подходящего резака. Добавьте куб, сферу, тор, цилиндр или конус.</p>}
-    {cutterReason && <p className="primitive-error" role="alert">{cutterReason}</p>}
-    <label className="boolean-check"><input type="checkbox" checked={hideCutter} disabled={disabled || !canHide} onChange={event => setHideCutter(event.target.checked)} />Скрыть резак после применения</label>
-    {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
-    <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
-    <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
-    <MirrorAdd store={store} targetId={target.id} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />
-    <DeformAdd store={store} targetId={target.id} disabled={disabled || store.getSnapshot().meshEdit.mode !== "object"} reason={target.meshSource.kind === "asset" ? "Деформации импортированного GLB пока недоступны: нет resolver геометрии." : store.getSnapshot().meshEdit.mode !== "object" ? "Вернитесь к режиму объектов." : reason} />
-    <h4>Стек модификаторов</h4>
-    {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
-    {stack.map((modifier, index) => {
-      if (!modifier) return null;
-      if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
-      if (modifier.kind === "mirror") return <MirrorItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />;
-      if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") return <DeformItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled || store.getSnapshot().meshEdit.mode !== "object"} reason={target.meshSource.kind === "asset" ? "Деформации импортированного GLB пока недоступны: нет resolver геометрии." : store.getSnapshot().meshEdit.mode !== "object" ? "Вернитесь к режиму объектов." : reason} />;
-      if (modifier.kind !== "boolean") return <p key={modifier.id} className="primitive-error" role="alert">{index + 1}. Тип модификатора не поддерживается.</p>;
-      const params = modifier.parameters;
-      const linked = project.nodes.find(node => node.id === params.cutterNodeId);
-      return <div className="boolean-stack-item" key={modifier.id}>
-        <strong>{index + 1}. {operations[params.operation as Operation] ?? "Boolean"} · {linked?.name ?? "Резак не найден"}</strong>
-        <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!targetReason} onChange={event => void run({ type: "enable", targetId: target.id, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
-        <label>Операция<select value={String(params.operation)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: event.target.value as Operation, cutterId: String(params.cutterNodeId) })}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-        <label>Резак<select value={String(params.cutterNodeId)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: params.operation as Operation, cutterId: event.target.value })}>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
-        <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!targetReason || index === 0} aria-label={`Поднять ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!targetReason || index === stack.length - 1} aria-label={`Опустить ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!targetReason} onClick={() => void run({ type: "remove", targetId: target.id, modifierId: modifier.id })}>Удалить</button></div>
-      </div>;
-    })}
-    {message && <p className={message.startsWith("Boolean применён") ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
-    <p className="panel-hint">CSG пересчитывает нормали. UV и группы материалов на поверхности результата не сохраняются; несколько material slots не переносятся по граням.</p>
-  </section>;
-}
-</file>
-
-<file path="tests/domain/serialization.test.ts">
-import { describe, expect, it } from "vitest";
-import {
-  deserializeProjectDocument, migrateProjectDocument, serializeProjectDocument,
-  validateNativeManifest, type NativeManifest,
-} from "../../src/domain";
-import {
-  emptyProject, createNestedMeshProject, createMaterialAnimationProject,
-  createDuplicateIdProject, createInvalidHierarchyProject, createMissingReferenceProject,
-} from "../fixtures/projects";
-
-const clone = <T>(value: T): T => structuredClone(value);
-const jsonOf = (value: unknown) => JSON.stringify(value);
-
-describe("project document schema v1", () => {
-  it.each([emptyProject, createNestedMeshProject(), createMaterialAnimationProject()])("round-trips complete projects", (project) => {
-    const before = clone(project);
-    const serialized = serializeProjectDocument(project);
-    expect(serialized.ok, JSON.stringify(serialized)).toBe(true);
-    if (!serialized.ok) return;
-    expect(serializeProjectDocument(project)).toEqual(serialized);
-    const restored = deserializeProjectDocument(serialized.value);
-    expect(restored).toEqual({ ok: true, value: project });
-    expect(project).toEqual(before);
-    if (restored.ok) expect(restored.value).not.toBe(project);
-  });
-
-  it("keeps modifier ordering, assets, zero, false and optional fields", () => {
-    const project = createMaterialAnimationProject();
-    const mesh = project.nodes.find((node) => node.kind === "mesh");
-    if (!mesh) throw new Error("Missing mesh");
-    project.assets.push({ id: "asset-1", hash: "hash", mediaType: "image/png", path: "assets/x.png", colorSpace: "srgb" });
-    project.scene.background.environmentAssetId = "asset-1";
-    project.modifiers.push(
-      { id: "modifier-1", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 1, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } },
-      { id: "modifier-2", nodeId: mesh.id, kind: "bevel", order: 1, enabled: true, version: 1, parameters: { width: 0 } },
-    );
-    mesh.modifierIds.push("modifier-1", "modifier-2");
-    const result = serializeProjectDocument(project);
-    expect(result.ok, JSON.stringify(result)).toBe(true);
-    if (result.ok) expect(deserializeProjectDocument(result.value)).toEqual({ ok: true, value: project });
-  });
-  it("round-trips deformation stacks and rejects invalid disabled parameters", () => {
-    const project = createMaterialAnimationProject();
-    const mesh = project.nodes.find(node => node.kind === "mesh");
-    if (!mesh) throw new Error("Missing mesh");
-    const params = [
-      { axis: "x", direction: "y", angleDegrees: 20, pivot: [0, 0, 0] },
-      { axis: "z", angleDegrees: -30, pivot: [1, 0, 0] },
-      { axis: "y", startScale: 0.5, endScale: 2, pivot: [0, 1, 0] },
-    ];
-    for (const [order, kind] of (["bend", "twist", "taper"] as const).entries()) {
-      const id = `deform-${order}`;
-      project.modifiers.push({ id, nodeId: mesh.id, kind, order, version: order + 1, enabled: order !== 1, parameters: params[order]! });
-      mesh.modifierIds.push(id);
-    }
-    const saved = serializeProjectDocument(project);
-    expect(saved.ok).toBe(true);
-    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toEqual({ ok: true, value: project });
-    project.modifiers[1]!.parameters.angleDegrees = Infinity;
-    expect(serializeProjectDocument(project).ok).toBe(false);
-  });
-
-  it.each([
-    ["bad JSON", "{"],
-    ["missing version", jsonOf({ ...emptyProject, schemaVersion: undefined })],
-    ["extra property", jsonOf({ ...emptyProject, unexpected: true })],
-    ["bad enum", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, projection: "orthographic" } } })],
-    ["bad vector", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, position: [1, 2] } } })],
-    ["bad quaternion", jsonOf({ ...emptyProject, nodes: [{ ...emptyProject.nodes[0], transform: { ...emptyProject.nodes[0]?.transform, rotationQuat: [0, 0, 1] } }] })],
-    ["bad number", jsonOf({ ...emptyProject, model: { ...emptyProject.model, revision: -1 } })],
-  ])("rejects %s", (_name, input) => {
-    const result = deserializeProjectDocument(input);
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
-  });
-
-  it.each(["2.0.0", "1.2.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
-    const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
-  });
-
-  it.each([createDuplicateIdProject(), createInvalidHierarchyProject(), createMissingReferenceProject()])("rejects broken domain links", (project) => {
-    const result = deserializeProjectDocument(jsonOf(project));
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
-  });
-
-  it("rejects nonfinite numbers without mutating input", () => {
-    const project = clone(emptyProject);
-    project.scene.camera.fovDegrees = Number.POSITIVE_INFINITY;
-    const result = serializeProjectDocument(project);
-    expect(result.ok).toBe(false);
-    expect(project.scene.camera.fovDegrees).toBe(Number.POSITIVE_INFINITY);
-  });
-
-  it("enforces input size and nesting limits", () => {
-    expect(deserializeProjectDocument(" ".repeat(17 * 1024 * 1024)).ok).toBe(false);
-    const deep = `${"[".repeat(70)}0${"]".repeat(70)}`;
-    expect(deserializeProjectDocument(deep).ok).toBe(false);
-  });
-
-  it("provides pure migration chaining through the built-in v1 migration", () => {
-    const old = { ...emptyProject, schemaVersion: "0.9.0" };
-    const before = clone(old);
-    const migration = { from: "0.9.0", to: "1.0.0", migrate: (input: unknown) => ({ ...(input as object), schemaVersion: "1.0.0" }) };
-    expect(migrateProjectDocument(old, [migration])).toEqual({ ok: true, value: emptyProject });
-    expect(old).toEqual(before);
-    expect(deserializeProjectDocument(jsonOf(old), [migration])).toEqual({ ok: true, value: emptyProject });
-  });
-});
-
-describe("native manifest v1", () => {
-  const sha256 = "a".repeat(64);
-  const manifest: NativeManifest = {
-    formatVersion: "1.0.0", appVersion: "0.1.0", document: { path: "document.json", sha256 },
-    assets: [{ id: "asset-1", path: "assets/image.png", sha256 }],
-  };
-
-  it("accepts the contract", () => expect(validateNativeManifest(manifest)).toEqual({ ok: true, value: manifest }));
-  it.each(["../image.png", "/assets/image.png", "assets\\image.png", "assets/%2e%2e/x", "C:/x", "assets//x", "assets/./x"])('rejects unsafe path %s', (path) => {
-    const candidate = clone(manifest);
-    candidate.assets[0]!.path = path;
-    expect(validateNativeManifest(candidate).ok).toBe(false);
-  });
-  it("rejects duplicate paths and invalid digests", () => {
-    expect(validateNativeManifest({ ...manifest, assets: [...manifest.assets, { id: "other", path: "ASSETS/IMAGE.PNG", sha256 }] }).ok).toBe(false);
-    expect(validateNativeManifest({ ...manifest, document: { ...manifest.document, sha256: "bad" } }).ok).toBe(false);
-  });
-});
-</file>
-
 <file path="src/geometry/modifiers/index.ts">
 export { ModifierEvaluator } from "./evaluator";
 export { evaluateBevel, parseBevelParameters } from "./bevel";
@@ -13739,6 +13628,75 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
 }
 </file>
 
+<file path="src/ui/BooleanEditor.tsx">
+import { useState } from "react";
+import { applyBooleanChange, booleanOperandReason, type BooleanChange } from "../app/boolean-actions";
+import type { DeepReadonly, EditorStore } from "../app/editor-store";
+import type { MeshNode, Project } from "../domain/types";
+import type { BooleanParameters } from "../geometry/modifiers/types";
+import { accessReason } from "./inspector-logic";
+import { ArrayAdd, ArrayItem } from "./ArrayEditor";
+import { MirrorAdd, MirrorItem } from "./MirrorEditor";
+import { DeformAdd, DeformItem } from "./DeformEditor";
+
+const operations = { subtract: "Вычитание", union: "Объединение", intersect: "Пересечение" } as const;
+type Operation = BooleanParameters["operation"];
+
+export function BooleanEditor({ store, project, target, disabled, reason }: { store: EditorStore; project: DeepReadonly<Project>; target: DeepReadonly<MeshNode>; disabled: boolean; reason: string }) {
+  const [operation, setOperation] = useState<Operation>("subtract");
+  const [cutterId, setCutterId] = useState("");
+  const [hideCutter, setHideCutter] = useState(false);
+  const [message, setMessage] = useState("");
+  const cutters = project.nodes.filter((node): node is DeepReadonly<MeshNode> => node.kind === "mesh" && node.id !== target.id);
+  const selectedCutter = cutters.find(node => node.id === cutterId);
+  const targetReason = booleanOperandReason(target) || reason;
+  const cutterReason = selectedCutter ? booleanOperandReason(selectedCutter) : null;
+  const canHide = selectedCutter && selectedCutter.visible && !selectedCutter.locked && !accessReason(project, selectedCutter);
+  const available = cutters.filter(node => !booleanOperandReason(node));
+  async function run(change: BooleanChange) {
+    setMessage("");
+    const outcome = await applyBooleanChange(store, change);
+    setMessage(outcome.ok ? "Boolean применён." : `${outcome.error.code}: ${outcome.error.message}`);
+  }
+  const stack = target.modifierIds.map(id => project.modifiers.find(modifier => modifier.id === id)).filter(modifier => modifier !== undefined);
+  return <section aria-label="Модификаторы" className="boolean-editor">
+    <h4>Булевы операции</h4>
+    <p className="panel-hint">Выберите второй замкнутый mesh. Геометрия резака остаётся редактируемой; результат пересчитывается при его перемещении.</p>
+    {targetReason && <p className="primitive-error" role="alert">{targetReason}</p>}
+    <label>Операция<select value={operation} disabled={disabled || !!targetReason} onChange={event => setOperation(event.target.value as Operation)}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+    <label>Режущий объект<select value={cutterId} disabled={disabled || !!targetReason} onChange={event => { setCutterId(event.target.value); setHideCutter(false); }}><option value="">Выберите mesh</option>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
+    {!available.length && <p className="panel-hint">Нет подходящего резака. Добавьте куб, сферу, тор, цилиндр или конус.</p>}
+    {cutterReason && <p className="primitive-error" role="alert">{cutterReason}</p>}
+    <label className="boolean-check"><input type="checkbox" checked={hideCutter} disabled={disabled || !canHide} onChange={event => setHideCutter(event.target.checked)} />Скрыть резак после применения</label>
+    {selectedCutter && !canHide && <p className="panel-hint">Скрытие недоступно для заблокированного или уже скрытого резака.</p>}
+    <button type="button" disabled={disabled || !!targetReason || !selectedCutter || !!cutterReason} onClick={() => void run({ type: "add", targetId: target.id, cutterId, operation, hideCutter })}>Применить Boolean</button>
+    <ArrayAdd store={store} targetId={target.id} disabled={disabled} reason={reason} />
+    <MirrorAdd store={store} targetId={target.id} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />
+    <DeformAdd store={store} targetId={target.id} disabled={disabled || store.getSnapshot().meshEdit.mode !== "object"} reason={target.meshSource.kind === "asset" ? "Деформации импортированного GLB пока недоступны: нет resolver геометрии." : store.getSnapshot().meshEdit.mode !== "object" ? "Вернитесь к режиму объектов." : reason} />
+    <h4>Стек модификаторов</h4>
+    {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
+    {stack.map((modifier, index) => {
+      if (!modifier) return null;
+      if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
+      if (modifier.kind === "mirror") return <MirrorItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />;
+      if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper" || modifier.kind === "bevel") return <DeformItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled || store.getSnapshot().meshEdit.mode !== "object"} reason={target.meshSource.kind === "asset" ? "Деформации импортированного GLB пока недоступны: нет resolver геометрии." : store.getSnapshot().meshEdit.mode !== "object" ? "Вернитесь к режиму объектов." : reason} />;
+      if (modifier.kind !== "boolean") return <p key={modifier.id} className="primitive-error" role="alert">{index + 1}. Тип модификатора не поддерживается.</p>;
+      const params = modifier.parameters;
+      const linked = project.nodes.find(node => node.id === params.cutterNodeId);
+      return <div className="boolean-stack-item" key={modifier.id}>
+        <strong>{index + 1}. {operations[params.operation as Operation] ?? "Boolean"} · {linked?.name ?? "Резак не найден"}</strong>
+        <label className="boolean-check"><input type="checkbox" checked={modifier.enabled} disabled={disabled || !!targetReason} onChange={event => void run({ type: "enable", targetId: target.id, modifierId: modifier.id, enabled: event.target.checked })} />Включён</label>
+        <label>Операция<select value={String(params.operation)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: event.target.value as Operation, cutterId: String(params.cutterNodeId) })}>{Object.entries(operations).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label>Резак<select value={String(params.cutterNodeId)} disabled={disabled || !!targetReason} onChange={event => void run({ type: "update", targetId: target.id, modifierId: modifier.id, operation: params.operation as Operation, cutterId: event.target.value })}>{cutters.map(node => <option key={node.id} value={node.id} disabled={!!booleanOperandReason(node)}>{node.name}{booleanOperandReason(node) ? ` — ${booleanOperandReason(node)}` : ""}</option>)}</select></label>
+        <div className="boolean-stack-actions"><button type="button" disabled={disabled || !!targetReason || index === 0} aria-label={`Поднять ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index - 1 })}>↑ Выше</button><button type="button" disabled={disabled || !!targetReason || index === stack.length - 1} aria-label={`Опустить ${modifier.id}`} onClick={() => void run({ type: "move", targetId: target.id, modifierId: modifier.id, toIndex: index + 1 })}>↓ Ниже</button><button type="button" disabled={disabled || !!targetReason} onClick={() => void run({ type: "remove", targetId: target.id, modifierId: modifier.id })}>Удалить</button></div>
+      </div>;
+    })}
+    {message && <p className={message.startsWith("Boolean применён") ? "panel-hint" : "primitive-error"} role="status">{message}</p>}
+    <p className="panel-hint">CSG пересчитывает нормали. UV и группы материалов на поверхности результата не сохраняются; несколько material slots не переносятся по граням.</p>
+  </section>;
+}
+</file>
+
 <file path="tests/app/editor-store.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import { applyProjectPatch, createProject } from "../../src/domain";
@@ -14005,6 +13963,140 @@ describe("editor store", () => {
     expect(store.undo(1).ok).toBe(true);
     expect(store.getSnapshot().document.project.nodes.some(node => node.id === "mesh-node")).toBe(true);
     expect(store.getSnapshot().document.dirty).toBe(false);
+  });
+});
+</file>
+
+<file path="tests/domain/serialization.test.ts">
+import { describe, expect, it } from "vitest";
+import {
+  deserializeProjectDocument, migrateProjectDocument, serializeProjectDocument,
+  validateNativeManifest, type NativeManifest,
+} from "../../src/domain";
+import {
+  emptyProject, createNestedMeshProject, createMaterialAnimationProject,
+  createDuplicateIdProject, createInvalidHierarchyProject, createMissingReferenceProject,
+} from "../fixtures/projects";
+
+const clone = <T>(value: T): T => structuredClone(value);
+const jsonOf = (value: unknown) => JSON.stringify(value);
+
+describe("project document schema v1", () => {
+  it.each([emptyProject, createNestedMeshProject(), createMaterialAnimationProject()])("round-trips complete projects", (project) => {
+    const before = clone(project);
+    const serialized = serializeProjectDocument(project);
+    expect(serialized.ok, JSON.stringify(serialized)).toBe(true);
+    if (!serialized.ok) return;
+    expect(serializeProjectDocument(project)).toEqual(serialized);
+    const restored = deserializeProjectDocument(serialized.value);
+    expect(restored).toEqual({ ok: true, value: project });
+    expect(project).toEqual(before);
+    if (restored.ok) expect(restored.value).not.toBe(project);
+  });
+
+  it("keeps modifier ordering, assets, zero, false and optional fields", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find((node) => node.kind === "mesh");
+    if (!mesh) throw new Error("Missing mesh");
+    project.assets.push({ id: "asset-1", hash: "hash", mediaType: "image/png", path: "assets/x.png", colorSpace: "srgb" });
+    project.scene.background.environmentAssetId = "asset-1";
+    project.modifiers.push(
+      { id: "modifier-1", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 1, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } },
+      { id: "modifier-2", nodeId: mesh.id, kind: "bevel", order: 1, enabled: true, version: 1, parameters: { width: 0 } },
+    );
+    mesh.modifierIds.push("modifier-1", "modifier-2");
+    const result = serializeProjectDocument(project);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    if (result.ok) expect(deserializeProjectDocument(result.value)).toEqual({ ok: true, value: project });
+  });
+  it("round-trips deformation stacks and rejects invalid disabled parameters", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.kind === "mesh");
+    if (!mesh) throw new Error("Missing mesh");
+    const params = [
+      { axis: "x", direction: "y", angleDegrees: 20, pivot: [0, 0, 0] },
+      { axis: "z", angleDegrees: -30, pivot: [1, 0, 0] },
+      { axis: "y", startScale: 0.5, endScale: 2, pivot: [0, 1, 0] },
+      { width: 0.1 },
+    ];
+    for (const [order, kind] of (["bend", "twist", "taper", "bevel"] as const).entries()) {
+      const id = `deform-${order}`;
+      project.modifiers.push({ id, nodeId: mesh.id, kind, order, version: order + 1, enabled: order !== 1, parameters: params[order]! });
+      mesh.modifierIds.push(id);
+    }
+    const saved = serializeProjectDocument(project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toEqual({ ok: true, value: project });
+    project.modifiers[1]!.parameters.angleDegrees = Infinity;
+    expect(serializeProjectDocument(project).ok).toBe(false);
+  });
+
+  it.each([
+    ["bad JSON", "{"],
+    ["missing version", jsonOf({ ...emptyProject, schemaVersion: undefined })],
+    ["extra property", jsonOf({ ...emptyProject, unexpected: true })],
+    ["bad enum", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, projection: "orthographic" } } })],
+    ["bad vector", jsonOf({ ...emptyProject, scene: { ...emptyProject.scene, camera: { ...emptyProject.scene.camera, position: [1, 2] } } })],
+    ["bad quaternion", jsonOf({ ...emptyProject, nodes: [{ ...emptyProject.nodes[0], transform: { ...emptyProject.nodes[0]?.transform, rotationQuat: [0, 0, 1] } }] })],
+    ["bad number", jsonOf({ ...emptyProject, model: { ...emptyProject.model, revision: -1 } })],
+  ])("rejects %s", (_name, input) => {
+    const result = deserializeProjectDocument(input);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
+  });
+
+  it.each(["2.0.0", "1.2.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+    const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
+  });
+
+  it.each([createDuplicateIdProject(), createInvalidHierarchyProject(), createMissingReferenceProject()])("rejects broken domain links", (project) => {
+    const result = deserializeProjectDocument(jsonOf(project));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
+  });
+
+  it("rejects nonfinite numbers without mutating input", () => {
+    const project = clone(emptyProject);
+    project.scene.camera.fovDegrees = Number.POSITIVE_INFINITY;
+    const result = serializeProjectDocument(project);
+    expect(result.ok).toBe(false);
+    expect(project.scene.camera.fovDegrees).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("enforces input size and nesting limits", () => {
+    expect(deserializeProjectDocument(" ".repeat(17 * 1024 * 1024)).ok).toBe(false);
+    const deep = `${"[".repeat(70)}0${"]".repeat(70)}`;
+    expect(deserializeProjectDocument(deep).ok).toBe(false);
+  });
+
+  it("provides pure migration chaining through the built-in v1 migration", () => {
+    const old = { ...emptyProject, schemaVersion: "0.9.0" };
+    const before = clone(old);
+    const migration = { from: "0.9.0", to: "1.0.0", migrate: (input: unknown) => ({ ...(input as object), schemaVersion: "1.0.0" }) };
+    expect(migrateProjectDocument(old, [migration])).toEqual({ ok: true, value: emptyProject });
+    expect(old).toEqual(before);
+    expect(deserializeProjectDocument(jsonOf(old), [migration])).toEqual({ ok: true, value: emptyProject });
+  });
+});
+
+describe("native manifest v1", () => {
+  const sha256 = "a".repeat(64);
+  const manifest: NativeManifest = {
+    formatVersion: "1.0.0", appVersion: "0.1.0", document: { path: "document.json", sha256 },
+    assets: [{ id: "asset-1", path: "assets/image.png", sha256 }],
+  };
+
+  it("accepts the contract", () => expect(validateNativeManifest(manifest)).toEqual({ ok: true, value: manifest }));
+  it.each(["../image.png", "/assets/image.png", "assets\\image.png", "assets/%2e%2e/x", "C:/x", "assets//x", "assets/./x"])('rejects unsafe path %s', (path) => {
+    const candidate = clone(manifest);
+    candidate.assets[0]!.path = path;
+    expect(validateNativeManifest(candidate).ok).toBe(false);
+  });
+  it("rejects duplicate paths and invalid digests", () => {
+    expect(validateNativeManifest({ ...manifest, assets: [...manifest.assets, { id: "other", path: "ASSETS/IMAGE.PNG", sha256 }] }).ok).toBe(false);
+    expect(validateNativeManifest({ ...manifest, document: { ...manifest.document, sha256: "bad" } }).ok).toBe(false);
   });
 });
 </file>
@@ -15929,12 +16021,13 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
-import type { BendParameters, TwistParameters, TaperParameters } from "../geometry/modifiers/types";
+import { parseBevelParameters } from "../geometry/modifiers/bevel";
+import type { BendParameters, TwistParameters, TaperParameters, BevelParameters } from "../geometry/modifiers/types";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
-type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters };
+type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
   | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
@@ -15957,7 +16050,7 @@ export type ProjectCommand =
   | { commandId: string; type: "ADD_MIRROR_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "UPDATE_MIRROR_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "ADD_DEFORM_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId } & DeformPayload }
-  | { commandId: string; type: "UPDATE_DEFORM_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: BendParameters | TwistParameters | TaperParameters } }
+  | { commandId: string; type: "UPDATE_DEFORM_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters } }
   | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
   | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
   | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
@@ -16008,10 +16101,11 @@ const idList = (value: unknown): value is string[] => Array.isArray(value) && va
 const numbers = (value: unknown, count: number): value is number[] =>
   Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
-function parseDeform(kind: unknown, parameters: unknown): BendParameters | TwistParameters | TaperParameters {
+function parseDeform(kind: unknown, parameters: unknown): BendParameters | TwistParameters | TaperParameters | BevelParameters {
   if (kind === "bend") return parseBendParameters(parameters);
   if (kind === "twist") return parseTwistParameters(parameters);
   if (kind === "taper") return parseTaperParameters(parameters);
+  if (kind === "bevel") return parseBevelParameters(parameters);
   throw new Error("Неизвестный вид деформации.");
 }
 const samePrimitive = (left: PrimitiveSource, right: PrimitiveSource): boolean => left.primitive === right.primitive
@@ -16347,12 +16441,13 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
         modifier.parameters = structuredClone(parameters);
       }
     } else if (command.type === "UPDATE_DEFORM_MODIFIER") {
-      if (modifier.kind !== "bend" && modifier.kind !== "twist" && modifier.kind !== "taper")
+      if (modifier.kind !== "bend" && modifier.kind !== "twist" && modifier.kind !== "taper" && modifier.kind !== "bevel")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является деформацией.");
-      let parameters: BendParameters | TwistParameters | TaperParameters;
+      let parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters;
       try { parameters = parseDeform(modifier.kind, command.payload.parameters); }
       catch { return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Параметры деформации недопустимы."); }
-      if (!same(parseDeform(modifier.kind, modifier.parameters), parameters)) {
+      const effective = (value: typeof parameters) => modifier.kind === "bevel" ? { ...value, angleDegrees: "angleDegrees" in value ? value.angleDegrees : 30 } : value;
+      if (!same(effective(parseDeform(modifier.kind, modifier.parameters)), effective(parameters))) {
         if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
         modifier.parameters = structuredClone(parameters);
       }
@@ -17096,6 +17191,12 @@ function EditorShell() {
 - Односегментный плоский Bevel срезает выбранные острые рёбра выпуклого замкнутого ориентированного solid последовательными локальными плоскостями через установленный Manifold. Смежность определяется после объединения совпадающих render-вершин; копланарные диагонали не режутся. Нулевая ширина сохраняет историческую identity-семантику.
 - Строгие `width` и необязательный `angleDegrees` (по умолчанию 30°) проверяются также для выключенного модификатора. `ModifierEvaluator` сохраняет порядок, кеш, fallback, отмену между синхронными WASM-срезами и предупреждения о потерянных атрибутах. Исходный Project и буферы не меняются; схема документа остаётся 1.1.0.
 - Поддержка консервативна: до 4096 входных треугольников и 256 срезов, ширина меньше половины кратчайшего геометрического ребра; невыпуклые, открытые и непригодные сетки отклоняются. Буферы ограничены 64 MiB, но пик внутренней памяти WASM отдельно не профилирован. Отмена не прерывает уже начавшийся синхронный вызов WASM. UV, авторские нормали и группы материалов после реального среза не переносятся. Команды/Inspector для Bevel и произвольные невыпуклые сетки остаются для следующих этапов; TASK-025 остаётся частичным.
+
+## CODEX-025D — Интеграция Bevel (завершение TASK-025)
+
+- Bevel добавляется и редактируется через существующие команды и транзакционный action-layer. Общий стек поддерживает enabled, reorder, remove, Undo/Redo; эффективные 30° при отсутствующем `angleDegrees` не создают лишней истории.
+- Inspector показывает поля ширины и порога, ограничения алгоритма и диагностические ошибки. Исходный meshSource остаётся без изменений; архив 1.1.0 сохраняет ID, порядок, version, enabled и параметры без изменения схемы.
+- `typecheck`, `lint`, `build`, целевые и полные Vitest прошли (41 файл, 298 тестов). Ручной browser smoke: UNVERIFIED. Ограничения геометрического ядра и прерывания WASM из CODEX-025C сохраняются. TASK-025 реализован.
 </file>
 
 </files>

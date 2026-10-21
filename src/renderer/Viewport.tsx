@@ -3,7 +3,8 @@ import type { EditorStore } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
 import type { SceneStatus } from "./scene-sync";
-import { ViewportInteractions, editable } from "./viewport-interactions";
+import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
+import { brushParameters } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
 
 export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
@@ -11,6 +12,10 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   const interactions = useRef<ViewportInteractions | null>(null);
   const state = useEditorStore(store);
   const [snap, setSnap] = useState(false);
+  const [radiusText, setRadiusText] = useState("0.35");
+  const [strengthText, setStrengthText] = useState("0.06");
+  const brushRadius = Number(radiusText), brushStrength = Number(strengthText);
+  const validBrush = radiusText.trim() !== "" && strengthText.trim() !== "" && brushParameters(brushRadius, brushStrength);
   const blockedRef = useRef(blocked);
   const snapRef = useRef(snap);
   blockedRef.current = blocked;
@@ -44,6 +49,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
       const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
       controller.setSnap(snapRef.current);
       interactions.current = controller;
+      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength);
       adapter.setFrameHook(() => controller.frame());
     });
     sync();
@@ -53,9 +59,11 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   }, [store, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
+  useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength); }, [validBrush, brushRadius, brushStrength]);
   const canTransform = editable(state, state.selection.activeId, blocked);
   const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
+  const brushReason = brushUnavailable(state, blocked);
   return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
     <div className="renderer-toolbar">
       <div className="viewport-tools" role="group" aria-label="Режим выбора">
@@ -69,6 +77,16 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
         {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
           <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
             disabled={subMode || tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
+      </div>
+      <div className="viewport-tools" role="group" aria-label="Кисть рельефа">
+        <button type="button" aria-pressed={state.tool.active === "displace"} disabled={!!brushReason || !validBrush}
+          title={brushReason ?? "Смещение вершин вдоль нормалей"} onClick={() => store.setTool({ active: "displace" })}>Кисть: рельеф</button>
+        {state.tool.active === "displace" && <span className="brush-settings">
+          <label>Радиус <input type="number" min="0.01" max="10" step="0.01" value={radiusText} onChange={event => setRadiusText(event.target.value)} /></label>
+          <label>Сила <input type="number" min="-0.5" max="0.5" step="0.01" value={strengthText} onChange={event => setStrengthText(event.target.value)} /></label>
+          <span>Положительная сила — выступ, отрицательная — углубление.</span>
+          {!validBrush && <span role="alert">Радиус: 0,01–10; сила: −0,5…0,5.</span>}
+        </span>}
       </div>
       <div className="viewport-tools" role="group" aria-label="Пространство координат">
         <button type="button" aria-pressed={state.tool.space === "local"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "local" })}>Локально</button>
@@ -86,7 +104,8 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
     <div className="renderer-host" ref={host} />
     <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
       <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
-      {!subMode && state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
+      {state.tool.active === "displace" && brushReason && <span>{brushReason}</span>}
+      {!subMode && state.tool.active !== "select" && state.tool.active !== "displace" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
       {subMode && <span>Выбор элементов: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
       {interactionError && <span role="alert">{interactionError}</span>}
       {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
