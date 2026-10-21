@@ -3,6 +3,7 @@ import { validatePrimitiveSource } from "../geometry/primitives";
 import { validateEditableSource } from "../geometry/mesh-edit";
 import { parseArrayParameters } from "../geometry/modifiers/array";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
+import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -174,6 +175,13 @@ export function validateProject(project: Project): ValidationIssue[] {
     if (modifier.kind === "mirror") {
       try { parseMirrorParameters(modifier.parameters); }
       catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Mirror." }); }
+    }
+    if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") {
+      try {
+        if (modifier.kind === "bend") parseBendParameters(modifier.parameters);
+        else if (modifier.kind === "twist") parseTwistParameters(modifier.parameters);
+        else parseTaperParameters(modifier.parameters);
+      } catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректная деформация." }); }
     }
     if (modifier.kind === "boolean") {
       const params = modifier.parameters;

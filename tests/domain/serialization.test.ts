@@ -39,6 +39,26 @@ describe("project document schema v1", () => {
     expect(result.ok, JSON.stringify(result)).toBe(true);
     if (result.ok) expect(deserializeProjectDocument(result.value)).toEqual({ ok: true, value: project });
   });
+  it("round-trips deformation stacks and rejects invalid disabled parameters", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.kind === "mesh");
+    if (!mesh) throw new Error("Missing mesh");
+    const params = [
+      { axis: "x", direction: "y", angleDegrees: 20, pivot: [0, 0, 0] },
+      { axis: "z", angleDegrees: -30, pivot: [1, 0, 0] },
+      { axis: "y", startScale: 0.5, endScale: 2, pivot: [0, 1, 0] },
+    ];
+    for (const [order, kind] of (["bend", "twist", "taper"] as const).entries()) {
+      const id = `deform-${order}`;
+      project.modifiers.push({ id, nodeId: mesh.id, kind, order, version: order + 1, enabled: order !== 1, parameters: params[order]! });
+      mesh.modifierIds.push(id);
+    }
+    const saved = serializeProjectDocument(project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toEqual({ ok: true, value: project });
+    project.modifiers[1]!.parameters.angleDegrees = Infinity;
+    expect(serializeProjectDocument(project).ok).toBe(false);
+  });
 
   it.each([
     ["bad JSON", "{"],

@@ -68,8 +68,6 @@ export class ModifierPreview {
     if (outcome.ok && result?.ok) {
       const messages = result.warnings.map(warning => warning.message);
       if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
-      if ((project.nodes.find(node => node.id === nodeId)?.materialSlots.length ?? 0) > 1)
-        messages.push("Назначения нескольких материалов после Boolean не сохраняются.");
       this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
     } else if (!outcome.ok) {
       const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;

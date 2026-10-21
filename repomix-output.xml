@@ -185,6 +185,8 @@ tests/
   geometry/
     array.test.ts
     mesh-edit.test.ts
+    mesh-extrude-integration.test.ts
+    mesh-extrude.test.ts
     mesh-topology.test.ts
     mirror.test.ts
     modifier-evaluator.test.ts
@@ -7879,6 +7881,189 @@ describe("regular arrays", () => {
 });
 </file>
 
+<file path="tests/geometry/mesh-extrude-integration.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createCommandBus } from "../../src/domain/command-bus";
+import { deserializeProjectDocument, serializeProjectDocument } from "../../src/domain/project-serialization";
+import type { MeshNode, Project } from "../../src/domain/types";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import { createNestedMeshProject } from "../fixtures/projects";
+import { SceneSync } from "../../src/renderer/scene-sync";
+
+function setup() {
+  const store = createEditorStore(createNestedMeshProject());
+  store.setSelection(["mesh-node"]);
+  const convert = store.executeCommand({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0);
+  if (!convert.ok) throw new Error(convert.message);
+  const source = (store.getSnapshot().document.project.nodes.find(n => n.id === "mesh-node") as MeshNode).meshSource;
+  if (source.kind !== "editable") throw new Error("fixture");
+  const faceId = buildMeshTopology(source)!.faces[0]!.id;
+  const command = (distance: number, id = "extrude") => ({ commandId: id, type: "EXTRUDE_EDITABLE_FACE" as const,
+    targetIds: ["mesh-node"] as [string], payload: { nodeId: "mesh-node", faceId, distance } });
+  return { store, source, faceId, command };
+}
+
+describe("face extrude transaction", () => {
+  it("updates the domain and renderer in one history step, clears stale face IDs, undo/redo and archive round trip", async () => {
+    const { store, source, faceId, command } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode("face", 1, epoch)).toBeNull();
+    expect(store.setSubElementSelection([faceId], 1, epoch)).toBe(true);
+    const sync = new SceneSync(() => {});
+    sync.sync(store.getSnapshot().document.project, () => undefined, {});
+    const previous = (sync.objects.get("mesh-node")!.content as T.Mesh).geometry;
+    const dispose = vi.spyOn(previous, "dispose");
+    const before = store.getSnapshot();
+    expect(store.executeCommand(command(0), 1)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot()).toBe(before);
+    const extruded = store.executeCommand(command(0.25), 1);
+    expect(extruded.ok && extruded.changed).toBe(true);
+    if (!extruded.ok) return;
+    expect(extruded.project.model.revision).toBe(before.document.project.model.revision + 1);
+    expect(extruded.project.model.id).toBe(before.document.project.model.id);
+    expect(extruded.project.scene.id).toBe(before.document.project.scene.id);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.getSnapshot().meshEdit).toMatchObject({ mode: "face", faceIds: [] });
+    const edited = (extruded.project.nodes.find(n => n.id === "mesh-node") as MeshNode).meshSource;
+    expect(edited.kind).toBe("editable");
+    expect(edited).not.toEqual(source);
+    sync.sync(extruded.project, () => undefined, {});
+    expect(dispose).toHaveBeenCalledOnce();
+    expect((sync.objects.get("mesh-node")!.content as T.Mesh).geometry.getAttribute("position").count).toBe(edited.kind === "editable" ? edited.positions.length / 3 : 0);
+    const json = serializeProjectDocument(extruded.project);
+    expect(json.ok).toBe(true);
+    if (json.ok) expect(deserializeProjectDocument(json.value)).toEqual({ ok: true, value: extruded.project });
+    const archive = await createNativeProjectArchive(extruded.project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok && opened.value.project).toEqual(extruded.project);
+    }
+    expect(store.undo(2).ok).toBe(true);
+    expect((store.getSnapshot().document.project.nodes.find(n => n.id === "mesh-node") as MeshNode).meshSource).toEqual(source);
+    expect(store.redo(3).ok).toBe(true);
+    expect((store.getSnapshot().document.project.nodes.find(n => n.id === "mesh-node") as MeshNode).meshSource).toEqual(edited);
+    sync.dispose();
+  });
+
+  it("rejects stale, invalid, locked, hidden and modified edits without publishing state", () => {
+    const { store, command } = setup();
+    const before = store.getSnapshot();
+    for (const edit of [command(-1), command(NaN), { ...command(0.25), payload: { ...command(0.25).payload, faceId: 999 } }]) {
+      expect(store.executeCommand(edit, 1).ok).toBe(false);
+      expect(store.getSnapshot()).toBe(before);
+    }
+    expect(store.executeCommand(command(0.25), 0).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    for (const field of ["locked", "visible"] as const) {
+      const project = structuredClone(before.document.project) as Project;
+      project.nodes.find(n => n.id === "nested-group")![field] = field === "locked";
+      const bus = createCommandBus(project);
+      expect(bus.executeCommand(command(0.25), 0).ok).toBe(false);
+    }
+    const modified = structuredClone(before.document.project) as Project;
+    const mesh = modified.nodes.find(n => n.id === "mesh-node") as MeshNode;
+    mesh.modifierIds.push("mirror");
+    modified.modifiers.push({ id: "mirror", nodeId: mesh.id, kind: "mirror", order: 0, enabled: true, version: 0,
+      parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
+    expect(createCommandBus(modified).executeCommand(command(0.25), 0).ok).toBe(false);
+    const dependent = structuredClone(before.document.project) as Project;
+    const root = dependent.nodes.find(n => n.id === dependent.model.rootNodeId)!;
+    const target = createPrimitiveNode("cube", root.id, "target");
+    target.modifierIds.push("boolean");
+    root.children.push(target.id); dependent.nodes.push(target);
+    dependent.modifiers.push({ id: "boolean", nodeId: target.id, kind: "boolean", order: 0, enabled: true, version: 0,
+      parameters: { operation: "subtract", cutterNodeId: "mesh-node" } });
+    expect(createCommandBus(dependent).executeCommand(command(0.25), 0).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+  });
+});
+</file>
+
+<file path="tests/geometry/mesh-extrude.test.ts">
+import { describe, expect, it } from "vitest";
+import { convertPrimitiveToEditable, extrudeEditableFace, validateEditableSource } from "../../src/geometry/mesh-edit";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { createNestedMeshProject } from "../fixtures/projects";
+import { Vector3 } from "three";
+
+const cube = () => {
+  const node = createNestedMeshProject().nodes.find(item => item.id === "mesh-node");
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "primitive") throw new Error("fixture");
+  return convertPrimitiveToEditable(node.meshSource);
+};
+
+function orientedEdgeCounts(source: ReturnType<typeof cube>) {
+  const points = new Map<string, number>();
+  const canonical = Array.from({ length: source.positions.length / 3 }, (_, i) => {
+    const key = source.positions.slice(3 * i, 3 * i + 3).join(":");
+    if (!points.has(key)) points.set(key, i);
+    return points.get(key)!;
+  });
+  const edges = new Map<string, number[]>();
+  for (let i = 0; i < source.indices.length; i += 3) for (let side = 0; side < 3; side++) {
+    const a = canonical[source.indices[i + side]!]!, b = canonical[source.indices[i + (side + 1) % 3]!]!;
+    const key = [Math.min(a, b), Math.max(a, b)].join(":");
+    edges.set(key, [...(edges.get(key) ?? []), a < b ? 1 : -1]);
+  }
+  return edges;
+}
+
+describe("safe editable face extrude", () => {
+  it("creates a closed oriented cube protrusion with top and sides, preserving old UV", () => {
+    const source = cube();
+    const face = buildMeshTopology(source)!.faces[0]!;
+    const original = structuredClone(source);
+    const result = extrudeEditableFace(source, face.id, 0.25);
+    expect(source).toEqual(original);
+    expect(result).toEqual(extrudeEditableFace(source, face.id, 0.25));
+    expect(validateEditableSource(result)).toBeNull();
+    expect(result.indices.length / 3).toBe(source.indices.length / 3 + 8);
+    expect(result.uv?.length).toBe(result.positions.length / 3 * 2);
+    const oldPositions = new Set(Array.from({ length: source.positions.length / 3 }, (_, i) => source.positions.slice(3 * i, 3 * i + 3).join(":")));
+    const newPositions = new Set(Array.from({ length: result.positions.length / 3 }, (_, i) => result.positions.slice(3 * i, 3 * i + 3).join(":")));
+    expect([...oldPositions].every(p => newPositions.has(p))).toBe(true);
+    expect(newPositions.size).toBe(oldPositions.size + 4);
+    const triangle = source.indices.slice(3 * face.triangles[0]!, 3 * face.triangles[0]! + 3);
+    const at = (i: number) => new Vector3().fromArray(source.positions, 3 * i);
+    const normal = at(triangle[1]!).sub(at(triangle[0]!)).cross(at(triangle[2]!).sub(at(triangle[0]!))).normalize();
+    const expectedTop = at(triangle[0]!).addScaledVector(normal, 0.25).toArray().join(":");
+    expect(newPositions.has(expectedTop)).toBe(true);
+    expect([...orientedEdgeCounts(result).values()].every(directions => directions.length === 2 && directions[0] === -directions[1]!)).toBe(true);
+    const selected = new Set(face.triangles);
+    const untouched = new Set(source.indices.filter((_, index) => !selected.has(Math.floor(index / 3))));
+    const oldUvAtPosition = new Set([...untouched].map(i =>
+      JSON.stringify([source.positions.slice(3 * i, 3 * i + 3), source.uv!.slice(2 * i, 2 * i + 2)])));
+    const newUvAtPosition = new Set(Array.from({ length: result.positions.length / 3 }, (_, i) =>
+      JSON.stringify([result.positions.slice(3 * i, 3 * i + 3), result.uv!.slice(2 * i, 2 * i + 2)])));
+    expect([...oldUvAtPosition].every(item => newUvAtPosition.has(item))).toBe(true);
+  });
+
+  it("rejects invalid depth, open shell, ambiguous quantization and bad face", () => {
+    const source = cube();
+    const faceId = buildMeshTopology(source)!.faces[0]!.id;
+    expect(extrudeEditableFace(source, faceId, 0)).toBe(source);
+    for (const distance of [-1, 1e-7, NaN, Infinity, 1e40]) expect(() => extrudeEditableFace(source, faceId, distance)).toThrow();
+    expect(() => extrudeEditableFace(source, 999, 0.25)).toThrow(/грань/i);
+    expect(() => extrudeEditableFace({ ...source, indices: source.indices.slice(3) }, faceId, 0.25)).toThrow(/замкнутой|ориентированной/);
+    const reversed = structuredClone(source);
+    reversed.indices.splice(0, 3, source.indices[0]!, source.indices[2]!, source.indices[1]!);
+    expect(() => extrudeEditableFace(reversed, faceId, 0.25)).toThrow(/ориентированной/);
+    const nonManifold = structuredClone(source);
+    nonManifold.indices.push(...source.indices.slice(0, 3));
+    expect(() => extrudeEditableFace(nonManifold, faceId, 0.25)).toThrow(/manifold/);
+    const ambiguous = structuredClone(source);
+    ambiguous.positions[3] = ambiguous.positions[0]! + 1e-7;
+    expect(() => extrudeEditableFace(ambiguous, faceId, 0.25)).toThrow();
+  });
+});
+</file>
+
 <file path="tests/geometry/mesh-topology.test.ts">
 import { describe, expect, it } from "vitest";
 import { convertPrimitiveToEditable } from "../../src/geometry/mesh-edit";
@@ -9791,145 +9976,6 @@ export interface Keyframe {
 }
 </file>
 
-<file path="src/geometry/mesh-edit.ts">
-import * as T from "three";
-import type { MeshSource, Vec3 } from "../domain/types";
-import { primitiveGeometry } from "./primitive-geometry";
-import { MAX_CSG_INPUT_BYTES, validateMesh, type MeshData } from "./csg/core";
-
-export type EditableMeshSource = Extract<MeshSource, { kind: "editable" }>;
-type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
-type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
-
-/** Absolute coordinate quantization at 1e-6 local units. Keys are never written to the Project. */
-export const SEAM_TOLERANCE = 1e-6;
-const key = (positions: readonly number[], i: number): string =>
-  [0, 1, 2].map(axis => Math.round(positions[3 * i + axis]! / SEAM_TOLERANCE)).join(":");
-
-type Checked = { error: string; mesh?: never } | { error: null; mesh: MeshData };
-const invalid = (error: string): Checked => ({ error });
-
-function checkedEditableData(value: unknown): Checked {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return invalid("Редактируемая сетка должна быть объектом.");
-  const source = value as Partial<EditableMeshSource>;
-  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv"].includes(k)) || source.kind !== "editable")
-    return invalid("Некорректный тип или поле редактируемой сетки.");
-  if (!Array.isArray(source.positions) || !Array.isArray(source.indices) || source.positions.length % 3 || source.indices.length % 3 || !source.indices.length)
-    return invalid("Позиции и индексы должны задавать треугольники.");
-  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
-  if (source.positions.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))) return invalid("Координаты должны быть конечными Float32 числами.");
-  if (source.indices.some(n => !Number.isSafeInteger(n) || n < 0 || n >= source.positions!.length / 3 || n > 0xffffffff)) return invalid("Индекс вершины вне диапазона.");
-  if (source.uv !== undefined && (!Array.isArray(source.uv) || source.uv.length !== source.positions.length / 3 * 2 || source.uv.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))))
-    return invalid("UV должны содержать две конечные координаты на render vertex.");
-  const mesh = { positions: Float32Array.from(source.positions), indices: Uint32Array.from(source.indices) };
-  try { validateMesh(mesh); }
-  catch (error) { return invalid(error instanceof Error ? error.message : "Некорректная геометрия."); }
-  return { error: null, mesh };
-}
-
-export function validateEditableSource(value: unknown): string | null {
-  return checkedEditableData(value).error;
-}
-
-export function editableMeshData(source: EditableInput) {
-  const checked = checkedEditableData(source);
-  if (checked.error !== null) throw new Error(checked.error);
-  return checked.mesh;
-}
-
-export function editableGeometry(source: EditableInput): T.BufferGeometry {
-  const data = editableMeshData(source);
-  const geometry = new T.BufferGeometry();
-  geometry.setAttribute("position", new T.BufferAttribute(data.positions, 3));
-  geometry.setIndex(new T.BufferAttribute(data.indices, 1));
-  if (source.uv) geometry.setAttribute("uv", new T.Float32BufferAttribute(source.uv, 2));
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-export function convertPrimitiveToEditable(source: PrimitiveSource): EditableMeshSource {
-  if (source.primitive === "plane") throw new Error("Плоскость не является замкнутой сеткой для преобразования.");
-  const geometry = primitiveGeometry(source);
-  try {
-    const position = geometry.getAttribute("position");
-    const uvAttribute = geometry.getAttribute("uv");
-    const index = geometry.getIndex();
-    if (!position || position.itemSize !== 3) throw new Error("Примитив не содержит XYZ координат.");
-    const result: EditableMeshSource = {
-      kind: "editable",
-      positions: Array.from({ length: position.count * 3 }, (_, i) => position.getComponent(Math.floor(i / 3), i % 3)),
-      indices: index ? Array.from(index.array) : Array.from({ length: position.count }, (_, i) => i),
-      ...(uvAttribute ? { uv: Array.from({ length: uvAttribute.count * 2 }, (_, i) => uvAttribute.getComponent(Math.floor(i / 2), i % 2)) } : {}),
-    };
-    const error = validateEditableSource(result);
-    if (error) throw new Error(`Примитив нельзя преобразовать без потерь: ${error}`);
-    return result;
-  } finally { geometry.dispose(); }
-}
-
-/** Selection uses render vertex indices; all vertices with the same quantized local XYZ move together. */
-export function translateEditableVertices(source: EditableMeshSource, selected: readonly number[], delta: Vec3): EditableMeshSource {
-  const error = validateEditableSource(source);
-  if (error) throw new Error(error);
-  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
-    throw new Error("Выбор содержит несуществующую вершину.");
-  if (!Array.isArray(delta) || delta.length !== 3 || delta.some(n => !Number.isFinite(n))) throw new Error("Delta должна содержать три конечных числа.");
-  if (delta.every(n => n === 0)) return source;
-  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
-  const positions = source.positions.slice();
-  for (let i = 0; i < positions.length / 3; i++) {
-    if (!selectedKeys.has(key(source.positions, i))) continue;
-    for (let axis = 0; axis < 3; axis++) positions[3 * i + axis] = Math.fround(source.positions[3 * i + axis]! + delta[axis]!);
-  }
-  const result: EditableMeshSource = { ...source, positions };
-  const resultError = validateEditableSource(result);
-  if (resultError) throw new Error(resultError);
-  return result;
-}
-
-/** Scale geometric vertices around their shared local centroid; UV seam copies stay coincident. */
-export function scaleEditableVertices(source: EditableMeshSource, selected: readonly number[], factors: Vec3): EditableMeshSource {
-  const error = validateEditableSource(source);
-  if (error) throw new Error(error);
-  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
-    throw new Error("Выбор содержит несуществующую вершину.");
-  if (!Array.isArray(factors) || factors.length !== 3 || factors.some(n => typeof n !== "number" || !Number.isFinite(n)))
-    throw new Error("Масштаб должен содержать три конечных числа.");
-  if (factors.some(n => n <= 0)) throw new Error("Коэффициенты масштаба должны быть строго положительными.");
-  if (factors.every(n => n === 1)) return source;
-
-  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
-  const representatives = new Map<string, number>();
-  for (let i = 0; i < source.positions.length / 3; i++) {
-    const positionKey = key(source.positions, i);
-    if (selectedKeys.has(positionKey) && !representatives.has(positionKey)) representatives.set(positionKey, i);
-  }
-  if (representatives.size === 1) return source;
-  const mean = (axis: number) => {
-    let mean = 0;
-    for (const i of representatives.values()) mean += source.positions[3 * i + axis]! / representatives.size;
-    return mean;
-  };
-  const center: Vec3 = [mean(0), mean(1), mean(2)];
-  const positions = source.positions.slice();
-  let changed = false;
-  for (let i = 0; i < positions.length / 3; i++) {
-    if (!selectedKeys.has(key(source.positions, i))) continue;
-    for (let axis = 0; axis < 3; axis++) {
-      const before = source.positions[3 * i + axis]!;
-      const after = Math.fround(center[axis]! + (before - center[axis]!) * factors[axis]!);
-      positions[3 * i + axis] = after;
-      if (after !== before) changed = true;
-    }
-  }
-  if (!changed) return source;
-  const result: EditableMeshSource = { ...source, positions };
-  const resultError = validateEditableSource(result);
-  if (resultError) throw new Error(resultError);
-  return result;
-}
-</file>
-
 <file path="src/importers/gltf/import-glb.ts">
 import { disposeObject } from "../../assets/three-resources";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -11721,6 +11767,298 @@ export type EvaluationResult =
   | { ok: false; error: ModifierDiagnostic; mesh?: MeshData; empty?: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: boolean };
 </file>
 
+<file path="src/geometry/mesh-edit.ts">
+import * as T from "three";
+import type { MeshSource, Vec3 } from "../domain/types";
+import { primitiveGeometry } from "./primitive-geometry";
+import { MAX_CSG_INPUT_BYTES, validateMesh, type MeshData } from "./csg/core";
+import { buildMeshTopology, MAX_TOPOLOGY_TRIANGLES } from "./mesh-topology";
+
+export type EditableMeshSource = Extract<MeshSource, { kind: "editable" }>;
+type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
+type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
+
+/** Absolute coordinate quantization at 1e-6 local units. Keys are never written to the Project. */
+export const SEAM_TOLERANCE = 1e-6;
+const key = (positions: readonly number[], i: number): string =>
+  [0, 1, 2].map(axis => Math.round(positions[3 * i + axis]! / SEAM_TOLERANCE)).join(":");
+
+type Checked = { error: string; mesh?: never } | { error: null; mesh: MeshData };
+const invalid = (error: string): Checked => ({ error });
+
+function checkedEditableData(value: unknown): Checked {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return invalid("Редактируемая сетка должна быть объектом.");
+  const source = value as Partial<EditableMeshSource>;
+  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv"].includes(k)) || source.kind !== "editable")
+    return invalid("Некорректный тип или поле редактируемой сетки.");
+  if (!Array.isArray(source.positions) || !Array.isArray(source.indices) || source.positions.length % 3 || source.indices.length % 3 || !source.indices.length)
+    return invalid("Позиции и индексы должны задавать треугольники.");
+  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
+  if (source.positions.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))) return invalid("Координаты должны быть конечными Float32 числами.");
+  if (source.indices.some(n => !Number.isSafeInteger(n) || n < 0 || n >= source.positions!.length / 3 || n > 0xffffffff)) return invalid("Индекс вершины вне диапазона.");
+  if (source.uv !== undefined && (!Array.isArray(source.uv) || source.uv.length !== source.positions.length / 3 * 2 || source.uv.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))))
+    return invalid("UV должны содержать две конечные координаты на render vertex.");
+  const mesh = { positions: Float32Array.from(source.positions), indices: Uint32Array.from(source.indices) };
+  try { validateMesh(mesh); }
+  catch (error) { return invalid(error instanceof Error ? error.message : "Некорректная геометрия."); }
+  return { error: null, mesh };
+}
+
+export function validateEditableSource(value: unknown): string | null {
+  return checkedEditableData(value).error;
+}
+
+export function editableMeshData(source: EditableInput) {
+  const checked = checkedEditableData(source);
+  if (checked.error !== null) throw new Error(checked.error);
+  return checked.mesh;
+}
+
+export function editableGeometry(source: EditableInput): T.BufferGeometry {
+  const data = editableMeshData(source);
+  const geometry = new T.BufferGeometry();
+  geometry.setAttribute("position", new T.BufferAttribute(data.positions, 3));
+  geometry.setIndex(new T.BufferAttribute(data.indices, 1));
+  if (source.uv) geometry.setAttribute("uv", new T.Float32BufferAttribute(source.uv, 2));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+export function convertPrimitiveToEditable(source: PrimitiveSource): EditableMeshSource {
+  if (source.primitive === "plane") throw new Error("Плоскость не является замкнутой сеткой для преобразования.");
+  const geometry = primitiveGeometry(source);
+  try {
+    const position = geometry.getAttribute("position");
+    const uvAttribute = geometry.getAttribute("uv");
+    const index = geometry.getIndex();
+    if (!position || position.itemSize !== 3) throw new Error("Примитив не содержит XYZ координат.");
+    const result: EditableMeshSource = {
+      kind: "editable",
+      positions: Array.from({ length: position.count * 3 }, (_, i) => position.getComponent(Math.floor(i / 3), i % 3)),
+      indices: index ? Array.from(index.array) : Array.from({ length: position.count }, (_, i) => i),
+      ...(uvAttribute ? { uv: Array.from({ length: uvAttribute.count * 2 }, (_, i) => uvAttribute.getComponent(Math.floor(i / 2), i % 2)) } : {}),
+    };
+    const error = validateEditableSource(result);
+    if (error) throw new Error(`Примитив нельзя преобразовать без потерь: ${error}`);
+    return result;
+  } finally { geometry.dispose(); }
+}
+
+/** Selection uses render vertex indices; all vertices with the same quantized local XYZ move together. */
+export function translateEditableVertices(source: EditableMeshSource, selected: readonly number[], delta: Vec3): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
+    throw new Error("Выбор содержит несуществующую вершину.");
+  if (!Array.isArray(delta) || delta.length !== 3 || delta.some(n => !Number.isFinite(n))) throw new Error("Delta должна содержать три конечных числа.");
+  if (delta.every(n => n === 0)) return source;
+  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
+  const positions = source.positions.slice();
+  for (let i = 0; i < positions.length / 3; i++) {
+    if (!selectedKeys.has(key(source.positions, i))) continue;
+    for (let axis = 0; axis < 3; axis++) positions[3 * i + axis] = Math.fround(source.positions[3 * i + axis]! + delta[axis]!);
+  }
+  const result: EditableMeshSource = { ...source, positions };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  return result;
+}
+
+/** Scale geometric vertices around their shared local centroid; UV seam copies stay coincident. */
+export function scaleEditableVertices(source: EditableMeshSource, selected: readonly number[], factors: Vec3): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
+    throw new Error("Выбор содержит несуществующую вершину.");
+  if (!Array.isArray(factors) || factors.length !== 3 || factors.some(n => typeof n !== "number" || !Number.isFinite(n)))
+    throw new Error("Масштаб должен содержать три конечных числа.");
+  if (factors.some(n => n <= 0)) throw new Error("Коэффициенты масштаба должны быть строго положительными.");
+  if (factors.every(n => n === 1)) return source;
+
+  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
+  const representatives = new Map<string, number>();
+  for (let i = 0; i < source.positions.length / 3; i++) {
+    const positionKey = key(source.positions, i);
+    if (selectedKeys.has(positionKey) && !representatives.has(positionKey)) representatives.set(positionKey, i);
+  }
+  if (representatives.size === 1) return source;
+  const mean = (axis: number) => {
+    let mean = 0;
+    for (const i of representatives.values()) mean += source.positions[3 * i + axis]! / representatives.size;
+    return mean;
+  };
+  const center: Vec3 = [mean(0), mean(1), mean(2)];
+  const positions = source.positions.slice();
+  let changed = false;
+  for (let i = 0; i < positions.length / 3; i++) {
+    if (!selectedKeys.has(key(source.positions, i))) continue;
+    for (let axis = 0; axis < 3; axis++) {
+      const before = source.positions[3 * i + axis]!;
+      const after = Math.fround(center[axis]! + (before - center[axis]!) * factors[axis]!);
+      positions[3 * i + axis] = after;
+      if (after !== before) changed = true;
+    }
+  }
+  if (!changed) return source;
+  const result: EditableMeshSource = { ...source, positions };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  return result;
+}
+
+type DirectedEdge = { from: number; to: number; triangle: number; renderFrom: number; renderTo: number };
+
+/** A closed, consistently wound geometric shell is required; UV seam render vertices share a geometric vertex. */
+function shellEdges(source: EditableMeshSource) {
+  const representatives = new Map<string, number>();
+  const canonical = Array.from({ length: source.positions.length / 3 }, (_, i) => {
+    const positionKey = key(source.positions, i);
+    const existing = representatives.get(positionKey);
+    if (existing !== undefined) {
+      if ([0, 1, 2].some(axis => source.positions[3 * existing + axis] !== source.positions[3 * i + axis]))
+        throw new Error("Неоднозначное совпадение вершин после квантования координат.");
+      return existing;
+    }
+    representatives.set(positionKey, i);
+    return i;
+  });
+  const edges = new Map<string, DirectedEdge[]>();
+  const vertexTriangles = new Map<number, Set<number>>();
+  for (let triangle = 0; triangle < source.indices.length / 3; triangle++) {
+    const render = source.indices.slice(triangle * 3, triangle * 3 + 3);
+    const corners = render.map(i => canonical[i]!);
+    if (new Set(corners).size !== 3) throw new Error("Треугольник вырожден после объединения UV-швов.");
+    for (let side = 0; side < 3; side++) {
+      const from = corners[side]!, to = corners[(side + 1) % 3]!;
+      const id = from < to ? `${from}:${to}` : `${to}:${from}`;
+      const list = edges.get(id) ?? [];
+      list.push({ from, to, triangle, renderFrom: render[side]!, renderTo: render[(side + 1) % 3]! });
+      edges.set(id, list);
+      const incident = vertexTriangles.get(from) ?? new Set<number>(); incident.add(triangle); vertexTriangles.set(from, incident);
+    }
+  }
+  const neighbors = Array.from({ length: source.indices.length / 3 }, () => new Set<number>());
+  for (const list of edges.values()) {
+    if (list.length !== 2 || list[0]!.from !== list[1]!.to || list[0]!.to !== list[1]!.from)
+      throw new Error("Сетка должна быть замкнутой, ориентированной и manifold по каждому ребру.");
+    neighbors[list[0]!.triangle]!.add(list[1]!.triangle);
+    neighbors[list[1]!.triangle]!.add(list[0]!.triangle);
+  }
+  const visit = (seed: number, allowed: ReadonlySet<number>) => {
+    const reached = new Set([seed]), stack = [seed];
+    while (stack.length) for (const next of neighbors[stack.pop()!]!) if (allowed.has(next) && !reached.has(next)) { reached.add(next); stack.push(next); }
+    return reached.size === allowed.size;
+  };
+  const all = new Set(neighbors.map((_, i) => i));
+  if (!visit(0, all)) throw new Error("Сетка содержит несвязанные оболочки.");
+  for (const incident of vertexTriangles.values()) if (!visit(incident.values().next().value!, incident))
+    throw new Error("Вершина имеет несвязные треугольные веера (non-manifold).");
+  return { canonical, edges };
+}
+
+/** Extrudes one planar face of a closed shell into the outward half-space. */
+export function extrudeEditableFace(source: EditableMeshSource, faceId: number, distance: number): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (typeof distance !== "number" || !Number.isFinite(distance) || !Number.isFinite(Math.fround(distance)))
+    throw new Error("Глубина должна быть конечным числом Float32.");
+  if (!Number.isSafeInteger(faceId) || faceId < 0) throw new Error("Некорректный идентификатор грани.");
+  const topology = buildMeshTopology(source);
+  if (!topology) throw new Error("Топология сетки недоступна или превышен предел треугольников.");
+  const face = topology.faces.find(item => item.id === faceId);
+  if (!face) throw new Error("Выбранная грань не найдена.");
+  if (distance === 0) return source;
+  if (distance < 1e-6) throw new Error("Глубина должна быть положительной и не меньше 0.000001.");
+  const { canonical, edges } = shellEdges(source);
+  const selected = new Set(face.triangles);
+  const point = (i: number) => new T.Vector3().fromArray(source.positions, 3 * i);
+  const first = source.indices.slice(face.triangles[0]! * 3, face.triangles[0]! * 3 + 3);
+  const origin = point(first[0]!);
+  const normal = point(first[1]!).sub(origin).cross(point(first[2]!).sub(origin)).normalize();
+  if (![normal.x, normal.y, normal.z].every(Number.isFinite)) throw new Error("Нормаль грани недопустима.");
+  for (const triangle of face.triangles) {
+    const render = source.indices.slice(3 * triangle, 3 * triangle + 3);
+    const a = point(render[0]!), b = point(render[1]!), c = point(render[2]!);
+    if (b.sub(a).cross(c.sub(a)).normalize().dot(normal) < 0.999999 || render.some(i => Math.abs(point(i).sub(origin).dot(normal)) > 2e-6))
+      throw new Error("Выбранная грань не является согласованной плоской областью.");
+  }
+  // The selected face must support the whole shell. Its outward prism then cannot intersect old geometry.
+  for (let i = 0; i < canonical.length; i++) if (point(i).sub(origin).dot(normal) > 2e-6)
+    throw new Error("В направлении выдавливания есть другая геометрия; грань не является внешней опорной плоскостью.");
+  const boundary = [...edges.values()].filter(list => selected.has(list[0]!.triangle) !== selected.has(list[1]!.triangle))
+    .map(list => selected.has(list[0]!.triangle) ? list[0]! : list[1]!);
+  if (boundary.length < 3 || boundary.length > 4096) throw new Error("Граница грани слишком сложная или отсутствует.");
+  const outgoing = new Map<number, DirectedEdge>(), incoming = new Set<number>();
+  for (const edge of boundary) {
+    if (outgoing.has(edge.from) || incoming.has(edge.to)) throw new Error("Граница грани имеет развилки или отверстия.");
+    outgoing.set(edge.from, edge); incoming.add(edge.to);
+  }
+  const loop: DirectedEdge[] = [], visited = new Set<number>();
+  let current = boundary[0]!.from;
+  while (!visited.has(current)) {
+    visited.add(current);
+    const edge = outgoing.get(current);
+    if (!edge) throw new Error("Граница грани разомкнута.");
+    loop.push(edge); current = edge.to;
+  }
+  if (current !== boundary[0]!.from || loop.length !== boundary.length) throw new Error("Граница грани содержит отверстие или несколько контуров.");
+  // Project to the dominant plane and reject crossing/nonadjacent touching boundary segments.
+  const drop = [Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z)].indexOf(Math.max(Math.abs(normal.x), Math.abs(normal.y), Math.abs(normal.z)));
+  const xy = (i: number): [number, number] => [source.positions[3 * i + (drop + 1) % 3]!, source.positions[3 * i + (drop + 2) % 3]!];
+  const orient = (a: [number, number], b: [number, number], c: [number, number]) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  for (let i = 0; i < loop.length; i++) for (let j = i + 2; j < loop.length; j++) {
+    if (i === 0 && j === loop.length - 1) continue;
+    const a = xy(loop[i]!.from), b = xy(loop[i]!.to), c = xy(loop[j]!.from), d = xy(loop[j]!.to);
+    const s1 = orient(a, b, c), s2 = orient(a, b, d), s3 = orient(c, d, a), s4 = orient(c, d, b);
+    if (Math.abs(s1) < 1e-12 || Math.abs(s2) < 1e-12 || Math.abs(s3) < 1e-12 || Math.abs(s4) < 1e-12 || s1 * s2 < 0 && s3 * s4 < 0)
+      throw new Error("Граница грани пересекается или касается сама себя.");
+  }
+  const selectedRender = new Set(face.triangles.flatMap(triangle => source.indices.slice(3 * triangle, 3 * triangle + 3))).size;
+  const prospectiveVertices = source.positions.length / 3 + selectedRender + loop.length * 4;
+  const prospectiveIndices = source.indices.length + loop.length * 6;
+  if ((prospectiveVertices * (source.uv ? 5 : 3) + prospectiveIndices) * 4 > MAX_CSG_INPUT_BYTES)
+    throw new Error("Результат превышает лимит 64 MiB.");
+  const positions = source.positions.slice(), uv = source.uv?.slice(), indices: number[] = [];
+  const add = (i: number, top: boolean, tex?: [number, number]) => {
+    const index = positions.length / 3;
+    const base = point(i);
+    if (top) base.addScaledVector(normal, distance);
+    positions.push(Math.fround(base.x), Math.fround(base.y), Math.fround(base.z));
+    if (uv) uv.push(...(tex ?? [source.uv![2 * i]!, source.uv![2 * i + 1]!]));
+    return index;
+  };
+  const top = new Map<number, number>();
+  for (let triangle = 0; triangle < source.indices.length / 3; triangle++) {
+    const render = source.indices.slice(3 * triangle, 3 * triangle + 3);
+    if (selected.has(triangle)) indices.push(...render.map(i => {
+      let next = top.get(i);
+      if (next === undefined) { next = add(i, true); top.set(i, next); }
+      return next;
+    }));
+    else indices.push(...render);
+  }
+  for (const edge of loop) {
+    const length = point(edge.renderFrom).distanceTo(point(edge.renderTo));
+    if (length <= 1e-6) throw new Error("Граничное ребро вырождено.");
+    const a = add(edge.renderFrom, false, [0, 0]), b = add(edge.renderTo, false, [length, 0]);
+    const c = add(edge.renderTo, true, [length, distance]), d = add(edge.renderFrom, true, [0, distance]);
+    indices.push(a, b, c, a, c, d);
+  }
+  if (indices.length / 3 > MAX_TOPOLOGY_TRIANGLES) throw new Error("Результат превышает предел треугольников.");
+  // Remove orphaned render vertices from the replaced face.
+  const used = [...new Set(indices)].sort((a, b) => a - b);
+  const compact = new Map(used.map((old, next) => [old, next]));
+  const result: EditableMeshSource = { kind: "editable", positions: used.flatMap(i => positions.slice(3 * i, 3 * i + 3)), indices: indices.map(i => compact.get(i)!),
+    ...(uv ? { uv: used.flatMap(i => uv.slice(2 * i, 2 * i + 2)) } : {}) };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  const resultTopology = buildMeshTopology(result);
+  if (!resultTopology) throw new Error("Результат имеет недопустимую топологию.");
+  shellEdges(result);
+  return result;
+}
+</file>
+
 <file path="src/renderer/primitive.ts">
 export { primitiveGeometry } from "../geometry/primitive-geometry";
 </file>
@@ -13481,257 +13819,6 @@ export class SceneSync {
 }
 </file>
 
-<file path="src/ui/Inspector.tsx">
-import { useEffect, useRef, useState } from "react";
-import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
-import type { Node } from "../domain/types";
-import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
-import { BooleanEditor } from "./BooleanEditor";
-import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
-
-const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
-const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
-const format = (value: number) => String(Number(value.toPrecision(12)));
-type TransformSession = EditSession & { groupId: string; applied?: string };
-
-export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const project = state.document.project;
-  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
-  const [draft, setDraft] = useState("");
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState<{ field: string; message: string } | null>(null);
-  const session = useRef<TransformSession | null>(null);
-  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const epoch = store.getProjectEpoch();
-  const selectedIds = selectionKey(state);
-  useEffect(() => {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null; session.current = null; setEditing(null); setError(null);
-    return () => { if (pending.current) clearTimeout(pending.current); };
-  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
-  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
-  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
-  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
-  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
-  const displayReason = displays.find(item => !item.ok);
-  const disabled = !!transformReason || !!displayReason;
-  function begin(key: string, value: number | null) {
-    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
-    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
-  }
-  function cancel(rollback = false) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    const captured = session.current;
-    if (rollback && captured?.applied && validSession(store, captured)) {
-      const current = store.getSnapshot();
-      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
-    }
-    session.current = null; setEditing(null); setError(null);
-  }
-  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
-    const captured = session.current;
-    if (!captured || captured.field !== key) return;
-    if (!validSession(store, captured) || blocked) { cancel(); return; }
-    if (!captured.touched) { if (final) cancel(); return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
-    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
-    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
-    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
-    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
-    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
-    captured.revision = result.revision;
-    captured.applied = raw;
-    if (final) cancel();
-  }
-  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    applyValue(field, axis, key, draft, true, currentValue);
-  }
-  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
-  }
-  function reset(field: TransformField) {
-    if (disabled) return;
-    const current = store.getSnapshot();
-    const prepared = prepareTransformCommands(current, { field, reset: true });
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else cancel();
-  }
-  function changeFlag(field: "visible" | "locked", value: boolean) {
-    if (flagReason) return;
-    const current = store.getSnapshot();
-    const prepared = prepareFlagCommands(current, field, value);
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else setError(null);
-  }
-  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
-  const axisLabels = ["X", "Y", "Z"] as const;
-  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
-  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
-  return <div className="inspector">
-    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
-    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
-      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
-      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
-      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
-        {transformReason && <p className="panel-hint">{transformReason}</p>}
-        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
-        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
-          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
-          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
-            const key = `${field}-${axis}`;
-            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
-            const value = values.length === nodes.length ? mixedValue(values) : null;
-            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
-          })}</div>
-          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
-        </div>)}
-      </section>
-      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
-        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
-          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
-          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
-          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
-        })}
-        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
-      </section>
-      <section aria-label="Геометрия"><h4>Геометрия</h4>
-        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
-          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
-        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
-      </section>
-      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
-      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
-    </>}
-    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
-    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
-  </div>;
-}
-
-function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
-  if (blocked) return "Дождитесь завершения операции.";
-  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
-  const access = accessReason(state.document.project, node);
-  if (access) return access;
-  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
-    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
-    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
-  return "";
-}
-
-function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
-  const [error, setError] = useState("");
-  const reason = meshRestriction(state, node, blocked);
-  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
-  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
-  function convert() {
-    const current = store.getSnapshot();
-    const selected = current.document.project.nodes.find(item => item.id === node.id);
-    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
-      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  const epoch = store.getProjectEpoch();
-  function enter() {
-    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
-    setError(message ?? "");
-  }
-  return <div className="mesh-edit-actions">
-    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
-    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
-      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
-      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
-    {restriction && <p className="panel-hint">{restriction}</p>}
-    {error && <p className="primitive-error" role="alert">{error}</p>}
-  </div>;
-}
-
-function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
-  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
-  const [moveError, setMoveError] = useState("");
-  const [scaleError, setScaleError] = useState("");
-  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
-  const epoch = store.getProjectEpoch();
-  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
-  const nodeId = node.id;
-  const reason = meshRestriction(state, node, blocked);
-  function apply(kind: "move" | "scale") {
-    const setError = kind === "move" ? setMoveError : setScaleError;
-    const current = store.getSnapshot();
-    const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
-      setError("Проект или выделение изменилось. Повторите действие."); return;
-    }
-    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
-    const failure = parsed.find(item => !item.ok);
-    if (failure && !failure.ok) { setError(failure.message); return; }
-    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
-    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
-    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
-    const vertices = store.selectedMeshVertices();
-    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
-    const result = kind === "move"
-      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
-      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
-  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
-  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
-  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
-    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
-    <p className="panel-hint">Локальные координаты объекта</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
-    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
-    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
-    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
-  </section>;
-}
-
-function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
-  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
-  const specs = primitiveDefinitions[source.primitive].parameters;
-  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
-    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
-  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
-  const [draft, setDraft] = useState<Record<string, string>>({});
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const session = useRef<EditSession | null>(null);
-  const epoch = store.getProjectEpoch();
-  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
-  function apply(key: string, raw: string) {
-    const captured = session.current;
-    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
-    if (!captured.touched) { setEditing(null); session.current = null; return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { setError(parsed.message); return; }
-    const next = updatedPrimitiveSource(source, key, parsed.value);
-    if (!next.ok) { setError(next.message); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
-    if (!result.ok) { setError(result.message); return; }
-    setEditing(null); setDraft({}); setError(""); session.current = null;
-  }
-  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
-    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
-    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
-    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
-  </div>;
-}
-</file>
-
 <file path="src/domain/validate-project.ts">
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
@@ -14000,6 +14087,284 @@ function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: stri
 }
 </file>
 
+<file path="src/ui/Inspector.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
+import type { Node } from "../domain/types";
+import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
+import { BooleanEditor } from "./BooleanEditor";
+import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
+
+const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
+const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
+const format = (value: number) => String(Number(value.toPrecision(12)));
+type TransformSession = EditSession & { groupId: string; applied?: string };
+
+export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const project = state.document.project;
+  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
+  const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState<{ field: string; message: string } | null>(null);
+  const session = useRef<TransformSession | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const epoch = store.getProjectEpoch();
+  const selectedIds = selectionKey(state);
+  useEffect(() => {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null; session.current = null; setEditing(null); setError(null);
+    return () => { if (pending.current) clearTimeout(pending.current); };
+  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
+  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
+  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
+  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
+  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
+  const displayReason = displays.find(item => !item.ok);
+  const disabled = !!transformReason || !!displayReason;
+  function begin(key: string, value: number | null) {
+    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
+    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
+  }
+  function cancel(rollback = false) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    const captured = session.current;
+    if (rollback && captured?.applied && validSession(store, captured)) {
+      const current = store.getSnapshot();
+      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
+    }
+    session.current = null; setEditing(null); setError(null);
+  }
+  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
+    const captured = session.current;
+    if (!captured || captured.field !== key) return;
+    if (!validSession(store, captured) || blocked) { cancel(); return; }
+    if (!captured.touched) { if (final) cancel(); return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
+    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
+    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
+    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
+    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
+    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
+    captured.revision = result.revision;
+    captured.applied = raw;
+    if (final) cancel();
+  }
+  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    applyValue(field, axis, key, draft, true, currentValue);
+  }
+  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
+  }
+  function reset(field: TransformField) {
+    if (disabled) return;
+    const current = store.getSnapshot();
+    const prepared = prepareTransformCommands(current, { field, reset: true });
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else cancel();
+  }
+  function changeFlag(field: "visible" | "locked", value: boolean) {
+    if (flagReason) return;
+    const current = store.getSnapshot();
+    const prepared = prepareFlagCommands(current, field, value);
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else setError(null);
+  }
+  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
+  const axisLabels = ["X", "Y", "Z"] as const;
+  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
+  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
+  return <div className="inspector">
+    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
+    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
+      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
+      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
+      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
+        {transformReason && <p className="panel-hint">{transformReason}</p>}
+        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
+        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
+          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
+          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
+            const key = `${field}-${axis}`;
+            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
+            const value = values.length === nodes.length ? mixedValue(values) : null;
+            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
+          })}</div>
+          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
+        </div>)}
+      </section>
+      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
+        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
+          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
+          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
+          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
+        })}
+        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
+      </section>
+      <section aria-label="Геометрия"><h4>Геометрия</h4>
+        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
+          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
+        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
+      </section>
+      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
+      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
+    </>}
+    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
+    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
+  </div>;
+}
+
+function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
+  if (blocked) return "Дождитесь завершения операции.";
+  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
+  const access = accessReason(state.document.project, node);
+  if (access) return access;
+  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
+    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
+    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
+  return "";
+}
+
+function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
+  const [error, setError] = useState("");
+  const reason = meshRestriction(state, node, blocked);
+  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
+  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
+  function convert() {
+    const current = store.getSnapshot();
+    const selected = current.document.project.nodes.find(item => item.id === node.id);
+    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
+      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  const epoch = store.getProjectEpoch();
+  function enter() {
+    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
+    setError(message ?? "");
+  }
+  return <div className="mesh-edit-actions">
+    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
+      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
+      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
+    {restriction && <p className="panel-hint">{restriction}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </div>;
+}
+
+function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
+  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
+  const [moveError, setMoveError] = useState("");
+  const [scaleError, setScaleError] = useState("");
+  const [extrudeDistance, setExtrudeDistance] = useState("0.25");
+  const [extrudeError, setExtrudeError] = useState("");
+  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+  const epoch = store.getProjectEpoch();
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
+  const nodeId = node.id;
+  const reason = meshRestriction(state, node, blocked);
+  function apply(kind: "move" | "scale") {
+    const setError = kind === "move" ? setMoveError : setScaleError;
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
+      setError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
+    const failure = parsed.find(item => !item.ok);
+    if (failure && !failure.ok) { setError(failure.message); return; }
+    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
+    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
+    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
+    const vertices = store.selectedMeshVertices();
+    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
+    const result = kind === "move"
+      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
+      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  function extrude() {
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.project.id !== state.document.project.id || current.document.revision !== state.document.revision
+      || store.getProjectEpoch() !== epoch || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)
+      || current.selection.ids.length !== 1 || current.selection.activeId !== nodeId || current.tool.mode !== "model"
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.mode !== "face" || current.meshEdit.faceIds.length !== 1) {
+      setExtrudeError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = parseNumber(extrudeDistance);
+    if (!parsed.ok) { setExtrudeError(parsed.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "EXTRUDE_EDITABLE_FACE", targetIds: [nodeId],
+      payload: { nodeId, faceId: current.meshEdit.faceIds[0]!, distance: parsed.value } }, current.document.revision);
+    setExtrudeError(result.ok ? "" : result.message);
+  }
+  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
+  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
+  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
+    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
+    <p className="panel-hint">Локальные координаты объекта</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
+    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
+    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
+    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
+    {state.meshEdit.mode === "face" && <div className="mesh-edit-actions"><h4>Выдавливание грани</h4>
+      <p className="panel-hint">Выдавливание выполняется вдоль локальной нормали выбранной грани.</p>
+      <label>Глубина выдавливания<input type="text" inputMode="decimal" aria-label="Глубина выдавливания" value={extrudeDistance}
+        onChange={event => { setExtrudeDistance(event.target.value); setExtrudeError(""); }}
+        onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); extrude(); } }} /></label>
+      <button type="button" disabled={!!reason || state.meshEdit.faceIds.length !== 1}
+        title={reason || (state.meshEdit.faceIds.length !== 1 ? "Выберите ровно одну грань." : undefined)} onClick={extrude}>Выдавить грань</button>
+      {state.meshEdit.faceIds.length !== 1 && <p className="panel-hint">Выберите ровно одну грань.</p>}
+      {extrudeError && <p className="primitive-error" role="alert">{extrudeError}</p>}
+    </div>}
+  </section>;
+}
+
+function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
+  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
+  const specs = primitiveDefinitions[source.primitive].parameters;
+  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
+    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
+  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const session = useRef<EditSession | null>(null);
+  const epoch = store.getProjectEpoch();
+  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
+  function apply(key: string, raw: string) {
+    const captured = session.current;
+    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
+    if (!captured.touched) { setEditing(null); session.current = null; return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { setError(parsed.message); return; }
+    const next = updatedPrimitiveSource(source, key, parsed.value);
+    if (!next.ok) { setError(next.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
+    if (!result.ok) { setError(result.message); return; }
+    setEditing(null); setDraft({}); setError(""); session.current = null;
+  }
+  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
+    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
+    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
+    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
+  </div>;
+}
+</file>
+
 <file path="package.json">
 {
   "name": "triad-3d",
@@ -14170,9 +14535,9 @@ export function createEditorStore(initialProject: Project): EditorStore {
     const changed = patch?.changes.some(change => change.kind === "setMeshSource" && change.nodeId === old.nodeId);
     if (changed) {
       const change = patch!.changes.find(item => item.kind === "setMeshSource" && item.nodeId === old.nodeId);
-      if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable"
-        || JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
-        || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return emptyMeshEdit();
+      if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable") return emptyMeshEdit();
+      if (JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
+        || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return subEdit(old.mode, old.nodeId!);
       // Edge and face IDs describe the old geometric embedding; re-pick after a geometry edit.
       if (old.mode !== "vertex") return subEdit(old.mode, old.nodeId!);
     }
@@ -14429,6 +14794,158 @@ export const selectCanUndo = (state: EditorState) => state.history.canUndo;
 export const selectCanRedo = (state: EditorState) => state.history.canRedo;
 </file>
 
+<file path="src/ui/styles/app.css">
+body { margin: 0; }
+#root { min-height: 100vh; }
+.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
+.app-content { min-height: 100vh; display: flex; flex-direction: column; }
+.job-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgb(12 18 28 / .5); }
+.job-dialog { width: min(420px, calc(100vw - 32px)); box-sizing: border-box; display: grid; gap: var(--space-4); padding: var(--space-6); border: var(--border-default); border-radius: var(--radius-lg); background: var(--color-surface-raised); box-shadow: 0 20px 70px rgb(0 0 0 / .22); }
+.job-dialog h2, .job-dialog p { margin: 0; }
+.job-dialog progress { width: 100%; accent-color: var(--color-primary-accent-strong); }
+.job-indeterminate { height: 8px; border-radius: 4px; background: var(--color-state-info-surface); overflow: hidden; }
+.job-indeterminate::after { content: ""; display: block; width: 35%; height: 100%; background: var(--color-primary-accent-strong); animation: job-progress 1.4s ease-in-out infinite alternate; }
+@keyframes job-progress { from { transform: translateX(0); } to { transform: translateX(185%); } }
+.job-dialog button { justify-self: end; min-height: 32px; padding: 0 var(--space-4); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.job-dialog button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.job-result { padding: var(--space-3) var(--space-4); color: var(--color-state-danger); }
+.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
+.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
+.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
+.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
+.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.file-actions { display: flex; align-items: center; gap: var(--space-2); }
+.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.file-actions button:disabled { opacity: .5; cursor: wait; }
+.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
+.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
+.import-confirm span { flex: 1; }
+.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
+.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
+.dock { background: var(--color-surface-base); }
+.left-dock { border-right: var(--border-default); }
+.right-dock { border-left: var(--border-default); }
+.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
+.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+.panel-content { padding: var(--space-4) var(--space-3); }
+.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
+.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
+.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
+.tree-row:first-of-type { background: var(--color-state-info-surface); }
+.tree-row span { color: var(--color-primary-accent-strong); }
+.tree-row small { margin-left: auto; color: var(--color-text-muted); }
+.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
+.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
+.info-block span { color: var(--color-text-secondary); }
+.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
+.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
+.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
+.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
+.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
+.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
+.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
+.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
+.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
+.topbar { height: auto; min-height: var(--toolbar-height); justify-content: flex-start; gap: var(--space-3); padding: var(--space-2) var(--space-3); }
+.brand { min-width: 0; white-space: nowrap; }
+.project-title { max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: var(--color-text-secondary); }
+.dirty-indicator { color: var(--color-state-success); font-size: var(--font-size-sm); }
+.dirty-indicator.is-dirty { color: var(--color-state-warning); }
+.mode-switch, .dock-tabs { display: flex; gap: 2px; }
+.file-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
+.topbar button, .dock-tabs button, .timeline button, .import-confirm button, .file-status button { min-height: 32px; padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.mode-switch button[aria-pressed="true"], .dock-tabs button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
+.topbar button:disabled, .dock-tabs button:disabled { opacity: .5; cursor: not-allowed; }
+.file-status { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
+.status-success { background: var(--color-state-success-surface); color: var(--color-state-success); }
+.status-error { background: var(--color-state-danger-surface); color: var(--color-state-danger); }
+.status-info { background: var(--color-state-info-surface); color: var(--color-state-info); }
+.file-status button { min-height: 24px; }
+.workspace-grid { min-height: 420px; }
+.dock, .stage { min-width: 0; }
+.dock { overflow: auto; }
+.dock-resizer { background: var(--color-surface-sunken); border-inline: 1px solid var(--color-stroke); cursor: col-resize; touch-action: none; }
+.dock-resizer:hover, .dock-resizer:focus-visible, .is-resizing .dock-resizer { background: var(--color-primary-accent); }
+.dock-tabs { padding: var(--space-2); border-bottom: var(--border-default); }
+.dock-tabs button { flex: 1; }
+.timeline.is-collapsed { height: 40px; }
+.timeline-body[hidden] { display: none; }
+.narrow-screen { display: none; }
+@media (max-width: 1279px) and (min-width: 960px) {
+  .topbar { flex-wrap: wrap; }
+  .file-actions { flex: 1 1 100%; justify-content: flex-start; }
+  .project-title { max-width: 110px; }
+}
+@media (max-width: 959px) {
+  .app-content > :not(.narrow-screen) { display: none; }
+  .narrow-screen { display: flex; min-height: 100vh; flex-direction: column; justify-content: center; align-items: center; padding: var(--space-6); text-align: center; }
+  .narrow-screen strong { font-size: var(--font-size-xl); }
+  .narrow-screen p { max-width: 34rem; line-height: 1.6; }
+}
+
+.renderer-viewport { flex: 1; min-height: 300px; display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-3); }
+.renderer-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); font-size: var(--font-size-xs); }
+.renderer-toolbar button, .renderer-toolbar select { min-height: 28px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.renderer-host { flex: 1; position: relative; min-height: 220px; overflow: hidden; border-radius: var(--radius-sm); background: #202020; }
+.renderer-host canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.renderer-status { display: flex; flex-direction: column; gap: var(--space-1); max-height: 100px; overflow: auto; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+.viewport-tools { display: inline-flex; gap: 2px; }
+.renderer-toolbar button { padding: 0 var(--space-2); cursor: pointer; }
+.renderer-toolbar button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
+.renderer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
+.renderer-toolbar button:not(:disabled):hover { border-color: var(--color-primary-accent-strong); }
+.renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.renderer-status [role="alert"] { color: var(--color-state-danger); }
+.primitive-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.primitive-editor { display: grid; gap: 10px; margin-bottom: 18px; }
+.primitive-editor h3 { margin: 0; font-size: 14px; }
+.primitive-editor label { display: grid; gap: 4px; font-size: 12px; }
+.primitive-editor input { width: 100%; box-sizing: border-box; }
+.primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
+.inspector { display: grid; gap: 12px; }
+.inspector h3, .inspector h4 { margin: 0; font-size: var(--font-size-sm); }
+.inspector section { display: grid; gap: 10px; padding: 12px 0; border-top: var(--border-default); }
+.inspector-group { display: grid; gap: 6px; }
+.inspector-group-heading, .inspector-flag { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--font-size-sm); }
+.inspector-vector { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.inspector-vector label { min-width: 0; display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+.inspector-vector input, .inspector-parameter input { min-width: 0; width: 100%; box-sizing: border-box; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.inspector button { min-height: 26px; padding: 2px 6px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
+.inspector button:disabled { opacity: .5; cursor: not-allowed; }
+.inspector input:focus-visible, .inspector button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.inspector-parameter { display: flex; gap: 5px; }
+.inspector-parameter button { flex: none; }
+.inspector .primitive-error { color: var(--color-state-danger); }
+.boolean-editor label { display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
+.boolean-editor select { min-width: 0; width: 100%; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.boolean-editor .boolean-check { display: flex; align-items: center; gap: 7px; }
+.boolean-stack-item { display: grid; gap: 8px; padding: 10px; border: var(--border-default); border-radius: var(--radius-sm); }
+.boolean-stack-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
+button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
+.object-tree { display: grid; gap: 8px; font-size: var(--font-size-sm); }
+.tree-search { width: 100%; box-sizing: border-box; min-height: 30px; border: var(--border-default); border-radius: var(--radius-sm); padding: 4px 8px; background: var(--color-surface-base); color: var(--color-text-primary); }
+.tree-tools, .tree-edit { display: flex; flex-wrap: wrap; gap: 4px; }
+.tree-tools button, .tree-edit button, .tree-edit select { border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); min-height: 26px; cursor: pointer; }
+.tree-tools button:disabled, .tree-edit button:disabled { opacity: .45; cursor: not-allowed; }
+.tree-scroll { height: 300px; overflow: auto; border: var(--border-default); border-radius: var(--radius-sm); }
+.object-row { position: absolute; left: 0; right: 0; height: 30px; box-sizing: border-box; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+.object-row:hover { background: var(--color-state-info-surface); }
+.object-row.is-selected { background: var(--color-state-info-surface); }
+.object-row.is-active { outline: 1px solid var(--color-primary-accent-strong); outline-offset: -1px; }
+.object-row.is-drop-inside { box-shadow: inset 0 0 0 2px var(--color-primary-accent-strong); }
+.object-row.is-drop-before { box-shadow: inset 0 2px 0 var(--color-primary-accent-strong); }
+.object-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--color-primary-accent-strong); }
+.object-row button { border: 0; background: transparent; color: var(--color-text-primary); cursor: pointer; }
+.object-row button:focus-visible, .tree-tools button:focus-visible, .tree-edit button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); }
+.object-row .tree-toggle { width: 18px; padding: 0; }
+.object-row .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.object-row .tree-icon { width: 24px; padding: 0; }
+.tree-measure { display: none; }
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { Asset, EntityId, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -14438,7 +14955,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
-import { convertPrimitiveToEditable, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
+import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
@@ -14451,6 +14968,7 @@ export type ProjectCommand =
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
   | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
+  | { commandId: string; type: "EXTRUDE_EDITABLE_FACE"; targetIds: [EntityId]; payload: { nodeId: EntityId; faceId: number; distance: number } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
@@ -14606,6 +15124,9 @@ function validCommand(value: unknown): value is ProjectCommand {
       && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
       && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
       && numbers(payload.factors, 3);
+    case "EXTRUDE_EDITABLE_FACE": return ownKeys(payload, ["nodeId", "faceId", "distance"])
+      && Number.isSafeInteger(payload.faceId) && (payload.faceId as number) >= 0
+      && typeof payload.distance === "number" && Number.isFinite(payload.distance);
     case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
     case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
     case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
@@ -14894,12 +15415,15 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       break;
     case "TRANSLATE_EDITABLE_VERTICES":
     case "SCALE_EDITABLE_VERTICES":
+    case "EXTRUDE_EDITABLE_FACE":
       if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
         const source = command.type === "TRANSLATE_EDITABLE_VERTICES"
           ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
-          : scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors);
+          : command.type === "SCALE_EDITABLE_VERTICES"
+            ? scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors)
+            : extrudeEditableFace(current.meshSource, command.payload.faceId, command.payload.distance);
         if (source !== current.meshSource && (current.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled) || activeDependents(project, current.id)))
           return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перед редактированием отключите активные модификаторы и зависимые Boolean.");
         next = source === current.meshSource ? current : { ...current, meshSource: source };
@@ -15078,158 +15602,6 @@ export function createCommandBus(initialProject: Project): CommandBus {
     },
   };
 }
-</file>
-
-<file path="src/ui/styles/app.css">
-body { margin: 0; }
-#root { min-height: 100vh; }
-.app-shell { min-height: 100vh; display: flex; flex-direction: column; background: var(--color-surface-background); }
-.app-content { min-height: 100vh; display: flex; flex-direction: column; }
-.job-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; background: rgb(12 18 28 / .5); }
-.job-dialog { width: min(420px, calc(100vw - 32px)); box-sizing: border-box; display: grid; gap: var(--space-4); padding: var(--space-6); border: var(--border-default); border-radius: var(--radius-lg); background: var(--color-surface-raised); box-shadow: 0 20px 70px rgb(0 0 0 / .22); }
-.job-dialog h2, .job-dialog p { margin: 0; }
-.job-dialog progress { width: 100%; accent-color: var(--color-primary-accent-strong); }
-.job-indeterminate { height: 8px; border-radius: 4px; background: var(--color-state-info-surface); overflow: hidden; }
-.job-indeterminate::after { content: ""; display: block; width: 35%; height: 100%; background: var(--color-primary-accent-strong); animation: job-progress 1.4s ease-in-out infinite alternate; }
-@keyframes job-progress { from { transform: translateX(0); } to { transform: translateX(185%); } }
-.job-dialog button { justify-self: end; min-height: 32px; padding: 0 var(--space-4); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.job-dialog button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.job-result { padding: var(--space-3) var(--space-4); color: var(--color-state-danger); }
-.topbar { height: var(--toolbar-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-4); background: var(--color-surface-raised); border-bottom: var(--border-default); }
-.brand { display: flex; align-items: center; gap: var(--space-2); letter-spacing: .03em; }
-.brand-mark { color: var(--color-primary-accent-strong); font-size: 27px; line-height: 1; }
-.brand-subtitle { margin-left: var(--space-3); color: var(--color-text-secondary); font-size: var(--font-size-sm); font-weight: var(--font-weight-regular); }
-.topbar-note { color: var(--color-text-secondary); font-size: var(--font-size-sm); }
-.file-actions { display: flex; align-items: center; gap: var(--space-2); }
-.file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.file-actions button:disabled { opacity: .5; cursor: wait; }
-.file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-.file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
-.import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
-.import-confirm span { flex: 1; }
-.import-confirm button { padding: var(--space-2) var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
-.workspace-grid { display: grid; grid-template-columns: var(--dock-width-default) minmax(0, 1fr) var(--dock-width-default); flex: 1; min-height: 420px; }
-.dock { background: var(--color-surface-base); }
-.left-dock { border-right: var(--border-default); }
-.right-dock { border-left: var(--border-default); }
-.panel-heading { height: 40px; display: flex; align-items: center; justify-content: space-between; padding: 0 var(--space-3); border-bottom: var(--border-default); color: var(--color-text-muted); font-size: var(--font-size-xs); }
-.panel-heading h2 { margin: 0; color: var(--color-text-primary); font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
-.panel-content { padding: var(--space-4) var(--space-3); }
-.eyebrow { margin: 0 0 var(--space-2); color: var(--color-text-muted); font-size: var(--font-size-xs); text-transform: uppercase; letter-spacing: .08em; }
-.project-name { padding-bottom: var(--space-4); font-weight: var(--font-weight-semibold); }
-.tree-row { display: flex; gap: var(--space-2); align-items: center; height: var(--control-height-lg); padding: 0 var(--space-2); border-radius: var(--radius-sm); }
-.tree-row:first-of-type { background: var(--color-state-info-surface); }
-.tree-row span { color: var(--color-primary-accent-strong); }
-.tree-row small { margin-left: auto; color: var(--color-text-muted); }
-.panel-hint { color: var(--color-text-secondary); font-size: var(--font-size-sm); line-height: 1.6; }
-.info-block { display: flex; justify-content: space-between; padding: var(--space-3) 0; border-bottom: var(--border-default); font-size: var(--font-size-sm); }
-.info-block span { color: var(--color-text-secondary); }
-.stage { position: relative; display: flex; flex-direction: column; padding: var(--space-4); background: radial-gradient(circle at 50% 42%, #f8f9fb 0, var(--color-surface-background) 70%); }
-.stage-topline, .stage-footer { display: flex; justify-content: space-between; color: var(--color-text-muted); font-size: var(--font-size-xs); letter-spacing: .06em; }
-.stage-center { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; max-width: 470px; margin: auto; }
-.stage-symbol { display: grid; place-items: center; width: 92px; height: 92px; margin-bottom: var(--space-6); border: 1px solid var(--color-primary-accent); border-radius: var(--radius-lg); background: var(--color-state-info-surface); color: var(--color-primary-accent-strong); font-size: 54px; }
-.stage h1 { margin: 0 0 var(--space-3); font-family: var(--font-family-display); font-size: var(--font-size-display); }
-.stage p { margin: 0 0 var(--space-6); color: var(--color-text-secondary); line-height: 1.6; }
-.status-pill { padding: var(--space-2) var(--space-3); border-radius: var(--radius-pill); background: var(--color-state-success-surface); color: var(--color-state-success); font-size: var(--font-size-sm); }
-.timeline { height: var(--timeline-height); background: var(--color-surface-base); border-top: var(--border-default); }
-.timeline-body { padding: var(--space-6); color: var(--color-text-muted); text-align: center; font-size: var(--font-size-sm); }
-.topbar { height: auto; min-height: var(--toolbar-height); justify-content: flex-start; gap: var(--space-3); padding: var(--space-2) var(--space-3); }
-.brand { min-width: 0; white-space: nowrap; }
-.project-title { max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: var(--color-text-secondary); }
-.dirty-indicator { color: var(--color-state-success); font-size: var(--font-size-sm); }
-.dirty-indicator.is-dirty { color: var(--color-state-warning); }
-.mode-switch, .dock-tabs { display: flex; gap: 2px; }
-.file-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-1); }
-.topbar button, .dock-tabs button, .timeline button, .import-confirm button, .file-status button { min-height: 32px; padding: 0 var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.mode-switch button[aria-pressed="true"], .dock-tabs button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
-.topbar button:disabled, .dock-tabs button:disabled { opacity: .5; cursor: not-allowed; }
-.file-status { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
-.status-success { background: var(--color-state-success-surface); color: var(--color-state-success); }
-.status-error { background: var(--color-state-danger-surface); color: var(--color-state-danger); }
-.status-info { background: var(--color-state-info-surface); color: var(--color-state-info); }
-.file-status button { min-height: 24px; }
-.workspace-grid { min-height: 420px; }
-.dock, .stage { min-width: 0; }
-.dock { overflow: auto; }
-.dock-resizer { background: var(--color-surface-sunken); border-inline: 1px solid var(--color-stroke); cursor: col-resize; touch-action: none; }
-.dock-resizer:hover, .dock-resizer:focus-visible, .is-resizing .dock-resizer { background: var(--color-primary-accent); }
-.dock-tabs { padding: var(--space-2); border-bottom: var(--border-default); }
-.dock-tabs button { flex: 1; }
-.timeline.is-collapsed { height: 40px; }
-.timeline-body[hidden] { display: none; }
-.narrow-screen { display: none; }
-@media (max-width: 1279px) and (min-width: 960px) {
-  .topbar { flex-wrap: wrap; }
-  .file-actions { flex: 1 1 100%; justify-content: flex-start; }
-  .project-title { max-width: 110px; }
-}
-@media (max-width: 959px) {
-  .app-content > :not(.narrow-screen) { display: none; }
-  .narrow-screen { display: flex; min-height: 100vh; flex-direction: column; justify-content: center; align-items: center; padding: var(--space-6); text-align: center; }
-  .narrow-screen strong { font-size: var(--font-size-xl); }
-  .narrow-screen p { max-width: 34rem; line-height: 1.6; }
-}
-
-.renderer-viewport { flex: 1; min-height: 300px; display: flex; flex-direction: column; gap: var(--space-2); margin-top: var(--space-3); }
-.renderer-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); font-size: var(--font-size-xs); }
-.renderer-toolbar button, .renderer-toolbar select { min-height: 28px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
-.renderer-host { flex: 1; position: relative; min-height: 220px; overflow: hidden; border-radius: var(--radius-sm); background: #202020; }
-.renderer-host canvas { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
-.renderer-status { display: flex; flex-direction: column; gap: var(--space-1); max-height: 100px; overflow: auto; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-.viewport-tools { display: inline-flex; gap: 2px; }
-.renderer-toolbar button { padding: 0 var(--space-2); cursor: pointer; }
-.renderer-toolbar button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
-.renderer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
-.renderer-toolbar button:not(:disabled):hover { border-color: var(--color-primary-accent-strong); }
-.renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.renderer-status [role="alert"] { color: var(--color-state-danger); }
-.primitive-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
-.primitive-editor { display: grid; gap: 10px; margin-bottom: 18px; }
-.primitive-editor h3 { margin: 0; font-size: 14px; }
-.primitive-editor label { display: grid; gap: 4px; font-size: 12px; }
-.primitive-editor input { width: 100%; box-sizing: border-box; }
-.primitive-error { color: #ff8d8d; font-size: 12px; margin: 0; }
-.inspector { display: grid; gap: 12px; }
-.inspector h3, .inspector h4 { margin: 0; font-size: var(--font-size-sm); }
-.inspector section { display: grid; gap: 10px; padding: 12px 0; border-top: var(--border-default); }
-.inspector-group { display: grid; gap: 6px; }
-.inspector-group-heading, .inspector-flag { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--font-size-sm); }
-.inspector-vector { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
-.inspector-vector label { min-width: 0; display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-.inspector-vector input, .inspector-parameter input { min-width: 0; width: 100%; box-sizing: border-box; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
-.inspector button { min-height: 26px; padding: 2px 6px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
-.inspector button:disabled { opacity: .5; cursor: not-allowed; }
-.inspector input:focus-visible, .inspector button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.inspector-parameter { display: flex; gap: 5px; }
-.inspector-parameter button { flex: none; }
-.inspector .primitive-error { color: var(--color-state-danger); }
-.boolean-editor label { display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
-.boolean-editor select { min-width: 0; width: 100%; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
-.boolean-editor .boolean-check { display: flex; align-items: center; gap: 7px; }
-.boolean-stack-item { display: grid; gap: 8px; padding: 10px; border: var(--border-default); border-radius: var(--radius-sm); }
-.boolean-stack-actions { display: flex; flex-wrap: wrap; gap: 5px; }
-button.tree-row { width: 100%; border: 0; text-align: left; background: transparent; color: inherit; cursor: pointer; }
-button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
-.object-tree { display: grid; gap: 8px; font-size: var(--font-size-sm); }
-.tree-search { width: 100%; box-sizing: border-box; min-height: 30px; border: var(--border-default); border-radius: var(--radius-sm); padding: 4px 8px; background: var(--color-surface-base); color: var(--color-text-primary); }
-.tree-tools, .tree-edit { display: flex; flex-wrap: wrap; gap: 4px; }
-.tree-tools button, .tree-edit button, .tree-edit select { border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); min-height: 26px; cursor: pointer; }
-.tree-tools button:disabled, .tree-edit button:disabled { opacity: .45; cursor: not-allowed; }
-.tree-scroll { height: 300px; overflow: auto; border: var(--border-default); border-radius: var(--radius-sm); }
-.object-row { position: absolute; left: 0; right: 0; height: 30px; box-sizing: border-box; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
-.object-row:hover { background: var(--color-state-info-surface); }
-.object-row.is-selected { background: var(--color-state-info-surface); }
-.object-row.is-active { outline: 1px solid var(--color-primary-accent-strong); outline-offset: -1px; }
-.object-row.is-drop-inside { box-shadow: inset 0 0 0 2px var(--color-primary-accent-strong); }
-.object-row.is-drop-before { box-shadow: inset 0 2px 0 var(--color-primary-accent-strong); }
-.object-row.is-drop-after { box-shadow: inset 0 -2px 0 var(--color-primary-accent-strong); }
-.object-row button { border: 0; background: transparent; color: var(--color-text-primary); cursor: pointer; }
-.object-row button:focus-visible, .tree-tools button:focus-visible, .tree-edit button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); }
-.object-row .tree-toggle { width: 18px; padding: 0; }
-.object-row .tree-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: left; }
-.object-row .tree-icon { width: 24px; padding: 0; }
-.tree-measure { display: none; }
 </file>
 
 <file path="src/ui/App.tsx">

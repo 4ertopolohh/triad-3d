@@ -115,7 +115,7 @@ describe("ModifierEvaluator", () => {
     p.nodes.find(n => n.id === "b")!.modifierIds = []; p.modifiers.pop();
     m.parameters = { operation: "wrong", cutterNodeId: "b" };
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
-    m.kind = "bend";
+    m.kind = "bevel";
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "UNSUPPORTED_MODIFIER" } });
   });
   it("keeps a fallback on worker failure and recovers on retry", async () => {
@@ -183,5 +183,42 @@ describe("ModifierEvaluator", () => {
     p.nodes.find(n => n.id === "b")!.transform.position = [1, 0, 0];
     complete({ jobId: "late", coordinateSpace: "target-local", output: csg.calls[0]!.target.mesh, empty: false, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] });
     expect(await pending).toMatchObject({ ok: false, error: { code: "STALE_PROJECT" }, fallback: false });
+  });
+  it("runs deformations in stack order, caches them, and keeps source state detached", async () => {
+    const p = fixture(), evaluator = new ModifierEvaluator({ csg: fake() });
+    const node = p.nodes.find(n => n.id === "a")!;
+    const m1: Modifier = { id: "bend", nodeId: "a", kind: "bend", order: 0, version: 0, enabled: true, parameters: { axis: "x", direction: "y", angleDegrees: 30, pivot: [0, 0, 0] } };
+    const m2: Modifier = { id: "twist", nodeId: "a", kind: "twist", order: 1, version: 0, enabled: true, parameters: { axis: "z", angleDegrees: 30, pivot: [0, 0, 0] } };
+    p.modifiers.push(m1, m2); node.modifierIds.push(m1.id, m2.id);
+    const before = JSON.stringify(p), first = await evaluator.evaluate(p, "a");
+    expect(first.ok && first.appliedModifierIds).toEqual(["bend", "twist"]);
+    expect(JSON.stringify(p)).toBe(before);
+    if (!first.ok) return;
+    const baseline = first.mesh.positions.slice(), size = evaluator.cacheSizeBytes;
+    first.mesh.positions[0] = 100;
+    const hit = await evaluator.evaluate(p, "a");
+    expect(hit.ok && hit.mesh.positions).toEqual(baseline);
+    expect(evaluator.cacheSizeBytes).toBe(size);
+    node.modifierIds.reverse(); m1.order = 1; m2.order = 0;
+    const reordered = await evaluator.evaluate(p, "a");
+    expect(reordered.ok && reordered.mesh.positions).not.toEqual(baseline);
+    m1.parameters.angleDegrees = -30; m1.version++;
+    const changed = await evaluator.evaluate(p, "a");
+    expect(changed.ok && changed.mesh.positions).not.toEqual(reordered.ok && reordered.mesh.positions);
+    m2.enabled = false;
+    expect((await evaluator.evaluate(p, "a")).appliedModifierIds).toEqual(["bend"]);
+  });
+  it("reports attribute loss and falls back after a failed later deformation", async () => {
+    const p = fixture(), evaluator = new ModifierEvaluator({ csg: fake() });
+    const node = p.nodes.find(n => n.id === "a")!;
+    const one: Modifier = { id: "one", nodeId: "a", kind: "taper", order: 0, version: 0, enabled: true, parameters: { axis: "z", startScale: 1, endScale: 1.2, pivot: [0, 0, 0] } };
+    const two: Modifier = { id: "two", nodeId: "a", kind: "twist", order: 1, version: 0, enabled: true, parameters: { axis: "z", angleDegrees: 1e6, pivot: [0, 0, 0] } };
+    p.modifiers.push(one, two); node.modifierIds.push(one.id, two.id);
+    const failed = await evaluator.evaluate(p, "a");
+    expect(failed).toMatchObject({ ok: false, error: { code: "INVALID_MODIFIER", modifierId: "two" }, fallback: true, appliedModifierIds: ["one"] });
+    expect(failed.warnings.map(w => w.code)).toContain("UV_DROPPED");
+    expect(failed.warnings.map(w => w.code)).toContain("NORMALS_RECOMPUTED");
+    two.enabled = false;
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true, appliedModifierIds: ["one"] });
   });
 });

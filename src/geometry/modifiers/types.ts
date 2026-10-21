@@ -2,6 +2,10 @@ import type { Project, MeshNode } from "../../domain/types";
 import type { CsgErrorCode, CsgOperation, CsgWarning, MeshData } from "../csg";
 
 export type BooleanParameters = { operation: CsgOperation; cutterNodeId: string };
+export type DeformAxis = "x" | "y" | "z";
+export type BendParameters = { axis: DeformAxis; direction: DeformAxis; angleDegrees: number; pivot: readonly [number, number, number] };
+export type TwistParameters = { axis: DeformAxis; angleDegrees: number; pivot: readonly [number, number, number] };
+export type TaperParameters = { axis: DeformAxis; startScale: number; endScale: number; pivot: readonly [number, number, number] };
 export type MirrorParameters = { axes: "x" | "y" | "z" | "xy" | "xz" | "yz" | "xyz"; pivot: readonly [number, number, number]; mergeSeam: boolean };
 export type ArrayParameters =
   | { mode: "linear"; count: number; axis: "x" | "y" | "z"; step: number; offset: readonly [number, number, number] }
