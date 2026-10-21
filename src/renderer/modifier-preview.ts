@@ -9,6 +9,7 @@ export class ModifierPreview {
   private readonly evaluator: ModifierEvaluator;
   private generation = -1;
   private epoch: object | undefined;
+  private geometryKey = "";
   private token = 0;
   private active = false;
   private closed = false;
@@ -21,10 +22,13 @@ export class ModifierPreview {
     const state = this.store.getSnapshot();
     const epoch = this.store.getProjectEpoch();
     if (this.generation === state.derived.generation && this.epoch === epoch) return;
+    const project = state.document.project;
+    const geometryKey = JSON.stringify([project.nodes.map(node => [node.id, node.parentId, node.transform, node.kind === "mesh" ? node.meshSource : null, node.modifierIds]), project.modifiers, project.assets]);
+    if (this.epoch === epoch && this.geometryKey === geometryKey) { this.generation = state.derived.generation; return; }
+    this.geometryKey = geometryKey;
     this.generation = state.derived.generation; this.epoch = epoch;
     const token = ++this.token;
     if (this.active) this.store.jobs.cancelJob();
-    const project = state.document.project;
     this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
     const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
     const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));

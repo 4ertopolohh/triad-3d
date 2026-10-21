@@ -31,20 +31,24 @@ export function applyTransform(object: T.Object3D, transform: Transform): void {
 function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
   if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
   return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
     transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
 }
+const editorMaterials = new WeakSet<T.Material>();
+function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  const created = material(value); editorMaterials.add(created); return created;
+}
 function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
-  const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
+  const oldMaterials = new Set<T.Material>();
   content.traverse(object => { if (!(object instanceof T.Mesh)) return;
     for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
-      oldMaterials.add(old);
-      for (const value of Object.values(old)) if (value instanceof T.Texture) oldTextures.add(value);
+      if (editorMaterials.has(old)) oldMaterials.add(old);
+      else if (!object.userData.originalMaterials) object.userData.originalMaterials = Array.isArray(object.material) ? [...object.material] : [object.material];
     }
-    object.material = values.length > 1 ? values.map(value => material(value)) : material(values[0]);
+    object.material = values.length > 1 && object.geometry.groups.length > 0
+      ? values.map(value => ownedMaterial(value)) : ownedMaterial(values[0]);
   });
   for (const old of oldMaterials) old.dispose();
-  for (const texture of oldTextures) { texture.dispose(); if (typeof ImageBitmap !== "undefined" && texture.image instanceof ImageBitmap) texture.image.close(); }
 }
 
 export class SceneSync {
@@ -124,8 +128,8 @@ export class SceneSync {
         this.surfaces.register(node.id, next.object, content); this.emit();
       };
       try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
-        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), material(materials[0])));
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), ownedMaterial(materials[0])));
+        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), ownedMaterial(materials[0])));
         else {
           if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
           const bytes = readAsset(source.assetId);
@@ -171,7 +175,7 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
-        content = new T.Mesh(geometry, material(this.nodeMaterials.get(nodeId)));
+        content = new T.Mesh(geometry, ownedMaterial(this.nodeMaterials.get(nodeId)));
       }
       if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
       if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }

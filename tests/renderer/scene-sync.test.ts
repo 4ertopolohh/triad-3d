@@ -1,10 +1,49 @@
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
 import { SceneSync } from "../../src/renderer/scene-sync";
-import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
+import { createNestedMeshProject, createMaterialAnimationProject, emptyProject } from "../fixtures/projects";
 
 const noAssets = () => undefined;
 describe("domain scene synchronization", () => {
+  it("updates a shared PBR material without replacing geometry or mesh", () => {
+    const project = createMaterialAnimationProject();
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const content = sync.objects.get("mesh-node")!.content as T.Mesh;
+    const geometry = content.geometry;
+    const old = content.material as T.MeshPhysicalMaterial;
+    const disposed = vi.spyOn(old, "dispose");
+    project.materials[0]!.roughness = 0.8;
+    project.materials[0]!.baseColor = [0.1, 0.2, 0.3];
+    sync.sync(project, noAssets);
+    expect(sync.objects.get("mesh-node")!.content).toBe(content);
+    expect(content.geometry).toBe(geometry);
+    expect(disposed).toHaveBeenCalledOnce();
+    expect((content.material as T.MeshPhysicalMaterial).roughness).toBe(0.8);
+    expect((content.material as T.MeshPhysicalMaterial).color.toArray()).toEqual([0.1, 0.2, 0.3]);
+    sync.dispose();
+  });
+  it("retains imported texture ownership while a domain override changes", async () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    if (mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "asset", assetId: "glb" };
+    project.assets.push({ id: "glb", hash: "f".repeat(64), path: `assets/${"f".repeat(64)}.glb`, mediaType: "model/gltf-binary", colorSpace: "none" });
+    const texture = new T.Texture();
+    const original = new T.MeshStandardMaterial({ map: texture });
+    const disposedTexture = vi.spyOn(texture, "dispose");
+    const disposedOriginal = vi.spyOn(original, "dispose");
+    const sync = new SceneSync(() => {}, async () => new T.Mesh(new T.BoxGeometry(), original));
+    sync.sync(project, () => new Uint8Array([1]));
+    await Promise.resolve(); await Promise.resolve();
+    project.materials[0]!.roughness = 0.9;
+    sync.sync(project, () => new Uint8Array([1]));
+    expect(disposedTexture).not.toHaveBeenCalled();
+    expect(disposedOriginal).not.toHaveBeenCalled();
+    sync.dispose();
+    expect(disposedTexture).toHaveBeenCalledOnce();
+    expect(disposedOriginal).toHaveBeenCalledOnce();
+  });
   it("keeps wrapper and geometry identity while reparenting and reordering", () => {
     const project = createNestedMeshProject();
     const root = project.nodes[0]!;

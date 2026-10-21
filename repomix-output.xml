@@ -5509,120 +5509,6 @@ export async function evaluateMirror(mesh: MeshData, params: MirrorParameters, s
 }
 </file>
 
-<file path="src/geometry/displace-brush.ts">
-import type { Vec3 } from "../domain/types";
-import { SEAM_TOLERANCE, validateEditableSource, type EditableMeshSource } from "./mesh-edit";
-
-type ReadonlyEditable = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
-
-export const MAX_BRUSH_VERTICES = 20_000;
-export const MAX_BRUSH_SAMPLES = 512;
-export const BRUSH_RADIUS_MIN = 0.01;
-export const BRUSH_RADIUS_MAX = 10;
-export const BRUSH_STRENGTH_MAX = 0.5;
-
-export function brushParameters(radius: number, strength: number): boolean {
-  return Number.isFinite(radius) && radius >= BRUSH_RADIUS_MIN && radius <= BRUSH_RADIUS_MAX
-    && Number.isFinite(strength) && Math.abs(strength) <= BRUSH_STRENGTH_MAX;
-}
-
-const vertexKey = (p: readonly number[], i: number) => [0, 1, 2].map(a => Math.round(p[3 * i + a]! / SEAM_TOLERANCE)).join(":");
-
-export function brushAffectedVertices(source: ReadonlyEditable, point: readonly number[], radius: number): number[] {
-  if (!Number.isFinite(radius) || radius <= 0 || point.length !== 3 || !point.every(Number.isFinite)) return [];
-  const result: number[] = [];
-  for (let i = 0; i < source.positions.length / 3; i++) {
-    const x = source.positions[3 * i]! - point[0]!;
-    const y = source.positions[3 * i + 1]! - point[1]!;
-    const z = source.positions[3 * i + 2]! - point[2]!;
-    if (x * x + y * y + z * z < radius * radius) result.push(i);
-  }
-  return result;
-}
-
-/** Pure local-space stroke. A canonical geometric vertex receives one displacement across UV seams. */
-export function displaceStroke(source: EditableMeshSource, samples: readonly (readonly number[])[], radius: number, strength: number): EditableMeshSource {
-  if (!brushParameters(radius, strength) || !samples.length || samples.length > MAX_BRUSH_SAMPLES
-    || samples.some(p => p.length !== 3 || !p.every(Number.isFinite))) throw new Error("Недопустимые параметры или точки мазка.");
-  if (source.positions.length / 3 > MAX_BRUSH_VERTICES) throw new Error(`Кисть поддерживает не более ${MAX_BRUSH_VERTICES} вершин.`);
-  const error = validateEditableSource(source);
-  if (error) throw new Error(error);
-  if (strength === 0) return source;
-  const p = source.positions, count = p.length / 3;
-  const groups = new Map<string, number[]>();
-  for (let i = 0; i < count; i++) {
-    const key = vertexKey(p, i);
-    const list = groups.get(key) ?? [];
-    if (list.length && [0, 1, 2].some(a => p[3 * list[0]! + a] !== p[3 * i + a])) throw new Error("Неоднозначное совпадение вершин после канонизации.");
-    list.push(i); groups.set(key, list);
-  }
-  const normals = new Map<string, [number, number, number]>();
-  const edgeUses = new Map<string, { count: number; winding: number }>();
-  let minEdge = Infinity;
-  const triangleNormals: number[][] = [];
-  for (let t = 0; t < source.indices.length; t += 3) {
-    const ids = source.indices.slice(t, t + 3);
-    const a = ids[0]!, b = ids[1]!, c = ids[2]!;
-    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
-      const from = vertexKey(p, u!), to = vertexKey(p, v!);
-      if (from === to) throw new Error("Вырожденное ребро сетки.");
-      const forward = from < to;
-      const edgeKey = forward ? `${from}|${to}` : `${to}|${from}`;
-      const use = edgeUses.get(edgeKey) ?? { count: 0, winding: 0 };
-      use.count++; use.winding += forward ? 1 : -1; edgeUses.set(edgeKey, use);
-    }
-    const ab = [0, 1, 2].map(k => p[3 * b + k]! - p[3 * a + k]!);
-    const ac = [0, 1, 2].map(k => p[3 * c + k]! - p[3 * a + k]!);
-    const cross = [ab[1]! * ac[2]! - ab[2]! * ac[1]!, ab[2]! * ac[0]! - ab[0]! * ac[2]!, ab[0]! * ac[1]! - ab[1]! * ac[0]!];
-    triangleNormals.push(cross);
-    for (const i of ids) {
-      const key = vertexKey(p, i), n = normals.get(key) ?? [0, 0, 0];
-      for (let k = 0; k < 3; k++) n[k] = n[k]! + cross[k]! / groups.get(key)!.length;
-      normals.set(key, n);
-    }
-    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
-      const length = Math.hypot(...[0, 1, 2].map(k => p[3 * u! + k]! - p[3 * v! + k]!));
-      if (length > 1e-9) minEdge = Math.min(minEdge, length);
-    }
-  }
-  if (!Number.isFinite(minEdge)) throw new Error("Невозможно определить масштаб сетки.");
-  if ([...edgeUses.values()].some(edge => edge.count !== 2 || edge.winding !== 0))
-    throw new Error("Кисть поддерживает только замкнутую согласованно ориентированную сетку.");
-  const next = p.slice();
-  const maxDisplacement = Math.min(Math.abs(strength), minEdge * 0.1);
-  let changed = false;
-  for (const [key, ids] of groups) {
-    const i = ids[0]!, n = normals.get(key) ?? [0, 0, 0];
-    const length = Math.hypot(...n);
-    if (length < 1e-12) continue;
-    let influence = 0;
-    for (const point of samples) {
-      const d = Math.hypot(p[3 * i]! - point[0]!, p[3 * i + 1]! - point[1]!, p[3 * i + 2]! - point[2]!);
-      if (d < radius) influence = Math.max(influence, (1 - d / radius) ** 2);
-    }
-    const amount = Math.sign(strength) * Math.min(maxDisplacement, Math.abs(strength) * influence);
-    if (!amount) continue;
-    const moved = [0, 1, 2].map(k => Math.fround(p[3 * i + k]! + n[k]! / length * amount));
-    if (!moved.every(Number.isFinite)) throw new Error("Переполнение координат Float32.");
-    for (const member of ids) for (let k = 0; k < 3; k++) { next[3 * member + k] = moved[k]!; if (moved[k] !== p[3 * member + k]) changed = true; }
-  }
-  if (!changed) return source;
-  const result: EditableMeshSource = { ...source, positions: next };
-  const resultError = validateEditableSource(result);
-  if (resultError) throw new Error(resultError);
-  for (let t = 0; t < source.indices.length; t += 3) {
-    const [a, b, c] = source.indices.slice(t, t + 3);
-    const ab = [0, 1, 2].map(k => next[3 * b! + k]! - next[3 * a! + k]!);
-    const ac = [0, 1, 2].map(k => next[3 * c! + k]! - next[3 * a! + k]!);
-    const cross = [ab[1]! * ac[2]! - ab[2]! * ac[1]!, ab[2]! * ac[0]! - ab[0]! * ac[2]!, ab[0]! * ac[1]! - ab[1]! * ac[0]!];
-    if (cross.reduce((sum, v, k) => sum + v * triangleNormals[t / 3]![k]!, 0) <= 0) throw new Error("Мазок переворачивает треугольник.");
-  }
-  return result;
-}
-
-export type BrushPoint = Vec3;
-</file>
-
 <file path="src/geometry/mesh-topology.ts">
 type EditableMeshSource = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
 import { vertexKey } from "./vertex-selection";
@@ -8461,109 +8347,6 @@ describe("deform", () => {
 });
 </file>
 
-<file path="tests/geometry/displace-brush.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { AssetBytes } from "../../src/assets/asset-bytes";
-import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
-import { createEditorStore } from "../../src/app/editor-store";
-import { createProject } from "../../src/domain/create-project";
-import { displaceStroke, brushAffectedVertices, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES } from "../../src/geometry/displace-brush";
-import { convertPrimitiveToEditable, validateEditableSource } from "../../src/geometry/mesh-edit";
-import { createPrimitiveNode } from "../../src/geometry/primitives";
-import { SceneSync } from "../../src/renderer/scene-sync";
-
-function fixture() {
-  let sequence = 0;
-  const project = createProject(() => `id-${++sequence}`);
-  const node = createPrimitiveNode("cube", project.model.rootNodeId, "cube");
-  project.nodes[0]!.children.push(node.id); project.nodes.push(node);
-  const source = convertPrimitiveToEditable(node.meshSource as Extract<typeof node.meshSource, { kind: "primitive" }>);
-  return { project, source };
-}
-
-describe("Displace Brush", () => {
-  it("is deterministic, radial, signed, seam-safe and leaves input/topology untouched", () => {
-    const { source } = fixture();
-    const before = structuredClone(source);
-    const center = source.positions.slice(0, 3) as [number, number, number];
-    const samples = [center];
-    const positive = displaceStroke(source, samples, 0.35, 0.06);
-    const negative = displaceStroke(source, samples, 0.35, -0.06);
-    expect(positive).toEqual(displaceStroke(source, samples, 0.35, 0.06));
-    expect(positive.positions).not.toEqual(source.positions);
-    expect(negative.positions).not.toEqual(positive.positions);
-    expect(positive.indices).toEqual(source.indices);
-    expect(positive.uv).toEqual(source.uv);
-    expect(source).toEqual(before);
-    const affected = brushAffectedVertices(source, center, 0.35);
-    expect(affected.length).toBeGreaterThan(1);
-    for (let i = 0; i < source.positions.length / 3; i++) {
-      if (affected.includes(i)) expect(positive.positions.slice(i * 3, i * 3 + 3)).toEqual(positive.positions.slice(0, 3));
-      else expect(positive.positions.slice(i * 3, i * 3 + 3)).toEqual(source.positions.slice(i * 3, i * 3 + 3));
-    }
-    expect(validateEditableSource(positive)).toBeNull();
-    const edgePoint: [number, number, number] = [center[0] + 0.2, center[1], center[2]];
-    const tapered = displaceStroke(source, [edgePoint], 1.5, 0.06);
-    const movement = (i: number) => Math.hypot(...[0, 1, 2].map(axis => tapered.positions[3 * i + axis]! - source.positions[3 * i + axis]!));
-    const distances = Array.from({ length: source.positions.length / 3 }, (_, i) => ({ i, d: Math.hypot(...[0, 1, 2].map(axis => source.positions[3 * i + axis]! - edgePoint[axis]!)) }));
-    const nearest = distances.reduce((a, b) => a.d < b.d ? a : b);
-    const farther = distances.filter(value => value.d < 1.5 && value.d > nearest.d + 0.1).sort((a, b) => a.d - b.d)[0]!;
-    expect(movement(nearest.i)).toBeGreaterThan(movement(farther.i));
-  });
-
-  it("returns semantic no-ops and rejects invalid input without mutation", () => {
-    const { source } = fixture();
-    const original = structuredClone(source);
-    expect(displaceStroke(source, [[100, 100, 100]], 0.35, 0.06)).toBe(source);
-    expect(displaceStroke(source, [[0, 0, 0]], 0.35, 0)).toBe(source);
-    for (const [radius, strength] of [[NaN, 0.06], [Infinity, 0.06], [0, 0.06], [11, 0.06], [0.35, 1]])
-      expect(() => displaceStroke(source, [[0, 0, 0]], radius!, strength!)).toThrow();
-    expect(() => displaceStroke(source, [[Infinity, 0, 0]], 0.35, 0.06)).toThrow();
-    expect(() => displaceStroke(source, Array.from({ length: MAX_BRUSH_SAMPLES + 1 }, () => [0, 0, 0]), 0.35, 0.06)).toThrow();
-    expect(() => displaceStroke({ kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] }, [[0, 0, 0]], 0.35, 0.06)).toThrow(/замкнутую/);
-    expect(() => displaceStroke({ ...source, positions: Array(MAX_BRUSH_VERTICES * 3 + 3).fill(0) }, [[0, 0, 0]], 0.35, 0.06)).toThrow();
-    expect(source).toEqual(original);
-  });
-
-  it("records one reversible command and archives the result", async () => {
-    const { project, source } = fixture();
-    const node = project.nodes.find(n => n.id === "cube")!;
-    if (node.kind !== "mesh") throw new Error("fixture");
-    node.meshSource = source;
-    const store = createEditorStore(project);
-    const scene = new SceneSync(() => {});
-    scene.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
-    const oldGeometry = (scene.objects.get("cube")!.content as T.Mesh).geometry;
-    const disposed = vi.spyOn(oldGeometry, "dispose");
-    const command = { commandId: "stroke", type: "APPLY_DISPLACE_STROKE" as const, targetIds: ["cube"] as [string],
-      payload: { nodeId: "cube", samples: [source.positions.slice(0, 3) as [number, number, number]], radius: 0.35, strength: 0.06 } };
-    const result = store.executeCommand(command, 0);
-    expect(result).toMatchObject({ ok: true, changed: true });
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    scene.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
-    expect(disposed).toHaveBeenCalledOnce();
-    const updated = store.getSnapshot().document.project.nodes.find(n => n.id === "cube");
-    if (updated?.kind !== "mesh" || updated.meshSource.kind !== "editable") throw new Error("updated fixture");
-    expect((scene.objects.get("cube")!.content as T.Mesh).geometry.getAttribute("position").array).toEqual(Float32Array.from(updated.meshSource.positions));
-    const changed = store.captureDocument().project;
-    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
-    expect(store.captureDocument().project.nodes.find(n => n.id === "cube")).toEqual(node);
-    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
-    expect(store.captureDocument().project).toEqual(changed);
-    expect(store.executeCommand({ ...command, commandId: "stale" }, 0).ok).toBe(false);
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    const archive = await createNativeProjectArchive(changed, new AssetBytes(), "0.1.0");
-    expect(archive.ok).toBe(true);
-    if (!archive.ok) return;
-    const reopened = await openNativeProjectArchive(archive.value);
-    expect(reopened.ok).toBe(true);
-    if (reopened.ok) expect(reopened.value.project).toEqual(changed);
-    scene.dispose();
-  });
-});
-</file>
-
 <file path="tests/geometry/mesh-extrude-integration.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -9221,59 +9004,6 @@ describe("renderer lifecycle", () => {
     await second.dispose();
     expect(host.canvases.size).toBe(0);
     expect(created[1]!.dispose).toHaveBeenCalledOnce();
-  });
-});
-</file>
-
-<file path="tests/renderer/displace-brush-interactions.test.ts">
-import { afterEach, describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { createEditorStore } from "../../src/app/editor-store";
-import { createProject } from "../../src/domain/create-project";
-import { convertPrimitiveToEditable } from "../../src/geometry/mesh-edit";
-import { createPrimitiveNode } from "../../src/geometry/primitives";
-import type { SurfaceHit } from "../../src/geometry/surface-query";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import { ViewportInteractions } from "../../src/renderer/viewport-interactions";
-
-describe("brush pointer lifecycle", () => {
-  afterEach(() => vi.unstubAllGlobals());
-  it("commits one stroke and cancels Escape without changing history", () => {
-    const document = new EventTarget();
-    const capture = new Set<number>();
-    const canvas = Object.assign(new EventTarget(), {
-      style: {}, ownerDocument: document, getRootNode: () => document,
-      setPointerCapture: (id: number) => capture.add(id),
-      hasPointerCapture: (id: number) => capture.has(id),
-      releasePointerCapture: (id: number) => capture.delete(id),
-      getBoundingClientRect: () => ({ left: 0, top: 0, right: 600, bottom: 400, width: 600, height: 400 }),
-    }) as unknown as HTMLCanvasElement;
-    const window = new EventTarget(); vi.stubGlobal("window", window);
-    let sequence = 0;
-    const project = createProject(() => `id-${++sequence}`);
-    const node = createPrimitiveNode("cube", project.model.rootNodeId, "cube");
-    node.meshSource = convertPrimitiveToEditable(node.meshSource as Extract<typeof node.meshSource, { kind: "primitive" }>);
-    project.nodes[0]!.children.push(node.id); project.nodes.push(node);
-    const store = createEditorStore(project); store.setSelection([node.id]); store.setTool({ active: "displace" });
-    const graph = new SceneSync(() => {});
-    graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
-    const unsubscribe = store.subscribe(() => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch()));
-    const source = node.meshSource;
-    if (source.kind !== "editable") throw new Error("fixture");
-    const local = new T.Vector3(...source.positions.slice(0, 3) as [number, number, number]);
-    const hit = { nodeId: node.id, pointNodeLocal: local, pointWorld: local, pointLocal: local, normalWorld: new T.Vector3(0, 1, 0), normalLocal: new T.Vector3(0, 1, 0),
-      mesh: new T.Mesh(), distance: 1 } as SurfaceHit;
-    vi.spyOn(graph.surfaces, "nearest").mockReturnValue(hit);
-    const controller = new ViewportInteractions(graph, canvas, store, () => {}, false);
-    const pointer = (type: string, x = 300) => canvas.dispatchEvent(Object.assign(new Event(type), { button: 0, pointerId: 1, clientX: x, clientY: 200 }));
-    pointer("pointerdown"); pointer("pointermove", 310); pointer("pointerup", 310);
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    expect(store.getSnapshot().tool.active).toBe("displace");
-    pointer("pointerdown");
-    window.dispatchEvent(Object.assign(new Event("keydown"), { key: "Escape", ctrlKey: false, metaKey: false, altKey: false }));
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    expect(capture.size).toBe(0);
-    controller.dispose(); unsubscribe(); graph.dispose();
   });
 });
 </file>
@@ -10826,6 +10556,136 @@ export interface Keyframe {
 }
 </file>
 
+<file path="src/geometry/displace-brush.ts">
+import type { Vec3 } from "../domain/types";
+import { SEAM_TOLERANCE, validateEditableSource, type EditableMeshSource } from "./mesh-edit";
+
+type ReadonlyEditable = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
+
+export const MAX_BRUSH_VERTICES = 20_000;
+export const MAX_BRUSH_SAMPLES = 512;
+export const BRUSH_RADIUS_MIN = 0.01;
+export const BRUSH_RADIUS_MAX = 10;
+export const BRUSH_STRENGTH_MAX = 0.5;
+export type BrushSymmetry = "off" | "x" | "y" | "z";
+export const isBrushSymmetry = (value: unknown): value is BrushSymmetry =>
+  value === "off" || value === "x" || value === "y" || value === "z";
+
+/** Centers of one sample in mesh-local coordinates. Coincident centers act once. */
+export function brushCenters(point: readonly number[], symmetry: BrushSymmetry = "off"): readonly (readonly number[])[] {
+  if (symmetry === "off") return [point];
+  const axis = { x: 0, y: 1, z: 2 }[symmetry];
+  const reflected = [...point];
+  reflected[axis] = -reflected[axis]!;
+  return reflected[axis] === point[axis] ? [point] : [point, reflected];
+}
+
+export function brushParameters(radius: number, strength: number): boolean {
+  return Number.isFinite(radius) && radius >= BRUSH_RADIUS_MIN && radius <= BRUSH_RADIUS_MAX
+    && Number.isFinite(strength) && Math.abs(strength) <= BRUSH_STRENGTH_MAX;
+}
+
+const vertexKey = (p: readonly number[], i: number) => [0, 1, 2].map(a => Math.round(p[3 * i + a]! / SEAM_TOLERANCE)).join(":");
+
+export function brushAffectedVertices(source: ReadonlyEditable, point: readonly number[], radius: number, symmetry: BrushSymmetry = "off"): number[] {
+  if (!Number.isFinite(radius) || radius <= 0 || point.length !== 3 || !point.every(Number.isFinite)) return [];
+  const result: number[] = [];
+  const centers = brushCenters(point, symmetry);
+  for (let i = 0; i < source.positions.length / 3; i++) {
+    if (centers.some(center => {
+      const x = source.positions[3 * i]! - center[0]!;
+      const y = source.positions[3 * i + 1]! - center[1]!;
+      const z = source.positions[3 * i + 2]! - center[2]!;
+      return x * x + y * y + z * z < radius * radius;
+    })) result.push(i);
+  }
+  return result;
+}
+
+/** Pure local-space stroke. A canonical geometric vertex receives one displacement across UV seams. */
+export function displaceStroke(source: EditableMeshSource, samples: readonly (readonly number[])[], radius: number, strength: number, symmetry: BrushSymmetry = "off"): EditableMeshSource {
+  if (!brushParameters(radius, strength) || !samples.length || samples.length > MAX_BRUSH_SAMPLES
+    || !isBrushSymmetry(symmetry) || samples.some(p => p.length !== 3 || !p.every(Number.isFinite))) throw new Error("Недопустимые параметры или точки мазка.");
+  if (source.positions.length / 3 > MAX_BRUSH_VERTICES) throw new Error(`Кисть поддерживает не более ${MAX_BRUSH_VERTICES} вершин.`);
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (strength === 0) return source;
+  const p = source.positions, count = p.length / 3;
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < count; i++) {
+    const key = vertexKey(p, i);
+    const list = groups.get(key) ?? [];
+    if (list.length && [0, 1, 2].some(a => p[3 * list[0]! + a] !== p[3 * i + a])) throw new Error("Неоднозначное совпадение вершин после канонизации.");
+    list.push(i); groups.set(key, list);
+  }
+  const normals = new Map<string, [number, number, number]>();
+  const edgeUses = new Map<string, { count: number; winding: number }>();
+  let minEdge = Infinity;
+  const triangleNormals: number[][] = [];
+  for (let t = 0; t < source.indices.length; t += 3) {
+    const ids = source.indices.slice(t, t + 3);
+    const a = ids[0]!, b = ids[1]!, c = ids[2]!;
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const from = vertexKey(p, u!), to = vertexKey(p, v!);
+      if (from === to) throw new Error("Вырожденное ребро сетки.");
+      const forward = from < to;
+      const edgeKey = forward ? `${from}|${to}` : `${to}|${from}`;
+      const use = edgeUses.get(edgeKey) ?? { count: 0, winding: 0 };
+      use.count++; use.winding += forward ? 1 : -1; edgeUses.set(edgeKey, use);
+    }
+    const ab = [0, 1, 2].map(k => p[3 * b + k]! - p[3 * a + k]!);
+    const ac = [0, 1, 2].map(k => p[3 * c + k]! - p[3 * a + k]!);
+    const cross = [ab[1]! * ac[2]! - ab[2]! * ac[1]!, ab[2]! * ac[0]! - ab[0]! * ac[2]!, ab[0]! * ac[1]! - ab[1]! * ac[0]!];
+    triangleNormals.push(cross);
+    for (const i of ids) {
+      const key = vertexKey(p, i), n = normals.get(key) ?? [0, 0, 0];
+      for (let k = 0; k < 3; k++) n[k] = n[k]! + cross[k]! / groups.get(key)!.length;
+      normals.set(key, n);
+    }
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const length = Math.hypot(...[0, 1, 2].map(k => p[3 * u! + k]! - p[3 * v! + k]!));
+      if (length > 1e-9) minEdge = Math.min(minEdge, length);
+    }
+  }
+  if (!Number.isFinite(minEdge)) throw new Error("Невозможно определить масштаб сетки.");
+  if ([...edgeUses.values()].some(edge => edge.count !== 2 || edge.winding !== 0))
+    throw new Error("Кисть поддерживает только замкнутую согласованно ориентированную сетку.");
+  const next = p.slice();
+  const centers = samples.flatMap(point => brushCenters(point, symmetry));
+  const maxDisplacement = Math.min(Math.abs(strength), minEdge * 0.1);
+  let changed = false;
+  for (const [key, ids] of groups) {
+    const i = ids[0]!, n = normals.get(key) ?? [0, 0, 0];
+    const length = Math.hypot(...n);
+    if (length < 1e-12) continue;
+    let influence = 0;
+    for (const point of centers) {
+      const d = Math.hypot(p[3 * i]! - point[0]!, p[3 * i + 1]! - point[1]!, p[3 * i + 2]! - point[2]!);
+      if (d < radius) influence = Math.max(influence, (1 - d / radius) ** 2);
+    }
+    const amount = Math.sign(strength) * Math.min(maxDisplacement, Math.abs(strength) * influence);
+    if (!amount) continue;
+    const moved = [0, 1, 2].map(k => Math.fround(p[3 * i + k]! + n[k]! / length * amount));
+    if (!moved.every(Number.isFinite)) throw new Error("Переполнение координат Float32.");
+    for (const member of ids) for (let k = 0; k < 3; k++) { next[3 * member + k] = moved[k]!; if (moved[k] !== p[3 * member + k]) changed = true; }
+  }
+  if (!changed) return source;
+  const result: EditableMeshSource = { ...source, positions: next };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  for (let t = 0; t < source.indices.length; t += 3) {
+    const [a, b, c] = source.indices.slice(t, t + 3);
+    const ab = [0, 1, 2].map(k => next[3 * b! + k]! - next[3 * a! + k]!);
+    const ac = [0, 1, 2].map(k => next[3 * c! + k]! - next[3 * a! + k]!);
+    const cross = [ab[1]! * ac[2]! - ab[2]! * ac[1]!, ab[2]! * ac[0]! - ab[0]! * ac[2]!, ab[0]! * ac[1]! - ab[1]! * ac[0]!];
+    if (cross.reduce((sum, v, k) => sum + v * triangleNormals[t / 3]![k]!, 0) <= 0) throw new Error("Мазок переворачивает треугольник.");
+  }
+  return result;
+}
+
+export type BrushPoint = Vec3;
+</file>
+
 <file path="src/importers/gltf/import-glb.ts">
 import { disposeObject } from "../../assets/three-resources";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -11966,6 +11826,166 @@ export function createMissingReferenceProject(): Project {
 }
 </file>
 
+<file path="tests/geometry/displace-brush.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createProject } from "../../src/domain/create-project";
+import { displaceStroke, brushAffectedVertices, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES } from "../../src/geometry/displace-brush";
+import { convertPrimitiveToEditable, validateEditableSource } from "../../src/geometry/mesh-edit";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import { SceneSync } from "../../src/renderer/scene-sync";
+
+function fixture() {
+  let sequence = 0;
+  const project = createProject(() => `id-${++sequence}`);
+  const node = createPrimitiveNode("cube", project.model.rootNodeId, "cube");
+  project.nodes[0]!.children.push(node.id); project.nodes.push(node);
+  const source = convertPrimitiveToEditable(node.meshSource as Extract<typeof node.meshSource, { kind: "primitive" }>);
+  return { project, source };
+}
+
+describe("Displace Brush", () => {
+  it("is deterministic, radial, signed, seam-safe and leaves input/topology untouched", () => {
+    const { source } = fixture();
+    const before = structuredClone(source);
+    const center = source.positions.slice(0, 3) as [number, number, number];
+    const samples = [center];
+    const positive = displaceStroke(source, samples, 0.35, 0.06);
+    const negative = displaceStroke(source, samples, 0.35, -0.06);
+    expect(positive).toEqual(displaceStroke(source, samples, 0.35, 0.06));
+    expect(positive.positions).not.toEqual(source.positions);
+    expect(negative.positions).not.toEqual(positive.positions);
+    expect(positive.indices).toEqual(source.indices);
+    expect(positive.uv).toEqual(source.uv);
+    expect(source).toEqual(before);
+    const affected = brushAffectedVertices(source, center, 0.35);
+    expect(affected.length).toBeGreaterThan(1);
+    for (let i = 0; i < source.positions.length / 3; i++) {
+      if (affected.includes(i)) expect(positive.positions.slice(i * 3, i * 3 + 3)).toEqual(positive.positions.slice(0, 3));
+      else expect(positive.positions.slice(i * 3, i * 3 + 3)).toEqual(source.positions.slice(i * 3, i * 3 + 3));
+    }
+    expect(validateEditableSource(positive)).toBeNull();
+    const edgePoint: [number, number, number] = [center[0] + 0.2, center[1], center[2]];
+    const tapered = displaceStroke(source, [edgePoint], 1.5, 0.06);
+    const movement = (i: number) => Math.hypot(...[0, 1, 2].map(axis => tapered.positions[3 * i + axis]! - source.positions[3 * i + axis]!));
+    const distances = Array.from({ length: source.positions.length / 3 }, (_, i) => ({ i, d: Math.hypot(...[0, 1, 2].map(axis => source.positions[3 * i + axis]! - edgePoint[axis]!)) }));
+    const nearest = distances.reduce((a, b) => a.d < b.d ? a : b);
+    const farther = distances.filter(value => value.d < 1.5 && value.d > nearest.d + 0.1).sort((a, b) => a.d - b.d)[0]!;
+    expect(movement(nearest.i)).toBeGreaterThan(movement(farther.i));
+  });
+
+  it("returns semantic no-ops and rejects invalid input without mutation", () => {
+    const { source } = fixture();
+    const original = structuredClone(source);
+    expect(displaceStroke(source, [[100, 100, 100]], 0.35, 0.06)).toBe(source);
+    expect(displaceStroke(source, [[0, 0, 0]], 0.35, 0)).toBe(source);
+    for (const [radius, strength] of [[NaN, 0.06], [Infinity, 0.06], [0, 0.06], [11, 0.06], [0.35, 1]])
+      expect(() => displaceStroke(source, [[0, 0, 0]], radius!, strength!)).toThrow();
+    expect(() => displaceStroke(source, [[Infinity, 0, 0]], 0.35, 0.06)).toThrow();
+    expect(() => displaceStroke(source, Array.from({ length: MAX_BRUSH_SAMPLES + 1 }, () => [0, 0, 0]), 0.35, 0.06)).toThrow();
+    expect(() => displaceStroke({ kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] }, [[0, 0, 0]], 0.35, 0.06)).toThrow(/замкнутую/);
+    expect(() => displaceStroke({ ...source, positions: Array(MAX_BRUSH_VERTICES * 3 + 3).fill(0) }, [[0, 0, 0]], 0.35, 0.06)).toThrow();
+    expect(source).toEqual(original);
+  });
+
+  it("mirrors around each mesh-local plane and uses maximum influence in overlaps", () => {
+    const { source } = fixture();
+    const before = structuredClone(source);
+    const point = source.positions.slice(0, 3) as [number, number, number];
+    for (const [axis, index] of [["x", 0], ["y", 1], ["z", 2]] as const) {
+      const reflected = [...point] as [number, number, number]; reflected[index] *= -1;
+      const mirrored = displaceStroke(source, [point], 0.35, 0.06, axis);
+      const separate = displaceStroke(source, [point, reflected], 0.35, 0.06);
+      expect(mirrored).toEqual(separate);
+      expect(brushAffectedVertices(source, point, 0.35, axis)).toEqual(
+        brushAffectedVertices(source, point, 0.35).concat(brushAffectedVertices(source, reflected, 0.35))
+          .filter((value, position, values) => values.indexOf(value) === position).sort((a, b) => a - b));
+      expect(mirrored.positions).not.toEqual(displaceStroke(source, [point], 0.35, 0.06).positions);
+      expect(mirrored.indices).toEqual(source.indices);
+      expect(mirrored.uv).toEqual(source.uv);
+      expect(validateEditableSource(mirrored)).toBeNull();
+    }
+    const onPlane: [number, number, number] = [0, point[1], point[2]];
+    expect(displaceStroke(source, [onPlane], 0.75, 0.06, "x")).toEqual(displaceStroke(source, [onPlane], 0.75, 0.06));
+    const overlapping: [number, number, number] = [0.1, point[1], point[2]];
+    const reflected: [number, number, number] = [-0.1, point[1], point[2]];
+    expect(displaceStroke(source, [overlapping], 1.2, 0.06, "x")).toEqual(displaceStroke(source, [overlapping, reflected, overlapping], 1.2, 0.06));
+    expect(displaceStroke(source, [overlapping, overlapping], 1.2, 0.06, "x")).toEqual(displaceStroke(source, [overlapping], 1.2, 0.06, "x"));
+    const shifted = { ...source, positions: source.positions.map((value, i) => value + (i % 3 === 0 ? 5 : 0)) };
+    const shiftedPoint: [number, number, number] = [point[0] + 5, point[1], point[2]];
+    expect(displaceStroke(shifted, [shiftedPoint], 0.35, 0.06, "x")).toEqual(displaceStroke(shifted, [shiftedPoint], 0.35, 0.06));
+    expect(source).toEqual(before);
+  });
+
+  it("records one reversible command and archives the result", async () => {
+    const { project, source } = fixture();
+    const node = project.nodes.find(n => n.id === "cube")!;
+    if (node.kind !== "mesh") throw new Error("fixture");
+    node.meshSource = source;
+    const store = createEditorStore(project);
+    const scene = new SceneSync(() => {});
+    scene.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    const oldGeometry = (scene.objects.get("cube")!.content as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    const command = { commandId: "stroke", type: "APPLY_DISPLACE_STROKE" as const, targetIds: ["cube"] as [string],
+      payload: { nodeId: "cube", samples: [source.positions.slice(0, 3) as [number, number, number]], radius: 0.35, strength: 0.06 } };
+    const result = store.executeCommand(command, 0);
+    expect(result).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    scene.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    expect(disposed).toHaveBeenCalledOnce();
+    const updated = store.getSnapshot().document.project.nodes.find(n => n.id === "cube");
+    if (updated?.kind !== "mesh" || updated.meshSource.kind !== "editable") throw new Error("updated fixture");
+    expect((scene.objects.get("cube")!.content as T.Mesh).geometry.getAttribute("position").array).toEqual(Float32Array.from(updated.meshSource.positions));
+    const changed = store.captureDocument().project;
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.captureDocument().project.nodes.find(n => n.id === "cube")).toEqual(node);
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.captureDocument().project).toEqual(changed);
+    expect(store.executeCommand({ ...command, commandId: "stale" }, 0).ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    const archive = await createNativeProjectArchive(changed, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (!archive.ok) return;
+    const reopened = await openNativeProjectArchive(archive.value);
+    expect(reopened.ok).toBe(true);
+    if (reopened.ok) expect(reopened.value.project).toEqual(changed);
+    const validSymmetric = store.executeCommand({ ...command, commandId: "symmetry", payload: { ...command.payload, symmetry: "x" } }, store.getSnapshot().document.revision);
+    expect(validSymmetric).toMatchObject({ ok: true, changed: true });
+    const historyLength = store.getSnapshot().history.entries.length;
+    const symmetricProject = store.captureDocument().project;
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.captureDocument().project).toEqual(symmetricProject);
+    const snapshot = store.captureDocument();
+    const symmetricArchive = await createNativeProjectArchive(symmetricProject, new AssetBytes(), "0.1.0");
+    expect(symmetricArchive.ok).toBe(true);
+    if (symmetricArchive.ok) {
+      const reopenedSymmetric = await openNativeProjectArchive(symmetricArchive.value);
+      expect(reopenedSymmetric.ok && reopenedSymmetric.value.project).toEqual(symmetricProject);
+    }
+    for (const symmetry of [null, "invalid", 4, undefined]) {
+      const invalid = { ...command, commandId: `bad-${String(symmetry)}`, payload: { ...command.payload, symmetry } };
+      expect(store.executeCommand(invalid as typeof command, store.getSnapshot().document.revision).ok).toBe(false);
+      expect(store.captureDocument()).toEqual(snapshot);
+      expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
+    }
+    expect(store.executeCommand({ ...command, commandId: "extra", payload: { ...command.payload, symmetry: "x", extra: true } } as typeof command,
+      store.getSnapshot().document.revision).ok).toBe(false);
+    expect(store.captureDocument()).toEqual(snapshot);
+    expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
+    const noop = store.executeCommand({ ...command, commandId: "noop", payload: { ...command.payload, samples: [[100, 100, 100]], symmetry: "x" } },
+      store.getSnapshot().document.revision);
+    expect(noop).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(historyLength);
+    scene.dispose();
+  });
+});
+</file>
+
 <file path="tests/geometry/mesh-edit.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -12485,6 +12505,83 @@ describe("GLB import", () => {
     expect(store.getSnapshot().document.project).toEqual(captured.project);
     expect(store.getSnapshot().history.entries).toHaveLength(0);
     expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+});
+</file>
+
+<file path="tests/renderer/displace-brush-interactions.test.ts">
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createProject } from "../../src/domain/create-project";
+import { convertPrimitiveToEditable } from "../../src/geometry/mesh-edit";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import type { SurfaceHit } from "../../src/geometry/surface-query";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { ViewportInteractions } from "../../src/renderer/viewport-interactions";
+
+describe("brush pointer lifecycle", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("commits one stroke and cancels Escape without changing history", () => {
+    const document = new EventTarget();
+    const capture = new Set<number>();
+    const canvas = Object.assign(new EventTarget(), {
+      style: {}, ownerDocument: document, getRootNode: () => document,
+      setPointerCapture: (id: number) => capture.add(id),
+      hasPointerCapture: (id: number) => capture.has(id),
+      releasePointerCapture: (id: number) => capture.delete(id),
+      getBoundingClientRect: () => ({ left: 0, top: 0, right: 600, bottom: 400, width: 600, height: 400 }),
+    }) as unknown as HTMLCanvasElement;
+    const window = new EventTarget(); vi.stubGlobal("window", window);
+    let sequence = 0;
+    const project = createProject(() => `id-${++sequence}`);
+    const node = createPrimitiveNode("cube", project.model.rootNodeId, "cube");
+    node.meshSource = convertPrimitiveToEditable(node.meshSource as Extract<typeof node.meshSource, { kind: "primitive" }>);
+    node.transform.position = [4, 2, -3];
+    node.transform.rotationQuat = new T.Quaternion().setFromAxisAngle(new T.Vector3(0, 1, 0), Math.PI / 3).toArray();
+    project.nodes[0]!.children.push(node.id); project.nodes.push(node);
+    const store = createEditorStore(project); store.setSelection([node.id]); store.setTool({ active: "displace" });
+    const graph = new SceneSync(() => {});
+    graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch());
+    const unsubscribe = store.subscribe(() => graph.sync(store.getSnapshot().document.project, () => undefined, store.getProjectEpoch()));
+    const source = node.meshSource;
+    if (source.kind !== "editable") throw new Error("fixture");
+    const local = new T.Vector3(...source.positions.slice(0, 3) as [number, number, number]);
+    const hit = { nodeId: node.id, pointNodeLocal: local, pointWorld: local, pointLocal: local, normalWorld: new T.Vector3(0, 1, 0), normalLocal: new T.Vector3(0, 1, 0),
+      mesh: new T.Mesh(), distance: 1 } as SurfaceHit;
+    vi.spyOn(graph.surfaces, "nearest").mockReturnValue(hit);
+    const controller = new ViewportInteractions(graph, canvas, store, () => {}, false);
+    const pointer = (type: string, x = 300) => canvas.dispatchEvent(Object.assign(new Event(type), { button: 0, pointerId: 1, clientX: x, clientY: 200 }));
+    controller.setBrush(0.35, 0.06, "x");
+    pointer("pointermove");
+    const preview = graph.objects.get(node.id)!.object.children.find(child => child instanceof T.Points) as T.Points;
+    expect(preview).toBeDefined();
+    const positions = preview.geometry.getAttribute("position") as T.BufferAttribute;
+    expect(positions.getX(0)).toBe(local.x);
+    expect(positions.getX(1)).toBe(-local.x);
+    expect(preview.geometry.drawRange.count).toBeGreaterThan(2);
+    expect(preview.parent).toBe(graph.objects.get(node.id)!.object);
+    expect(preview.raycast).toBeDefined();
+    const previewGeometryDisposed = vi.spyOn(preview.geometry, "dispose");
+    const previewMaterialDisposed = vi.spyOn(preview.material as T.Material, "dispose");
+    pointer("pointerdown"); pointer("pointermove", 310); pointer("pointerup", 310);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.getSnapshot().tool.active).toBe("displace");
+    expect(preview.parent).toBeNull();
+    expect(previewGeometryDisposed).toHaveBeenCalledOnce();
+    expect(previewMaterialDisposed).toHaveBeenCalledOnce();
+    pointer("pointerdown");
+    controller.setBrush(0.35, 0.06, "y");
+    expect(capture.size).toBe(0);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    pointer("pointerdown");
+    window.dispatchEvent(Object.assign(new Event("keydown"), { key: "Escape", ctrlKey: false, metaKey: false, altKey: false }));
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(capture.size).toBe(0);
+    pointer("pointerdown"); pointer("lostpointercapture");
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(capture.size).toBe(0);
+    controller.dispose(); unsubscribe(); graph.dispose();
   });
 });
 </file>
@@ -14662,7 +14759,7 @@ import { vertexRepresentatives } from "../geometry/vertex-selection";
 import { pickEditableVertex } from "./vertex-picking";
 import { buildMeshTopology, type MeshTopology } from "../geometry/mesh-topology";
 import { pickEditableEdge } from "./sub-element-picking";
-import { brushAffectedVertices, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES } from "../geometry/displace-brush";
+import { brushAffectedVertices, brushCenters, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES, type BrushSymmetry } from "../geometry/displace-brush";
 import type { SurfaceHit } from "../geometry/surface-query";
 
 export function brushUnavailable(state: EditorState, blocked: boolean): string | null {
@@ -14683,7 +14780,7 @@ export function brushUnavailable(state: EditorState, blocked: boolean): string |
 }
 
 type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
-type Stroke = { id: string; revision: number; epoch: object; pointerId: number; samples: [number, number, number][] };
+type Stroke = { id: string; revision: number; epoch: object; pointerId: number; radius: number; strength: number; symmetry: BrushSymmetry; samples: [number, number, number][] };
 const EPS = 1e-6;
 
 export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
@@ -14751,6 +14848,7 @@ export class ViewportInteractions {
   private stroke: Stroke | null = null;
   private brushRadius = 0.35;
   private brushStrength = 0.06;
+  private brushSymmetry: BrushSymmetry = "off";
   private brushValid = true;
   private brushPoints: T.Points | null = null;
 
@@ -14830,6 +14928,7 @@ export class ViewportInteractions {
       const hit = this.brushHit(event);
       if (brushUnavailable(state, this.blocked) || !hit) return;
       this.stroke = { id: hit.nodeId, revision: state.document.revision, epoch: this.store.getProjectEpoch(), pointerId: event.pointerId,
+        radius: this.brushRadius, strength: this.brushStrength, symmetry: this.brushSymmetry,
         samples: [hit.pointNodeLocal.toArray() as [number, number, number]] };
       this.orbit.enabled = false;
       this.canvas.setPointerCapture(event.pointerId);
@@ -14846,11 +14945,11 @@ export class ViewportInteractions {
     const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
     return hit?.nodeId === this.store.getSnapshot().selection.activeId ? hit : null;
   }
-  setBrush(radius: number, strength: number): void {
-    if (this.stroke) this.cancel("Мазок отменён: параметры кисти изменились.");
+  setBrush(radius: number, strength: number, symmetry: BrushSymmetry = "off"): void {
+    if (this.stroke && (radius !== this.brushRadius || strength !== this.brushStrength || symmetry !== this.brushSymmetry))
+      this.cancel("Мазок отменён: параметры кисти изменились.");
     this.brushValid = brushParameters(radius, strength);
-    if (!this.brushValid) { this.clearBrushPreview(); return; }
-    this.brushRadius = radius; this.brushStrength = strength;
+    this.brushRadius = radius; this.brushStrength = strength; this.brushSymmetry = symmetry;
     this.clearBrushPreview();
   }
   private clearBrushPreview(): void {
@@ -14866,11 +14965,14 @@ export class ViewportInteractions {
     const wrapper = hit && this.graph.objects.get(hit.nodeId)?.object;
     if (!hit || !wrapper || node?.kind !== "mesh" || node.meshSource.kind !== "editable") { this.clearBrushPreview(); return; }
     const source = node.meshSource;
-    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), this.brushRadius);
+    const symmetry = this.stroke?.symmetry ?? this.brushSymmetry;
+    const radius = this.stroke?.radius ?? this.brushRadius;
+    const centers = brushCenters(hit.pointNodeLocal.toArray(), symmetry);
+    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), radius, symmetry);
     if (!this.brushPoints || this.brushPoints.parent !== wrapper) {
       this.clearBrushPreview();
       const geometry = new T.BufferGeometry();
-      geometry.setAttribute("position", new T.BufferAttribute(new Float32Array(source.positions.length + 3), 3));
+      geometry.setAttribute("position", new T.BufferAttribute(new Float32Array(source.positions.length + 6), 3));
       const material = new T.PointsMaterial({ color: 0xff9a24, size: 9, sizeAttenuation: false, depthTest: false, depthWrite: false, toneMapped: false });
       this.brushPoints = new T.Points(geometry, material);
       this.brushPoints.raycast = () => {};
@@ -14878,10 +14980,10 @@ export class ViewportInteractions {
       wrapper.add(this.brushPoints);
     }
     const attr = this.brushPoints.geometry.getAttribute("position") as T.BufferAttribute;
-    attr.setXYZ(0, hit.pointNodeLocal.x, hit.pointNodeLocal.y, hit.pointNodeLocal.z);
-    affected.forEach((i, k) => attr.setXYZ(k + 1, source.positions[3 * i]!, source.positions[3 * i + 1]!, source.positions[3 * i + 2]!));
+    centers.forEach((center, k) => attr.setXYZ(k, center[0]!, center[1]!, center[2]!));
+    affected.forEach((i, k) => attr.setXYZ(k + centers.length, source.positions[3 * i]!, source.positions[3 * i + 1]!, source.positions[3 * i + 2]!));
     attr.needsUpdate = true;
-    this.brushPoints.geometry.setDrawRange(0, affected.length + 1);
+    this.brushPoints.geometry.setDrawRange(0, affected.length + centers.length);
     this.brushPoints.geometry.computeBoundingSphere();
   }
   private onPointerMove = (event: PointerEvent) => {
@@ -14893,7 +14995,7 @@ export class ViewportInteractions {
     this.showBrush(hit);
     const samples = this.stroke.samples, previous = new T.Vector3(...samples.at(-1)!);
     const next = hit.pointNodeLocal;
-    const distance = previous.distanceTo(next), spacing = Math.max(0.005, this.brushRadius * 0.25);
+    const distance = previous.distanceTo(next), spacing = Math.max(0.005, this.stroke.radius * 0.25);
     const steps = Math.ceil(distance / spacing);
     if (steps > MAX_BRUSH_SAMPLES - samples.length) { this.cancel("Мазок слишком длинный; начните новый."); return; }
     for (let i = 1; i <= steps; i++) samples.push(previous.clone().lerp(next, i / steps).toArray() as [number, number, number]);
@@ -14912,7 +15014,7 @@ export class ViewportInteractions {
         this.clearBrushPreview(); this.report("Мазок отменён: проект или объект изменился."); return;
       }
       const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "APPLY_DISPLACE_STROKE", targetIds: [stroke.id],
-        payload: { nodeId: stroke.id, samples: stroke.samples, radius: this.brushRadius, strength: this.brushStrength } }, stroke.revision);
+        payload: { nodeId: stroke.id, samples: stroke.samples, radius: stroke.radius, strength: stroke.strength, symmetry: stroke.symmetry } }, stroke.revision);
       this.clearBrushPreview(); this.report(result.ok ? result.changed ? "Рельеф применён." : "Мазок не изменил сетку." : result.message);
       return;
     }
@@ -15190,7 +15292,7 @@ import { useEditorStore } from "../app/use-editor-store";
 import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
 import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
-import { brushParameters } from "../geometry/displace-brush";
+import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
 
 export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
@@ -15200,6 +15302,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   const [snap, setSnap] = useState(false);
   const [radiusText, setRadiusText] = useState("0.35");
   const [strengthText, setStrengthText] = useState("0.06");
+  const [symmetry, setSymmetry] = useState<BrushSymmetry>("off");
   const brushRadius = Number(radiusText), brushStrength = Number(strengthText);
   const validBrush = radiusText.trim() !== "" && strengthText.trim() !== "" && brushParameters(brushRadius, brushStrength);
   const blockedRef = useRef(blocked);
@@ -15235,7 +15338,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
       const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
       controller.setSnap(snapRef.current);
       interactions.current = controller;
-      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength);
+      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry);
       adapter.setFrameHook(() => controller.frame());
     });
     sync();
@@ -15245,7 +15348,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   }, [store, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
-  useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength); }, [validBrush, brushRadius, brushStrength]);
+  useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry); }, [validBrush, brushRadius, brushStrength, symmetry]);
   const canTransform = editable(state, state.selection.activeId, blocked);
   const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
@@ -15270,6 +15373,12 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
         {state.tool.active === "displace" && <span className="brush-settings">
           <label>Радиус <input type="number" min="0.01" max="10" step="0.01" value={radiusText} onChange={event => setRadiusText(event.target.value)} /></label>
           <label>Сила <input type="number" min="-0.5" max="0.5" step="0.01" value={strengthText} onChange={event => setStrengthText(event.target.value)} /></label>
+          <label>Симметрия <select value={symmetry} onChange={event => setSymmetry(event.target.value as BrushSymmetry)}
+            title="Плоскость проходит через локальное начало координат объекта">
+            <option value="off">Выключена</option><option value="x">X · плоскость YZ</option>
+            <option value="y">Y · плоскость XZ</option><option value="z">Z · плоскость XY</option>
+          </select></label>
+          <span title="Плоскость проходит через локальное начало координат объекта">Через локальное начало объекта.</span>
           <span>Положительная сила — выступ, отрицательная — углубление.</span>
           {!validBrush && <span role="alert">Радиус: 0,01–10; сила: −0,5…0,5.</span>}
         </span>}
@@ -16389,8 +16498,9 @@ body { margin: 0; }
 .viewport-tools { display: inline-flex; gap: 2px; }
 .brush-settings { display: inline-flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; padding-left: var(--space-2); color: var(--color-text-secondary); }
 .brush-settings label { display: inline-flex; align-items: center; gap: var(--space-1); }
-.brush-settings input { width: 66px; min-height: 28px; box-sizing: border-box; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
-.brush-settings input:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
+.brush-settings input, .brush-settings select { min-height: 28px; box-sizing: border-box; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.brush-settings input { width: 66px; }
+.brush-settings input:focus-visible, .brush-settings select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
 .renderer-toolbar button { padding: 0 var(--space-2); cursor: pointer; }
 .renderer-toolbar button[aria-pressed="true"] { background: var(--color-state-info-surface); border-color: var(--color-primary-accent-strong); color: var(--color-state-info); }
 .renderer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
@@ -16445,6 +16555,303 @@ button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 .tree-measure { display: none; }
 </file>
 
+<file path="src/ui/App.tsx">
+import { Viewport } from "../renderer/Viewport";
+import { createProject } from "../domain";
+import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject } from "../app/editor-store";
+import { useEditorStore } from "../app/use-editor-store";
+import { lazy, Suspense, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
+import { AssetBytes } from "../assets/asset-bytes";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
+import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
+import packageInfo from "../../package.json";
+import { createPrimitiveNode, primitiveDefinitions, type PrimitiveKind } from "../geometry/primitives";
+import { ObjectTree } from "./ObjectTree";
+import { Inspector } from "./Inspector";
+import { JobOverlay } from "./JobOverlay";
+import { isJobActive } from "../app/job-controller";
+
+const RendererSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/renderer/RendererSpike"))
+  : null;
+const CsgSpike = import.meta.env.DEV
+  ? lazy(() => import("../spikes/csg/CsgSpike"))
+  : null;
+
+const editorStore = createEditorStore(createProject());
+const DOCK_MIN = 220;
+const STAGE_MIN = 320;
+const HANDLE_WIDTH = 8;
+type Notice = { kind: "info" | "success" | "error"; text: string };
+
+function clampDocks(width: number, left: number, right: number, changed?: "left" | "right"): [number, number] {
+  const available = Math.max(DOCK_MIN * 2, width - STAGE_MIN - HANDLE_WIDTH * 2);
+  if (changed === "left") {
+    const fixedRight = Math.min(Math.max(right, DOCK_MIN), available - DOCK_MIN);
+    return [Math.min(Math.max(left, DOCK_MIN), available - fixedRight), fixedRight];
+  }
+  const fixedLeft = Math.min(Math.max(left, DOCK_MIN), available - DOCK_MIN);
+  return [fixedLeft, Math.min(Math.max(right, DOCK_MIN), available - fixedLeft)];
+}
+
+export function App() {
+  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
+    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
+  }
+  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
+    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
+  }
+  return <EditorShell />;
+}
+
+function EditorShell() {
+  const state = useEditorStore(editorStore);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const glbInput = useRef<HTMLInputElement>(null);
+  const workspace = useRef<HTMLDivElement>(null);
+  const fileLock = useRef(false);
+  const [fileBusy, setFileBusy] = useState(false);
+  const [fileStatus, setFileStatus] = useState<Notice | null>(null);
+  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
+  const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
+  const [dragging, setDragging] = useState(false);
+  const dragCleanup = useRef<(() => void) | null>(null);
+  const project = selectProject(state);
+  const dirty = selectDirty(state);
+  const canUndo = selectCanUndo(state);
+  const canRedo = selectCanRedo(state);
+  const jobBlocked = isJobActive(state.job.status);
+  const blocked = fileBusy || !!pendingGlb || jobBlocked;
+  const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
+  const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
+  useEffect(() => () => { dragCleanup.current?.(); }, []);
+  useEffect(() => {
+    if (!dirty) return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!editorStore.getSnapshot().document.dirty) return;
+      event.preventDefault();
+      event.returnValue = true;
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+  useEffect(() => {
+    const element = workspace.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => setDockWidths(([left, right]) => clampDocks(element.clientWidth, left, right)));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  function setDock(side: "left" | "right", value: number) {
+    const width = workspace.current?.clientWidth ?? window.innerWidth;
+    setDockWidths(([left, right]) => clampDocks(width, side === "left" ? value : left, side === "right" ? value : right, side));
+  }
+  function startDrag(event: React.PointerEvent<HTMLDivElement>, side: "left" | "right") {
+    if (event.button !== 0 || dragCleanup.current) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const startX = event.clientX;
+    const startWidth = dockWidths[side === "left" ? 0 : 1];
+    const oldUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = "none";
+    handle.setPointerCapture(event.pointerId);
+    setDragging(true);
+    const move = (next: PointerEvent) => setDock(side, startWidth + (next.clientX - startX) * (side === "left" ? 1 : -1));
+    const cleanup = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", stopDrag);
+      handle.removeEventListener("pointercancel", stopDrag);
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      document.body.style.userSelect = oldUserSelect;
+    };
+    dragCleanup.current = cleanup;
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", stopDrag);
+    handle.addEventListener("pointercancel", stopDrag);
+  }
+  function travel(direction: "undo" | "redo") {
+    if (blocked) return;
+    const current = editorStore.getSnapshot();
+    const result = editorStore[direction](current.document.revision);
+    if (!result.ok) notice("error", result.message);
+    else notice("success", direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.keyCode === 229) return;
+      const target = event.target;
+      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
+      const key = event.key.toLowerCase();
+      if (key === "s" && !event.shiftKey) { event.preventDefault(); void saveProject(); return; }
+      if (blocked) return;
+      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
+      if (!direction) return;
+      const current = editorStore.getSnapshot();
+      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
+      event.preventDefault();
+      travel(direction);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+  useEffect(() => {
+    if (!pendingGlb) return;
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.isComposing) {
+        setPendingGlb(null);
+        notice("info", "Импорт отменён.");
+      }
+    };
+    window.addEventListener("keydown", onEscape);
+    return () => window.removeEventListener("keydown", onEscape);
+  }, [pendingGlb]);
+  function newProject() {
+    if (blocked || fileLock.current) return;
+    const current = editorStore.captureDocument();
+    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Создать новый проект и потерять их?")) return;
+    if (!editorStore.replaceProject({ project: createProject(), assets: new AssetBytes() }, current.identity)) {
+      notice("error", "Проект изменился. Повторите создание нового проекта.");
+      return;
+    }
+    setPendingGlb(null);
+    notice("success", "Новый проект создан.");
+  }
+  async function saveProject() {
+    if (blocked || fileLock.current) return;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Подготовка архива…");
+    const captured = editorStore.captureDocument();
+    const filename = `${captured.project.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 80) || "project"}.triad3d`;
+    const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
+    try {
+      // The picker needs the original click activation; acquire the handle before asynchronous hashing.
+      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
+      const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      if (handle) {
+        const writable = await handle.createWritable();
+        await writable.write(result.value);
+        await writable.close();
+        notice("success", editorStore.confirmSaved(captured.revision, captured.identity) ? "Проект сохранён." : "Файл записан; после подготовки проекта были новые изменения.");
+      } else {
+        const url = URL.createObjectURL(result.value);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        notice("info", "Загрузка файла запущена. Проверьте его сохранение в браузере.");
+      }
+    } catch (error) {
+      notice(error instanceof DOMException && error.name === "AbortError" ? "info" : "error", error instanceof DOMException && error.name === "AbortError" ? "Сохранение отменено." : "Не удалось сохранить проект.");
+    } finally { fileLock.current = false; setFileBusy(false); }
+  }
+
+  async function openProject(file: File) {
+    if (blocked || fileLock.current) return;
+    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Открыть другой проект и потерять их?")) return;
+    const expected = editorStore.captureDocument().identity;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка архива…");
+    try {
+      const result = await openNativeProjectArchive(file);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      if (!editorStore.replaceProject(result.value, expected)) { notice("error", "Проект изменился во время открытия файла. Повторите операцию."); return; }
+      notice("success", "Проект открыт.");
+    } catch { notice("error", "Не удалось открыть проект."); }
+    finally { fileLock.current = false; setFileBusy(false); }
+  }
+  async function importGlb(file: File) {
+    if (blocked || fileLock.current) return;
+    const captured = editorStore.captureDocument();
+    setPendingGlb(null);
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка GLB…");
+    try {
+      const result = await prepareGlb(file);
+      if (!result.ok) { notice("error", result.error.message); return; }
+      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
+      notice("info", "GLB проверен. Подтвердите добавление в текущую модель.");
+    } catch { notice("error", "Не удалось проверить GLB."); }
+    finally { fileLock.current = false; setFileBusy(false); }
+  }
+  function confirmGlb() {
+    if (!pendingGlb) return;
+    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
+    setPendingGlb(null);
+    notice(result.ok ? "success" : "error", result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
+  }
+  const root = project.nodes.find(node => node.id === project.model.rootNodeId);
+  const canEditModel = !blocked && state.tool.mode === "model" && !!root?.visible && !root?.locked;
+  function addPrimitive(kind: PrimitiveKind) {
+    if (!canEditModel) return;
+    const node = createPrimitiveNode(kind, project.model.rootNodeId, crypto.randomUUID());
+    const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, state.document.revision);
+    if (!result.ok) notice("error", result.message);
+    else { editorStore.setSelection([node.id], node.id); notice("success", `${node.name} добавлен в модель.`); }
+  }
+  return (
+    <div className="app-shell">
+      <div className="app-content" inert={jobBlocked}>
+      <header className="topbar">
+        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="project-title" title={project.name}>{project.name}</span><span className={`dirty-indicator ${dirty ? "is-dirty" : ""}`} title={dirty ? "Есть несохранённые изменения" : "Нет несохранённых изменений"}>{dirty ? "● Не сохранено" : "Сохранено"}</span></div>
+        <div className="mode-switch" role="group" aria-label="Режим редактора">
+          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "model"} onClick={() => editorStore.setTool({ mode: "model" })}>Модель</button>
+          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "scene"} onClick={() => editorStore.setTool({ mode: "scene" })}>Сцена</button>
+        </div>
+        <div className="file-actions">
+          <button type="button" disabled={blocked} onClick={newProject}>Новый проект</button>
+          <button type="button" disabled={!canUndo || blocked} onClick={() => travel("undo")}>Отменить</button>
+          <button type="button" disabled={!canRedo || blocked} onClick={() => travel("redo")}>Повторить</button>
+          <button type="button" disabled={blocked} onClick={saveProject}>Сохранить проект</button>
+          <button type="button" disabled={blocked} onClick={() => fileInput.current?.click()}>Открыть проект</button>
+          <button type="button" disabled={blocked} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
+          <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
+          <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
+          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
+        </div>
+      </header>
+      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
+      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
+        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются.</span>
+        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
+        <button type="button" onClick={() => { setPendingGlb(null); notice("info", "Импорт отменён."); }}>Отмена</button>
+      </div>}
+      <div className={`workspace-grid ${dragging ? "is-resizing" : ""}`} ref={workspace} style={{ gridTemplateColumns: `${dockWidths[0]}px ${HANDLE_WIDTH}px minmax(0, 1fr) ${HANDLE_WIDTH}px ${dockWidths[1]}px` }}>
+        <aside className="dock left-dock" aria-label="Структура проекта">
+          <div className="panel-heading"><h2>{state.view.leftTab === "structure" ? "Структура" : "Библиотека"}</h2></div>
+          <div className="dock-tabs" role="group" aria-label="Левая панель"><button type="button" aria-pressed={state.view.leftTab === "structure"} onClick={() => editorStore.setView({ leftTab: "structure" })}>Структура</button><button type="button" aria-pressed={state.view.leftTab === "assets"} onClick={() => editorStore.setView({ leftTab: "assets" })}>Библиотека</button></div>
+          {state.view.leftTab === "structure" ?
+          <div className="panel-content">
+            <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
+          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
+        </aside>
+        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
+        <main className="stage" aria-label="Рабочая область">
+          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ · {state.tool.mode === "model" ? "МОДЕЛЬ" : "СЦЕНА"}</span><span>Проект только в памяти вкладки</span></div>
+          <Viewport store={editorStore} mode={state.tool.mode} blocked={blocked} />
+        </main>
+        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
+        <aside className="dock right-dock" aria-label="Инспектор">
+          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
+          <div className="panel-content"><Inspector store={editorStore} state={state} blocked={blocked} /></div>
+        </aside>
+      </div>
+      <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
+      <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
+      </div>
+      <JobOverlay job={state.job} cancel={() => editorStore.jobs.cancelJob()} />
+    </div>
+  );
+}
+</file>
+
 <file path="src/domain/command-bus.ts">
 import type { Asset, EntityId, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -16459,7 +16866,7 @@ import type { BendParameters, TwistParameters, TaperParameters, BevelParameters 
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
-import { displaceStroke, brushParameters, MAX_BRUSH_SAMPLES } from "../geometry/displace-brush";
+import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, type BrushSymmetry } from "../geometry/displace-brush";
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
@@ -16471,7 +16878,7 @@ export type ProjectCommand =
   | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
-  | { commandId: string; type: "APPLY_DISPLACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; samples: Vec3[]; radius: number; strength: number } }
+  | { commandId: string; type: "APPLY_DISPLACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; samples: Vec3[]; radius: number; strength: number; symmetry?: BrushSymmetry } }
   | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
   | { commandId: string; type: "EXTRUDE_EDITABLE_FACE"; targetIds: [EntityId]; payload: { nodeId: EntityId; faceId: number; distance: number } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
@@ -16637,7 +17044,8 @@ function validCommand(value: unknown): value is ProjectCommand {
     || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   switch (value.type) {
     case "CONVERT_PRIMITIVE_TO_EDITABLE": return ownKeys(payload, ["nodeId"]);
-    case "APPLY_DISPLACE_STROKE": return ownKeys(payload, ["nodeId", "samples", "radius", "strength"])
+    case "APPLY_DISPLACE_STROKE": return ownKeys(payload, ["nodeId", "samples", "radius", "strength", "symmetry"])
+      && (!Object.hasOwn(payload, "symmetry") || isBrushSymmetry(payload.symmetry))
       && brushParameters(payload.radius as number, payload.strength as number)
       && Array.isArray(payload.samples) && payload.samples.length > 0 && payload.samples.length <= MAX_BRUSH_SAMPLES
       && payload.samples.every((point: unknown) => numbers(point, 3));
@@ -16957,7 +17365,7 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
         const source = command.type === "APPLY_DISPLACE_STROKE"
-          ? displaceStroke(current.meshSource, command.payload.samples, command.payload.radius, command.payload.strength)
+          ? displaceStroke(current.meshSource, command.payload.samples, command.payload.radius, command.payload.strength, command.payload.symmetry)
           : command.type === "TRANSLATE_EDITABLE_VERTICES"
           ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
           : command.type === "SCALE_EDITABLE_VERTICES"
@@ -17140,303 +17548,6 @@ export function createCommandBus(initialProject: Project): CommandBus {
       }
     },
   };
-}
-</file>
-
-<file path="src/ui/App.tsx">
-import { Viewport } from "../renderer/Viewport";
-import { createProject } from "../domain";
-import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject } from "../app/editor-store";
-import { useEditorStore } from "../app/use-editor-store";
-import { lazy, Suspense, useCallback } from "react";
-import { useEffect, useRef, useState } from "react";
-import { AssetBytes } from "../assets/asset-bytes";
-import { createNativeProjectArchive, openNativeProjectArchive } from "../assets/native-project-archive";
-import { commitGlb, prepareGlb, type PreparedGlb } from "../importers/gltf/import-glb";
-import packageInfo from "../../package.json";
-import { createPrimitiveNode, primitiveDefinitions, type PrimitiveKind } from "../geometry/primitives";
-import { ObjectTree } from "./ObjectTree";
-import { Inspector } from "./Inspector";
-import { JobOverlay } from "./JobOverlay";
-import { isJobActive } from "../app/job-controller";
-
-const RendererSpike = import.meta.env.DEV
-  ? lazy(() => import("../spikes/renderer/RendererSpike"))
-  : null;
-const CsgSpike = import.meta.env.DEV
-  ? lazy(() => import("../spikes/csg/CsgSpike"))
-  : null;
-
-const editorStore = createEditorStore(createProject());
-const DOCK_MIN = 220;
-const STAGE_MIN = 320;
-const HANDLE_WIDTH = 8;
-type Notice = { kind: "info" | "success" | "error"; text: string };
-
-function clampDocks(width: number, left: number, right: number, changed?: "left" | "right"): [number, number] {
-  const available = Math.max(DOCK_MIN * 2, width - STAGE_MIN - HANDLE_WIDTH * 2);
-  if (changed === "left") {
-    const fixedRight = Math.min(Math.max(right, DOCK_MIN), available - DOCK_MIN);
-    return [Math.min(Math.max(left, DOCK_MIN), available - fixedRight), fixedRight];
-  }
-  const fixedLeft = Math.min(Math.max(left, DOCK_MIN), available - DOCK_MIN);
-  return [fixedLeft, Math.min(Math.max(right, DOCK_MIN), available - fixedLeft)];
-}
-
-export function App() {
-  if (CsgSpike && new URLSearchParams(window.location.search).get("spike") === "csg") {
-    return <Suspense fallback={<p>Загрузка CSG…</p>}><CsgSpike /></Suspense>;
-  }
-  if (RendererSpike && new URLSearchParams(window.location.search).get("spike") === "renderer") {
-    return <Suspense fallback={<p>Загрузка прототипа рендеринга…</p>}><RendererSpike /></Suspense>;
-  }
-  return <EditorShell />;
-}
-
-function EditorShell() {
-  const state = useEditorStore(editorStore);
-  const fileInput = useRef<HTMLInputElement>(null);
-  const glbInput = useRef<HTMLInputElement>(null);
-  const workspace = useRef<HTMLDivElement>(null);
-  const fileLock = useRef(false);
-  const [fileBusy, setFileBusy] = useState(false);
-  const [fileStatus, setFileStatus] = useState<Notice | null>(null);
-  const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
-  const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
-  const [dragging, setDragging] = useState(false);
-  const dragCleanup = useRef<(() => void) | null>(null);
-  const project = selectProject(state);
-  const dirty = selectDirty(state);
-  const canUndo = selectCanUndo(state);
-  const canRedo = selectCanRedo(state);
-  const jobBlocked = isJobActive(state.job.status);
-  const blocked = fileBusy || !!pendingGlb || jobBlocked;
-  const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
-  const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
-  useEffect(() => () => { dragCleanup.current?.(); }, []);
-  useEffect(() => {
-    if (!dirty) return;
-    const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (!editorStore.getSnapshot().document.dirty) return;
-      event.preventDefault();
-      event.returnValue = true;
-    };
-    window.addEventListener("beforeunload", onBeforeUnload);
-    return () => window.removeEventListener("beforeunload", onBeforeUnload);
-  }, [dirty]);
-  useEffect(() => {
-    const element = workspace.current;
-    if (!element) return;
-    const observer = new ResizeObserver(() => setDockWidths(([left, right]) => clampDocks(element.clientWidth, left, right)));
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, []);
-  function setDock(side: "left" | "right", value: number) {
-    const width = workspace.current?.clientWidth ?? window.innerWidth;
-    setDockWidths(([left, right]) => clampDocks(width, side === "left" ? value : left, side === "right" ? value : right, side));
-  }
-  function startDrag(event: React.PointerEvent<HTMLDivElement>, side: "left" | "right") {
-    if (event.button !== 0 || dragCleanup.current) return;
-    event.preventDefault();
-    const handle = event.currentTarget;
-    const startX = event.clientX;
-    const startWidth = dockWidths[side === "left" ? 0 : 1];
-    const oldUserSelect = document.body.style.userSelect;
-    document.body.style.userSelect = "none";
-    handle.setPointerCapture(event.pointerId);
-    setDragging(true);
-    const move = (next: PointerEvent) => setDock(side, startWidth + (next.clientX - startX) * (side === "left" ? 1 : -1));
-    const cleanup = () => {
-      handle.removeEventListener("pointermove", move);
-      handle.removeEventListener("pointerup", stopDrag);
-      handle.removeEventListener("pointercancel", stopDrag);
-      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
-      document.body.style.userSelect = oldUserSelect;
-    };
-    dragCleanup.current = cleanup;
-    handle.addEventListener("pointermove", move);
-    handle.addEventListener("pointerup", stopDrag);
-    handle.addEventListener("pointercancel", stopDrag);
-  }
-  function travel(direction: "undo" | "redo") {
-    if (blocked) return;
-    const current = editorStore.getSnapshot();
-    const result = editorStore[direction](current.document.revision);
-    if (!result.ok) notice("error", result.message);
-    else notice("success", direction === "undo" ? "Изменение отменено." : "Изменение повторено.");
-  }
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.keyCode === 229) return;
-      const target = event.target;
-      if (target instanceof Element && (target.closest("input, textarea, [contenteditable]") || (target as HTMLElement).isContentEditable)) return;
-      const key = event.key.toLowerCase();
-      if (key === "s" && !event.shiftKey) { event.preventDefault(); void saveProject(); return; }
-      if (blocked) return;
-      const direction = key === "y" && !event.shiftKey || key === "z" && event.shiftKey ? "redo" : key === "z" && !event.shiftKey ? "undo" : null;
-      if (!direction) return;
-      const current = editorStore.getSnapshot();
-      if (direction === "undo" ? !current.history.canUndo : !current.history.canRedo) return;
-      event.preventDefault();
-      travel(direction);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
-  useEffect(() => {
-    if (!pendingGlb) return;
-    const onEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.isComposing) {
-        setPendingGlb(null);
-        notice("info", "Импорт отменён.");
-      }
-    };
-    window.addEventListener("keydown", onEscape);
-    return () => window.removeEventListener("keydown", onEscape);
-  }, [pendingGlb]);
-  function newProject() {
-    if (blocked || fileLock.current) return;
-    const current = editorStore.captureDocument();
-    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Создать новый проект и потерять их?")) return;
-    if (!editorStore.replaceProject({ project: createProject(), assets: new AssetBytes() }, current.identity)) {
-      notice("error", "Проект изменился. Повторите создание нового проекта.");
-      return;
-    }
-    setPendingGlb(null);
-    notice("success", "Новый проект создан.");
-  }
-  async function saveProject() {
-    if (blocked || fileLock.current) return;
-    fileLock.current = true;
-    setFileBusy(true);
-    notice("info", "Подготовка архива…");
-    const captured = editorStore.captureDocument();
-    const filename = `${captured.project.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 80) || "project"}.triad3d`;
-    const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
-    try {
-      // The picker needs the original click activation; acquire the handle before asynchronous hashing.
-      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
-      const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
-      if (!result.ok) { notice("error", result.error.message); return; }
-      if (handle) {
-        const writable = await handle.createWritable();
-        await writable.write(result.value);
-        await writable.close();
-        notice("success", editorStore.confirmSaved(captured.revision, captured.identity) ? "Проект сохранён." : "Файл записан; после подготовки проекта были новые изменения.");
-      } else {
-        const url = URL.createObjectURL(result.value);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        document.body.append(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
-        notice("info", "Загрузка файла запущена. Проверьте его сохранение в браузере.");
-      }
-    } catch (error) {
-      notice(error instanceof DOMException && error.name === "AbortError" ? "info" : "error", error instanceof DOMException && error.name === "AbortError" ? "Сохранение отменено." : "Не удалось сохранить проект.");
-    } finally { fileLock.current = false; setFileBusy(false); }
-  }
-
-  async function openProject(file: File) {
-    if (blocked || fileLock.current) return;
-    if (editorStore.getSnapshot().document.dirty && !window.confirm("В проекте есть несохранённые изменения. Открыть другой проект и потерять их?")) return;
-    const expected = editorStore.captureDocument().identity;
-    fileLock.current = true;
-    setFileBusy(true);
-    notice("info", "Проверка архива…");
-    try {
-      const result = await openNativeProjectArchive(file);
-      if (!result.ok) { notice("error", result.error.message); return; }
-      if (!editorStore.replaceProject(result.value, expected)) { notice("error", "Проект изменился во время открытия файла. Повторите операцию."); return; }
-      notice("success", "Проект открыт.");
-    } catch { notice("error", "Не удалось открыть проект."); }
-    finally { fileLock.current = false; setFileBusy(false); }
-  }
-  async function importGlb(file: File) {
-    if (blocked || fileLock.current) return;
-    const captured = editorStore.captureDocument();
-    setPendingGlb(null);
-    fileLock.current = true;
-    setFileBusy(true);
-    notice("info", "Проверка GLB…");
-    try {
-      const result = await prepareGlb(file);
-      if (!result.ok) { notice("error", result.error.message); return; }
-      setPendingGlb({ prepared: result.value, revision: captured.revision, identity: captured.identity });
-      notice("info", "GLB проверен. Подтвердите добавление в текущую модель.");
-    } catch { notice("error", "Не удалось проверить GLB."); }
-    finally { fileLock.current = false; setFileBusy(false); }
-  }
-  function confirmGlb() {
-    if (!pendingGlb) return;
-    const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
-    setPendingGlb(null);
-    notice(result.ok ? "success" : "error", result.ok ? "GLB добавлен в модель. Сохраните проект, чтобы записать ресурс в .triad3d." : result.message);
-  }
-  const root = project.nodes.find(node => node.id === project.model.rootNodeId);
-  const canEditModel = !blocked && state.tool.mode === "model" && !!root?.visible && !root?.locked;
-  function addPrimitive(kind: PrimitiveKind) {
-    if (!canEditModel) return;
-    const node = createPrimitiveNode(kind, project.model.rootNodeId, crypto.randomUUID());
-    const result = editorStore.executeCommand({ commandId: crypto.randomUUID(), type: "ADD_NODE", targetIds: [project.model.rootNodeId, node.id], payload: { parentId: project.model.rootNodeId, node } }, state.document.revision);
-    if (!result.ok) notice("error", result.message);
-    else { editorStore.setSelection([node.id], node.id); notice("success", `${node.name} добавлен в модель.`); }
-  }
-  return (
-    <div className="app-shell">
-      <div className="app-content" inert={jobBlocked}>
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="project-title" title={project.name}>{project.name}</span><span className={`dirty-indicator ${dirty ? "is-dirty" : ""}`} title={dirty ? "Есть несохранённые изменения" : "Нет несохранённых изменений"}>{dirty ? "● Не сохранено" : "Сохранено"}</span></div>
-        <div className="mode-switch" role="group" aria-label="Режим редактора">
-          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "model"} onClick={() => editorStore.setTool({ mode: "model" })}>Модель</button>
-          <button type="button" disabled={blocked} aria-pressed={state.tool.mode === "scene"} onClick={() => editorStore.setTool({ mode: "scene" })}>Сцена</button>
-        </div>
-        <div className="file-actions">
-          <button type="button" disabled={blocked} onClick={newProject}>Новый проект</button>
-          <button type="button" disabled={!canUndo || blocked} onClick={() => travel("undo")}>Отменить</button>
-          <button type="button" disabled={!canRedo || blocked} onClick={() => travel("redo")}>Повторить</button>
-          <button type="button" disabled={blocked} onClick={saveProject}>Сохранить проект</button>
-          <button type="button" disabled={blocked} onClick={() => fileInput.current?.click()}>Открыть проект</button>
-          <button type="button" disabled={blocked} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
-          <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
-          <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
-          <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
-        </div>
-      </header>
-      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
-      {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
-        <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются.</span>
-        <button type="button" onClick={confirmGlb}>Добавить в модель</button>
-        <button type="button" onClick={() => { setPendingGlb(null); notice("info", "Импорт отменён."); }}>Отмена</button>
-      </div>}
-      <div className={`workspace-grid ${dragging ? "is-resizing" : ""}`} ref={workspace} style={{ gridTemplateColumns: `${dockWidths[0]}px ${HANDLE_WIDTH}px minmax(0, 1fr) ${HANDLE_WIDTH}px ${dockWidths[1]}px` }}>
-        <aside className="dock left-dock" aria-label="Структура проекта">
-          <div className="panel-heading"><h2>{state.view.leftTab === "structure" ? "Структура" : "Библиотека"}</h2></div>
-          <div className="dock-tabs" role="group" aria-label="Левая панель"><button type="button" aria-pressed={state.view.leftTab === "structure"} onClick={() => editorStore.setView({ leftTab: "structure" })}>Структура</button><button type="button" aria-pressed={state.view.leftTab === "assets"} onClick={() => editorStore.setView({ leftTab: "assets" })}>Библиотека</button></div>
-          {state.view.leftTab === "structure" ?
-          <div className="panel-content">
-            <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
-          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
-        </aside>
-        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
-        <main className="stage" aria-label="Рабочая область">
-          <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ · {state.tool.mode === "model" ? "МОДЕЛЬ" : "СЦЕНА"}</span><span>Проект только в памяти вкладки</span></div>
-          <Viewport store={editorStore} mode={state.tool.mode} blocked={blocked} />
-        </main>
-        <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
-        <aside className="dock right-dock" aria-label="Инспектор">
-          <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><Inspector store={editorStore} state={state} blocked={blocked} /></div>
-        </aside>
-      </div>
-      <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
-      <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
-      </div>
-      <JobOverlay job={state.job} cancel={() => editorStore.jobs.cancelJob()} />
-    </div>
-  );
 }
 </file>
 
@@ -17640,6 +17751,7 @@ function EditorShell() {
 - Inspector показывает поля ширины и порога, ограничения алгоритма и диагностические ошибки. Исходный meshSource остаётся без изменений; архив 1.1.0 сохраняет ID, порядок, version, enabled и параметры без изменения схемы.
 - `typecheck`, `lint`, `build`, целевые и полные Vitest прошли (41 файл, 298 тестов). Ручной browser smoke: UNVERIFIED. Ограничения геометрического ядра и прерывания WASM из CODEX-025C сохраняются. TASK-025 реализован.
 - **CODEX-026A / TASK-026 / FR-021 / UI-08 (PARTIAL):** Добавлена «Кисть: рельеф» для одного выбранного Editable Mesh в режиме «Модель»: локальные радиус/сила, BVH hit, подсветка затрагиваемых вершин, непрерывный мазок с интерполяцией, одна команда и один Undo/Redo. Отмена не меняет документ; архив `.triad3d` сохраняет результат. Лимиты: замкнутая согласованно ориентированная сетка до 20 000 render vertices, 512 точек мазка, радиус 0,01–10, сила −0,5…0,5, смещение за мазок не более 10% минимального ребра. Активные модификаторы/Boolean запрещены. Проверка вырождения и переворота треугольников не доказывает отсутствие всех самопересечений; Paint, Material Brush, fill и symmetry остаются в TASK-026. Typecheck, lint, целевые Vitest и build: результаты указаны в отчёте задания. Ручная браузерная проверка: UNVERIFIED — доступное окно встроенного браузера показывает только desktop-only экран.
+- **CODEX-026B / TASK-026 / FR-021 / UI-08 / TST-011 (PARTIAL):** Displace Brush поддерживает выключенную симметрию и отражение по X/Y/Z относительно локальных плоскостей YZ/XZ/XY через начало mesh. Обе области показаны в предпросмотре и применяются одной транзакцией; пересечение и повторы samples объединяются по максимальному falloff. Параметры мазка фиксируются при pointerdown, смена параметров отменяет активный мазок. Старый payload команды сохраняет семантику `off`, невалидные значения отклоняются. Подтверждены typecheck, lint, 49 целевых тестов и production build; ручная браузерная проверка: UNVERIFIED. Существующие ограничения сетки и отсутствие полной гарантии против самопересечений сохраняются. Paint Brush, Material Brush и fill остаются в TASK-026.
 </file>
 
 </files>

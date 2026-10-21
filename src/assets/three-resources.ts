@@ -8,7 +8,9 @@ export function disposeObject(root: Object3D): void {
   root.traverse((object) => {
     if (!(object instanceof Mesh)) return;
     resources.add(object.geometry);
-    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
+    const retained = object.userData.originalMaterials as unknown;
+    const originals = Array.isArray(retained) ? retained.filter((item): item is typeof object.material => item && typeof item === "object" && "dispose" in item) : [];
+    for (const material of [...(Array.isArray(object.material) ? object.material : [object.material]), ...originals].flat()) {
       resources.add(material);
       for (const value of Object.values(material)) if (value instanceof Texture) {
         resources.add(value);

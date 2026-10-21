@@ -1,5 +1,6 @@
-import type { Asset, EntityId, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
+import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
+import { validateMaterial } from "./validate-material";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import type { ArrayParameters } from "../geometry/modifiers/types";
 import { parseArrayParameters } from "../geometry/modifiers/array";
@@ -15,6 +16,10 @@ import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, ty
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
+  | { commandId: string; type: "UPDATE_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
+  | { commandId: string; type: "REMOVE_MATERIAL"; targetIds: [EntityId]; payload: { materialId: EntityId } }
+  | { commandId: string; type: "SET_MATERIAL_SLOT"; targetIds: [EntityId] | [EntityId, EntityId]; payload: { nodeId: EntityId; slotName: string; materialId: EntityId | null } }
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
   | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
@@ -55,6 +60,10 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | { kind: "addMaterial"; material: Material; index: number }
+  | { kind: "removeMaterial"; material: Material; index: number }
+  | { kind: "setMaterial"; materialId: EntityId; before: Material; after: Material }
+  | { kind: "setMaterialSlots"; nodeId: EntityId; before: MaterialSlot[]; after: MaterialSlot[] }
   | { kind: "addNode"; node: Node }
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
@@ -128,6 +137,13 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_MATERIAL" || value.type === "UPDATE_MATERIAL") return ownKeys(payload, ["material"])
+    && validateMaterial(payload.material).length === 0 && same(value.targetIds, [(payload.material as Material).id]);
+  if (value.type === "REMOVE_MATERIAL") return ownKeys(payload, ["materialId"])
+    && id(payload.materialId) && same(value.targetIds, [payload.materialId]);
+  if (value.type === "SET_MATERIAL_SLOT") return ownKeys(payload, ["nodeId", "slotName", "materialId"])
+    && id(payload.nodeId) && typeof payload.slotName === "string" && !!payload.slotName.trim()
+    && (payload.materialId === null || id(payload.materialId)) && same(value.targetIds, payload.materialId === null ? [payload.nodeId] : [payload.nodeId, payload.materialId]);
   if (value.type === "ADD_BOOLEAN_MODIFIER") return ownKeys(payload, ["nodeId", "modifierId", "operation", "cutterNodeId"])
     && id(payload.nodeId) && id(payload.modifierId) && id(payload.cutterNodeId)
     && booleanOperation(payload.operation) && same(value.targetIds, [payload.nodeId, payload.modifierId, payload.cutterNodeId]);
@@ -302,6 +318,41 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_MATERIAL") {
+    if (entityIds(project).has(command.payload.material.id)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID материала уже занят.");
+    project.materials.push(structuredClone(command.payload.material)); return null;
+  }
+  if (command.type === "UPDATE_MATERIAL") {
+    const index = project.materials.findIndex(item => item.id === command.payload.material.id);
+    if (index < 0) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    if (!same(project.materials[index], command.payload.material)) project.materials[index] = structuredClone(command.payload.material);
+    return null;
+  }
+  if (command.type === "REMOVE_MATERIAL") {
+    const index = project.materials.findIndex(item => item.id === command.payload.materialId);
+    if (index < 0) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    if (project.nodes.some(node => node.materialSlots.some(slot => slot.materialId === command.payload.materialId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал назначен узлу. Сначала снимите назначение.");
+    project.materials.splice(index, 1); return null;
+  }
+  if (command.type === "SET_MATERIAL_SLOT") {
+    const { nodeId, slotName, materialId } = command.payload;
+    const node = nodeById(project, nodeId);
+    if (!node || node.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Mesh-узел не найден.");
+    const block = blocked(project, node);
+    if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
+    if (materialId !== null && !project.materials.some(item => item.id === materialId))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    const matches = node.materialSlots.filter(slot => slot.name === slotName);
+    if (matches.length > 1) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Имя слота повторяется.");
+    // Geometry without material groups has only one effective slot.
+    if (materialId !== null && matches.length === 0 && node.materialSlots.length > 0)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Для этой геометрии доступен только один действующий слот.");
+    if (materialId === null) node.materialSlots = node.materialSlots.filter(slot => slot.name !== slotName);
+    else if (matches.length) node.materialSlots = node.materialSlots.map(slot => slot.name === slotName ? { name: slotName, materialId } : slot);
+    else node.materialSlots.push({ name: slotName, materialId });
+    return null;
+  }
   if (command.type === "MOVE_NODE") {
     const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
     if (!node || !parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел или новая группа не найдены.");
@@ -541,11 +592,20 @@ function entityIds(project: Project): Set<string> {
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
   for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
+  for (const [index, material] of [...before.materials.entries()].reverse()) if (!after.materials.some(item => item.id === material.id))
+    changes.push({ kind: "removeMaterial", material: structuredClone(material), index });
+  for (const [index, material] of after.materials.entries()) {
+    const old = before.materials.find(item => item.id === material.id);
+    if (!old) changes.push({ kind: "addMaterial", material: structuredClone(material), index });
+    else if (!same(old, material)) changes.push({ kind: "setMaterial", materialId: material.id, before: structuredClone(old), after: structuredClone(material) });
+  }
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
     if (!same(old.modifierIds, node.modifierIds)) changes.push({ kind: "setModifierIds", nodeId: node.id,
       before: structuredClone(old.modifierIds), after: structuredClone(node.modifierIds) });
+    if (!same(old.materialSlots, node.materialSlots)) changes.push({ kind: "setMaterialSlots", nodeId: node.id,
+      before: structuredClone(old.materialSlots), after: structuredClone(node.materialSlots) });
     for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
@@ -571,6 +631,10 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
     if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "addMaterial") return { kind: "removeMaterial", material: structuredClone(change.material), index: change.index };
+    if (change.kind === "removeMaterial") return { kind: "addMaterial", material: structuredClone(change.material), index: change.index };
+    if (change.kind === "setMaterial") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    if (change.kind === "setMaterialSlots") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "addModifier") return { kind: "removeModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "removeModifier") return { kind: "addModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
@@ -585,7 +649,21 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
-    if (change.kind === "addAsset") {
+    if (change.kind === "addMaterial") {
+      if (entityIds(result).has(change.material.id) || change.index < 0 || change.index > result.materials.length) throw new Error("Patch material conflict");
+      result.materials.splice(change.index, 0, structuredClone(change.material));
+    } else if (change.kind === "removeMaterial") {
+      if (!same(result.materials[change.index], change.material)) throw new Error("Patch material conflict");
+      result.materials.splice(change.index, 1);
+    } else if (change.kind === "setMaterial") {
+      const index = result.materials.findIndex(item => item.id === change.materialId);
+      if (index < 0 || !same(result.materials[index], change.before) || change.after.id !== change.materialId) throw new Error("Patch material conflict");
+      result.materials[index] = structuredClone(change.after);
+    } else if (change.kind === "setMaterialSlots") {
+      const node = result.nodes.find(item => item.id === change.nodeId);
+      if (!node || node.kind !== "mesh" || !same(node.materialSlots, change.before)) throw new Error("Patch material slots conflict");
+      node.materialSlots = structuredClone(change.after);
+    } else if (change.kind === "addAsset") {
       if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
       result.assets.push(structuredClone(change.asset));
     } else if (change.kind === "removeAsset") {

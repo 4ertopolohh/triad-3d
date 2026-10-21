@@ -5,6 +5,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { parseBevelParameters } from "../geometry/modifiers/bevel";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
+import { validateMaterial } from "./validate-material";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -97,7 +98,15 @@ export function validateProject(project: Project): ValidationIssue[] {
         if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
       }
     }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    const slotNames = new Set<string>();
+    if (node.kind !== "mesh" && node.materialSlots.length) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.materialSlots`, message: "Слоты материалов разрешены только у mesh." });
+    for (const [slotIndex, slot] of node.materialSlots.entries()) {
+      const path = `nodes.${node.id}.materialSlots[${slotIndex}]`;
+      if (!slot || typeof slot.name !== "string" || !slot.name.trim() || slotNames.has(slot.name))
+        issues.push({ code: "INVALID_STRUCTURE", path: `${path}.name`, message: "Имя слота должно быть непустым и уникальным." });
+      else slotNames.add(slot.name);
+      reference(slot.materialId, materialIds, `${path}.materialId`);
+    }
     const seenModifiers = new Set<EntityId>();
     for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
       if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
@@ -231,11 +240,8 @@ export function validateProject(project: Project): ValidationIssue[] {
     }
   }
   for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+    issues.push(...validateMaterial(material, `materials.${material.id}`));
+    if (Array.isArray(material.textureAssetIds)) material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
   }
   for (const clip of project.animations) {
     finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
