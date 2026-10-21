@@ -7,6 +7,7 @@ import type { AssetGeometryResolver, BooleanParameters, EvaluationResult, Geomet
 import { ArrayError, evaluateArray, parseArrayParameters } from "./array";
 import { MirrorError, evaluateMirror, parseMirrorParameters } from "./mirror";
 import { DeformError, evaluateDeform, parseBendParameters, parseTwistParameters, parseTaperParameters } from "./deform";
+import { BevelError, evaluateBevel, parseBevelParameters } from "./bevel";
 
 type CsgRunner = Pick<CsgService, "run" | "cancel">;
 type Stage = { mesh: MeshData; key: string; attributes: GeometryAttributes; warnings: ModifierWarning[]; applied: string[]; empty: boolean };
@@ -106,7 +107,7 @@ export class ModifierEvaluator {
       this.checkProject(ctx, nodeId);
       return { ok: true, mesh: cloneMesh(stage.mesh), empty: stage.empty, warnings: [...stage.warnings], appliedModifierIds: [...stage.applied], fallback: false };
     } catch (error) {
-      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError || error instanceof ArrayError || error instanceof MirrorError || error instanceof DeformError ? error.code : "WORKER_FAILED";
+      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError || error instanceof ArrayError || error instanceof MirrorError || error instanceof DeformError || error instanceof BevelError ? error.code : "WORKER_FAILED";
       const message = error instanceof Error ? error.message : String(error);
       const diagnostic: ModifierDiagnostic = { code, message, ...(error instanceof EvaluationFailure && error.nodeId ? { nodeId: error.nodeId } : { nodeId }), ...(error instanceof EvaluationFailure && error.modifierId ? { modifierId: error.modifierId } : {}) };
       return fail(diagnostic, code === "JOB_CANCELLED" || code === "STALE_PROJECT" ? undefined : last);
@@ -161,6 +162,30 @@ export class ModifierEvaluator {
       for (const modifier of modifiers) {
         this.check(ctx.signal, ctx.epoch);
         if (!modifier.enabled) continue;
+        if (modifier.kind === "bevel") {
+          let params;
+          try { params = parseBevelParameters(modifier.parameters); }
+          catch (error) { throw new EvaluationFailure(error instanceof BevelError ? error.code : "INVALID_MODIFIER", error instanceof Error ? error.message : "Некорректный Bevel.", nodeId, modifier.id); }
+          const key = stable([stage.key, modifier.id, modifier.kind, modifier.version, modifier.order, modifier.parameters]);
+          const hit = this.read(key);
+          if (hit) { stage = hit; progress?.(stage); continue; }
+          let output: MeshData;
+          try { output = await evaluateBevel(stage.mesh, params, ctx.signal); }
+          catch (error) { throw new EvaluationFailure(error instanceof BevelError || error instanceof CsgError ? error.code : "WORKER_FAILED", error instanceof Error ? error.message : "Ошибка Bevel.", nodeId, modifier.id); }
+          this.check(ctx.signal, ctx.epoch); this.checkProject(ctx, nodeId);
+          const unchanged = output.positions.length === stage.mesh.positions.length && output.indices.length === stage.mesh.indices.length
+            && output.positions.every((value, index) => value === stage.mesh.positions[index])
+            && output.indices.every((value, index) => value === stage.mesh.indices[index]);
+          const warnings = [...stage.warnings];
+          if (!unchanged) {
+            if (stage.attributes.uv) warnings.push({ code: "UV_DROPPED", message: "MeshData Bevel не переносит исходные UV." });
+            if (stage.attributes.normals) warnings.push({ code: "NORMALS_RECOMPUTED", message: "Авторские нормали не сохраняются; отображение пересчитывает их." });
+            if (stage.attributes.materialGroups || (stage.attributes.materialSlots ?? 0) > 1) warnings.push({ code: "MATERIALS_DROPPED", message: "Группы и слоты материалов не сохраняются." });
+          }
+          stage = { ...stage, mesh: output, key, attributes: unchanged ? stage.attributes : {}, warnings, applied: [...stage.applied, modifier.id] };
+          this.write(stage); progress?.(stage);
+          continue;
+        }
         if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") {
           const key = stable([stage.key, modifier.id, modifier.kind, modifier.version, modifier.order, modifier.parameters]);
           let params;

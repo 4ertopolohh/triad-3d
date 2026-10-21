@@ -116,7 +116,7 @@ describe("ModifierEvaluator", () => {
     m.parameters = { operation: "wrong", cutterNodeId: "b" };
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
     m.kind = "bevel";
-    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "UNSUPPORTED_MODIFIER" } });
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
   });
   it("keeps a fallback on worker failure and recovers on retry", async () => {
     const p = fixture(), csg = fake(), evaluator = new ModifierEvaluator({ csg });

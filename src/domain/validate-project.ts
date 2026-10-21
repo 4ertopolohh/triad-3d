@@ -3,6 +3,7 @@ import { validatePrimitiveSource } from "../geometry/primitives";
 import { validateEditableSource } from "../geometry/mesh-edit";
 import { parseArrayParameters } from "../geometry/modifiers/array";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
+import { parseBevelParameters } from "../geometry/modifiers/bevel";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
 
 export type ValidationCode =
@@ -175,6 +176,10 @@ export function validateProject(project: Project): ValidationIssue[] {
     if (modifier.kind === "mirror") {
       try { parseMirrorParameters(modifier.parameters); }
       catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Mirror." }); }
+    }
+    if (modifier.kind === "bevel") {
+      try { parseBevelParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Bevel." }); }
     }
     if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") {
       try {
