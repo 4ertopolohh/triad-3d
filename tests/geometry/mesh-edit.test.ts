@@ -8,7 +8,9 @@ import { createProject } from "../../src/domain/create-project";
 import { deserializeProjectDocument, serializeProjectDocument } from "../../src/domain/project-serialization";
 import type { MeshNode, Project } from "../../src/domain/types";
 import { ModifierEvaluator } from "../../src/geometry/modifiers";
-import { convertPrimitiveToEditable, translateEditableVertices, validateEditableSource } from "../../src/geometry/mesh-edit";
+import { convertPrimitiveToEditable, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../../src/geometry/mesh-edit";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { vertexRepresentatives } from "../../src/geometry/vertex-selection";
 import { createPrimitiveNode } from "../../src/geometry/primitives";
 import { SceneSync } from "../../src/renderer/scene-sync";
 import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
@@ -24,6 +26,150 @@ function fixture(): { project: Project; mesh: MeshNode } {
 const convert = () => ({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube" } });
 const translate = (vertexIndices: number[], delta: [number, number, number], commandId = "move") =>
   ({ commandId, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube", vertexIndices, delta } });
+const scale = (vertexIndices: number[], factors: [number, number, number], commandId = "scale") =>
+  ({ commandId, type: "SCALE_EDITABLE_VERTICES" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube", vertexIndices, factors } });
+
+describe("editable mesh scaling", () => {
+  const cube = () => convertPrimitiveToEditable(createPrimitiveNode("cube", "root", "cube").meshSource as Extract<MeshNode["meshSource"], { kind: "primitive" }>);
+
+  it("scales two unique vertices around one center, preserves seams, UV, indices and input", () => {
+    const source = cube();
+    const original = structuredClone(source);
+    const [a, b] = vertexRepresentatives(source);
+    const center = [0, 1, 2].map(axis => (source.positions[3 * a! + axis]! + source.positions[3 * b! + axis]!) / 2);
+    const result = scaleEditableVertices(source, [b!, a!, a!], [1.25, 1.5, 1.75]);
+    for (const index of [a!, b!]) {
+      const before = source.positions.slice(3 * index, 3 * index + 3);
+      const duplicates = Array.from({ length: source.positions.length / 3 }, (_, i) => i)
+        .filter(i => source.positions.slice(3 * i, 3 * i + 3).every((value, axis) => value === before[axis]));
+      for (const duplicate of duplicates) for (let axis = 0; axis < 3; axis++)
+        expect(result.positions[3 * duplicate + axis]).toBeCloseTo(Math.fround(center[axis]! + (before[axis]! - center[axis]!) * [1.25, 1.5, 1.75][axis]!));
+    }
+    expect(result.indices).toEqual(source.indices);
+    expect(result.uv).toEqual(source.uv);
+    expect(source).toEqual(original);
+    expect(validateEditableSource(result)).toBeNull();
+  });
+
+  it("scales edge and connected face vertices with one shared center", () => {
+    const source = cube();
+    const topology = buildMeshTopology(source)!;
+    for (const selected of [topology.edges[0]!.vertices, topology.faces[0]!.vertices,
+      [...topology.faces[0]!.vertices, ...topology.edges[1]!.vertices]]) {
+      const unique = [...new Set(selected)];
+      const center = [0, 1, 2].map(axis => unique.reduce((sum, index) => sum + source.positions[3 * index + axis]!, 0) / unique.length);
+      const result = scaleEditableVertices(source, selected, [1.1, 1.2, 1.3]);
+      for (const index of unique) for (let axis = 0; axis < 3; axis++)
+        expect(result.positions[3 * index + axis]).toBeCloseTo(Math.fround(center[axis]! + (source.positions[3 * index + axis]! - center[axis]!) * [1.1, 1.2, 1.3][axis]!));
+      expect(validateEditableSource(result)).toBeNull();
+    }
+  });
+
+  it("returns the same source for semantic and effective no-ops", () => {
+    const source = cube();
+    const [a, b] = vertexRepresentatives(source);
+    expect(scaleEditableVertices(source, [a!, b!], [1, 1, 1])).toBe(source);
+    expect(scaleEditableVertices(source, [a!], [2, 2, 2])).toBe(source);
+    const axis = [0, 1, 2].find(i => source.positions[3 * a! + i] === source.positions[3 * b! + i])!;
+    const factors: [number, number, number] = [1, 1, 1]; factors[axis] = 2;
+    expect(scaleEditableVertices(source, [a!, b!], factors)).toBe(source);
+  });
+
+  it("rejects malformed factors, selections, overflow and degenerate results atomically", () => {
+    const source = cube();
+    const before = structuredClone(source);
+    for (const selection of [[], [999], [-1], [0.5]]) expect(() => scaleEditableVertices(source, selection, [2, 1, 1])).toThrow();
+    for (const factors of [[NaN, 1, 1], [Infinity, 1, 1], [0, 1, 1], [-1, 1, 1], [1e300, 1, 1], [1, 1]] as [number, number, number][])
+      expect(() => scaleEditableVertices(source, vertexRepresentatives(source), factors)).toThrow();
+    expect(() => scaleEditableVertices(source, vertexRepresentatives(source), [1e-20, 1, 1])).toThrow(/вырожденный/i);
+    expect(source).toEqual(before);
+  });
+
+  it("commits one reversible patch and keeps invalid edits out of history", async () => {
+    const store = createEditorStore(fixture().project);
+    const converted = store.executeCommand(convert(), 0);
+    expect(converted.ok).toBe(true);
+    if (!converted.ok) return;
+    const initial = store.getSnapshot();
+    const source = (initial.document.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (source.kind !== "editable") throw new Error("fixture");
+    const vertices = vertexRepresentatives(source);
+    for (const command of [scale(vertices, [0, 1, 1]), scale([999], [2, 1, 1]), scale(vertices, [NaN, 1, 1])])
+      expect(store.executeCommand(command, 1).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(initial);
+    const noOp = store.executeCommand(scale(vertices, [1, 1, 1]), 1);
+    expect(noOp.ok && !noOp.changed).toBe(true);
+    expect(store.getSnapshot()).toBe(initial);
+    expect(store.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    const sync = new SceneSync(() => {});
+    const epoch = {};
+    sync.sync(converted.project, () => undefined, epoch);
+    const oldGeometry = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    const result = store.executeCommand(scale(vertices, [1.2, 1, 1]), 1);
+    expect(result.ok && result.changed).toBe(true);
+    if (!result.ok) return;
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    const changed = result.project;
+    sync.sync(changed, () => undefined, epoch);
+    expect(disposed).toHaveBeenCalledOnce();
+    const rendered = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    const changedSource = (changed.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (changedSource.kind !== "editable") throw new Error("fixture");
+    expect((rendered.getAttribute("position") as T.BufferAttribute).getX(vertices[0]!)).toBe(changedSource.positions[3 * vertices[0]!]!);
+    expect(store.undo(2).ok).toBe(true);
+    expect((store.getSnapshot().document.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource).toEqual(source);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project).toEqual(changed);
+    const archive = await createNativeProjectArchive(changed, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok && opened.value.project).toEqual(changed);
+    }
+    sync.dispose();
+  });
+
+  it("rejects malformed commands, hidden or locked ancestors and active modifiers", () => {
+    const converted = createCommandBus(fixture().project).executeCommand(convert(), 0);
+    if (!converted.ok) throw new Error(converted.message);
+    const source = (converted.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (source.kind !== "editable") throw new Error("fixture");
+    const vertices = vertexRepresentatives(source);
+    const bus = createCommandBus(converted.project);
+    const before = bus.getSnapshot();
+    for (const invalid of [
+      { ...scale(vertices, [2, 1, 1]), targetIds: ["other"] },
+      { ...scale(vertices, [2, 1, 1]), payload: { nodeId: "cube", vertexIndices: vertices, factors: [2, 1] } },
+      { ...scale(vertices, [2, 1, 1]), payload: { nodeId: "cube", vertexIndices: vertices, factors: [2, 1, 1], extra: true } },
+    ]) expect(bus.executeCommand(invalid as unknown as Parameters<typeof bus.executeCommand>[0], 0).ok).toBe(false);
+    expect(bus.getSnapshot()).toEqual(before);
+    for (const field of ["locked", "visible"] as const) {
+      const project = structuredClone(converted.project);
+      project.nodes[0]![field] = field === "locked";
+      const restricted = createCommandBus(project);
+      expect(restricted.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    }
+    const withModifier = structuredClone(converted.project);
+    (withModifier.nodes.find(n => n.id === "cube") as MeshNode).modifierIds.push("mirror");
+    withModifier.modifiers.push({ id: "mirror", nodeId: "cube", kind: "mirror", order: 0, enabled: true, version: 0,
+      parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
+    const restricted = createCommandBus(withModifier);
+    expect(restricted.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    expect(restricted.getSnapshot()).toEqual(withModifier);
+    const withDependent = structuredClone(converted.project);
+    const root = withDependent.nodes[0]!;
+    const target = createPrimitiveNode("cube", root.id, "target");
+    target.modifierIds.push("boolean");
+    root.children.push(target.id);
+    withDependent.nodes.push(target);
+    withDependent.modifiers.push({ id: "boolean", nodeId: target.id, kind: "boolean", order: 0, enabled: true, version: 0,
+      parameters: { operation: "subtract", cutterNodeId: "cube" } });
+    const dependent = createCommandBus(withDependent);
+    expect(dependent.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    expect(dependent.getSnapshot()).toEqual(withDependent);
+  });
+});
 
 describe("editable mesh foundation", () => {
   it.each(["cube", "sphere", "torus", "cylinder", "cone"] as const)("converts valid closed %s primitive", kind => {

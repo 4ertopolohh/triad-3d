@@ -92,3 +92,45 @@ export function translateEditableVertices(source: EditableMeshSource, selected: 
   if (resultError) throw new Error(resultError);
   return result;
 }
+
+/** Scale geometric vertices around their shared local centroid; UV seam copies stay coincident. */
+export function scaleEditableVertices(source: EditableMeshSource, selected: readonly number[], factors: Vec3): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
+    throw new Error("Выбор содержит несуществующую вершину.");
+  if (!Array.isArray(factors) || factors.length !== 3 || factors.some(n => typeof n !== "number" || !Number.isFinite(n)))
+    throw new Error("Масштаб должен содержать три конечных числа.");
+  if (factors.some(n => n <= 0)) throw new Error("Коэффициенты масштаба должны быть строго положительными.");
+  if (factors.every(n => n === 1)) return source;
+
+  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
+  const representatives = new Map<string, number>();
+  for (let i = 0; i < source.positions.length / 3; i++) {
+    const positionKey = key(source.positions, i);
+    if (selectedKeys.has(positionKey) && !representatives.has(positionKey)) representatives.set(positionKey, i);
+  }
+  if (representatives.size === 1) return source;
+  const mean = (axis: number) => {
+    let mean = 0;
+    for (const i of representatives.values()) mean += source.positions[3 * i + axis]! / representatives.size;
+    return mean;
+  };
+  const center: Vec3 = [mean(0), mean(1), mean(2)];
+  const positions = source.positions.slice();
+  let changed = false;
+  for (let i = 0; i < positions.length / 3; i++) {
+    if (!selectedKeys.has(key(source.positions, i))) continue;
+    for (let axis = 0; axis < 3; axis++) {
+      const before = source.positions[3 * i + axis]!;
+      const after = Math.fround(center[axis]! + (before - center[axis]!) * factors[axis]!);
+      positions[3 * i + axis] = after;
+      if (after !== before) changed = true;
+    }
+  }
+  if (!changed) return source;
+  const result: EditableMeshSource = { ...source, positions };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  return result;
+}

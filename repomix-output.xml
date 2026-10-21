@@ -111,6 +111,7 @@ src/
       mirror.ts
       types.ts
     mesh-edit.ts
+    mesh-topology.ts
     primitive-geometry.ts
     primitives.ts
     surface-query.ts
@@ -123,6 +124,7 @@ src/
     modifier-preview.ts
     primitive.ts
     scene-sync.ts
+    sub-element-picking.ts
     vertex-picking.ts
     viewport-interactions.ts
     Viewport.tsx
@@ -183,6 +185,7 @@ tests/
   geometry/
     array.test.ts
     mesh-edit.test.ts
+    mesh-topology.test.ts
     mirror.test.ts
     modifier-evaluator.test.ts
     surface-query.test.ts
@@ -193,6 +196,7 @@ tests/
     modifier-preview.test.ts
     primitives.test.ts
     scene-sync.test.ts
+    sub-element-edit.test.ts
     vertex-edit.test.ts
     viewport-interactions.test.ts
   ui/
@@ -5322,6 +5326,98 @@ export function translateEditableVertices(source: EditableMeshSource, selected: 
 }
 </file>
 
+<file path="src/geometry/mesh-topology.ts">
+type EditableMeshSource = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
+import { vertexKey } from "./vertex-selection";
+
+export type TopologyEdge = { id: string; vertices: readonly [number, number]; triangles: readonly number[] };
+export type TopologyFace = { id: number; triangles: readonly number[]; vertices: readonly number[] };
+export type MeshTopology = { edges: readonly TopologyEdge[]; faces: readonly TopologyFace[]; triangleFace: readonly number[] };
+
+/** Face tolerance allows Float32 quantization, but rejects visibly bent surfaces. */
+export const FACE_NORMAL_DOT = 0.999999;
+const PLANE_TOLERANCE = 2e-6;
+export const MAX_TOPOLOGY_TRIANGLES = 100_000;
+const cache = new WeakMap<object, MeshTopology | null>();
+
+export function buildMeshTopology(source: EditableMeshSource): MeshTopology | null {
+  if (Object.isFrozen(source) && cache.has(source)) return cache.get(source)!;
+  const { positions, indices } = source;
+  if (positions.length % 3 || indices.length % 3 || !indices.length || indices.length / 3 > MAX_TOPOLOGY_TRIANGLES ||
+    positions.some(value => !Number.isFinite(value)) ||
+    indices.some(value => !Number.isSafeInteger(value) || value < 0 || value >= positions.length / 3)) return null;
+  const representatives = new Map<string, number>();
+  const canonical = Array.from({ length: positions.length / 3 }, (_, index) => {
+    const key = vertexKey(positions, index);
+    if (!representatives.has(key)) representatives.set(key, index);
+    return representatives.get(key)!;
+  });
+  const edgeTriangles = new Map<string, { vertices: [number, number]; triangles: number[] }>();
+  const normals: number[][] = [];
+  const points: number[][] = [];
+  const corners: number[][] = [];
+  const point = (index: number) => positions.slice(index * 3, index * 3 + 3);
+  for (let triangle = 0; triangle < indices.length / 3; triangle++) {
+    const render = indices.slice(triangle * 3, triangle * 3 + 3);
+    const vertices = render.map(index => canonical[index]!);
+    if (new Set(vertices).size !== 3) return null;
+    const a = point(render[0]!), b = point(render[1]!), c = point(render[2]!);
+    const u = b.map((value, axis) => value - a[axis]!);
+    const v = c.map((value, axis) => value - a[axis]!);
+    const cross = [u[1]! * v[2]! - u[2]! * v[1]!, u[2]! * v[0]! - u[0]! * v[2]!, u[0]! * v[1]! - u[1]! * v[0]!];
+    const length = Math.hypot(...cross);
+    if (!Number.isFinite(length) || length <= 1e-12) return null;
+    normals.push(cross.map(value => value / length)); points.push(a); corners.push(vertices);
+    for (let edge = 0; edge < 3; edge++) {
+      const pair = [vertices[edge]!, vertices[(edge + 1) % 3]!].sort((x, y) => x - y) as [number, number];
+      const id = `${pair[0]}:${pair[1]}`;
+      const entry = edgeTriangles.get(id) ?? { vertices: pair, triangles: [] };
+      entry.triangles.push(triangle); edgeTriangles.set(id, entry);
+    }
+  }
+  const edges = [...edgeTriangles].sort((a, b) => a[1].vertices[0] - b[1].vertices[0] || a[1].vertices[1] - b[1].vertices[1])
+    .map(([id, value]) => ({ id, vertices: value.vertices, triangles: value.triangles }));
+  const neighbors = Array.from({ length: corners.length }, () => new Set<number>());
+  // A non-manifold edge has no unambiguous face continuation.
+  for (const edge of edges) if (edge.triangles.length === 2) {
+    const [a, b] = edge.triangles;
+    neighbors[a!]!.add(b!); neighbors[b!]!.add(a!);
+  }
+  const triangleFace = Array<number>(corners.length).fill(-1);
+  const faces: TopologyFace[] = [];
+  const dot = (a: readonly number[], b: readonly number[]) => a.reduce((sum, value, axis) => sum + value * b[axis]!, 0);
+  for (let seed = 0; seed < corners.length; seed++) {
+    if (triangleFace[seed] !== -1) continue;
+    const stack = [seed], region: number[] = [], reference = normals[seed]!, origin = points[seed]!;
+    triangleFace[seed] = seed;
+    while (stack.length) {
+      const current = stack.pop()!; region.push(current);
+      for (const candidate of neighbors[current]!) {
+        if (triangleFace[candidate] !== -1 || dot(reference, normals[candidate]!) < FACE_NORMAL_DOT) continue;
+        if (corners[candidate]!.some(index => Math.abs(dot(reference, point(index).map((value, axis) => value - origin[axis]!))) > PLANE_TOLERANCE)) continue;
+        triangleFace[candidate] = seed; stack.push(candidate);
+      }
+    }
+    region.sort((a, b) => a - b);
+    faces.push({ id: seed, triangles: region, vertices: [...new Set(region.flatMap(index => corners[index]!))].sort((a, b) => a - b) });
+  }
+  const topology = { edges, faces, triangleFace };
+  if (Object.isFrozen(source)) cache.set(source, topology);
+  return topology;
+}
+
+export function selectedTopologyVertices(topology: MeshTopology, mode: "edge" | "face", ids: readonly string[] | readonly number[]): number[] | null {
+  const byId = new Map<string | number, readonly number[]>(mode === "edge" ? topology.edges.map(element => [element.id, element.vertices]) : topology.faces.map(element => [element.id, element.vertices]));
+  const vertices = new Set<number>();
+  for (const id of ids) {
+    const found = byId.get(id);
+    if (!found) return null;
+    for (const vertex of found) vertices.add(vertex);
+  }
+  return [...vertices].sort((a, b) => a - b);
+}
+</file>
+
 <file path="src/geometry/primitive-geometry.ts">
 import * as T from "three";
 import type { MeshSource } from "../domain/types";
@@ -5660,6 +5756,38 @@ export function normalizeVertexIndices(source: { readonly positions: readonly nu
     result.add(representatives.get(vertexKey(source.positions, index))!);
   }
   return [...result].sort((a, b) => a - b);
+}
+</file>
+
+<file path="src/renderer/sub-element-picking.ts">
+import * as T from "three";
+import type { SurfaceHit } from "../geometry/surface-query";
+import type { MeshTopology } from "../geometry/mesh-topology";
+type EditableMeshSource = { readonly positions: readonly number[] };
+
+/** Eight CSS pixels from a front surface segment; the surface hit prevents picking occluded objects. */
+export const EDGE_PICK_TOLERANCE = 8;
+
+export function pickEditableEdge(hit: SurfaceHit, source: EditableMeshSource, topology: MeshTopology, camera: T.Camera,
+  clientX: number, clientY: number, rect: Pick<DOMRect, "left" | "top" | "width" | "height">): string | null {
+  if (hit.faceIndex === undefined || rect.width <= 0 || rect.height <= 0) return null;
+  hit.mesh.updateWorldMatrix(true, false);
+  const project = (index: number) => {
+    const point = new T.Vector3(...source.positions.slice(index * 3, index * 3 + 3) as [number, number, number]);
+    point.applyMatrix4(hit.mesh.matrixWorld).project(camera);
+    return { x: rect.left + (point.x + 1) * rect.width / 2, y: rect.top + (1 - point.y) * rect.height / 2, z: point.z };
+  };
+  let best: string | null = null, distance = EDGE_PICK_TOLERANCE ** 2;
+  for (const edge of topology.edges) {
+    if (!edge.triangles.includes(hit.faceIndex)) continue;
+    const a = project(edge.vertices[0]), b = project(edge.vertices[1]);
+    if (a.z < -1 || a.z > 1 || b.z < -1 || b.z > 1) continue;
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const t = Math.max(0, Math.min(1, ((clientX - a.x) * dx + (clientY - a.y) * dy) / (dx * dx + dy * dy || 1)));
+    const squared = (clientX - a.x - t * dx) ** 2 + (clientY - a.y - t * dy) ** 2;
+    if (squared <= distance) { distance = squared; best = edge.id; }
+  }
+  return best;
 }
 </file>
 
@@ -8070,6 +8198,49 @@ describe("editable mesh foundation", () => {
 });
 </file>
 
+<file path="tests/geometry/mesh-topology.test.ts">
+import { describe, expect, it } from "vitest";
+import { convertPrimitiveToEditable } from "../../src/geometry/mesh-edit";
+import { buildMeshTopology, selectedTopologyVertices } from "../../src/geometry/mesh-topology";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const cube = () => {
+  const node = createNestedMeshProject().nodes.find(item => item.id === "mesh-node");
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "primitive") throw new Error("cube fixture");
+  return convertPrimitiveToEditable(node.meshSource);
+};
+
+describe("editable mesh topology", () => {
+  it("groups the cube into six UV seam aware faces and deduplicates geometric edges", () => {
+    const source = cube();
+    const before = structuredClone(source);
+    const topology = buildMeshTopology(source)!;
+    expect(topology.faces).toHaveLength(6);
+    expect(topology.faces.every(face => face.triangles.length === 2)).toBe(true);
+    expect(topology.edges).toHaveLength(18); // Twelve outer edges and six triangulation diagonals.
+    expect(topology.edges.every(edge => edge.vertices[0] !== edge.vertices[1])).toBe(true);
+    expect(buildMeshTopology(source)).toEqual(topology);
+    expect(source).toEqual(before);
+  });
+
+  it("keeps disconnected coplanar triangles separate and rejects bent joins", () => {
+    const source = { kind: "editable" as const, positions: [0,0,0, 1,0,0, 0,1,0, 3,0,0, 4,0,0, 3,1,0], indices: [0,1,2,3,4,5] };
+    expect(buildMeshTopology(source)?.faces).toHaveLength(2);
+    const bent = { kind: "editable" as const, positions: [0,0,0, 1,0,0, 0,1,0, 1,1,0.01], indices: [0,1,2, 1,3,2] };
+    expect(buildMeshTopology(bent)?.faces).toHaveLength(2);
+  });
+
+  it("rejects bad indices and returns unique vertices for multi selection", () => {
+    expect(buildMeshTopology({ kind: "editable", positions: [0,0,0, 1,0,0, 0,1,0], indices: [0,1,4] })).toBeNull();
+    const topology = buildMeshTopology(cube())!;
+    const ids = topology.edges.slice(0, 2).map(edge => edge.id);
+    const vertices = selectedTopologyVertices(topology, "edge", ids)!;
+    expect(vertices).toEqual([...new Set(vertices)]);
+    expect(selectedTopologyVertices(topology, "face", [999])).toBeNull();
+  });
+});
+</file>
+
 <file path="tests/geometry/mirror.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import { createProject } from "../../src/domain/create-project";
@@ -8749,6 +8920,92 @@ describe("parametric primitives", () => {
     sync.sync(project, () => undefined);
     expect(sync.objects.has(node.id)).toBe(false);
     sync.dispose();
+  });
+});
+</file>
+
+<file path="tests/renderer/sub-element-edit.test.ts">
+import { describe, expect, it } from "vitest";
+import { createEditorStore } from "../../src/app/editor-store";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { editableGeometry } from "../../src/geometry/mesh-edit";
+import { pickEditableEdge } from "../../src/renderer/sub-element-picking";
+import { createNestedMeshProject } from "../fixtures/projects";
+import * as T from "three";
+
+function setup() {
+  const store = createEditorStore(createNestedMeshProject());
+  store.setSelection(["mesh-node"]);
+  expect(store.executeCommand({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0).ok).toBe(true);
+  const node = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") throw new Error("fixture");
+  return { store, source: node.meshSource, topology: buildMeshTopology(node.meshSource)! };
+}
+
+describe("edge and face editing", () => {
+  it.each(["edge", "face"] as const)("translates a selected %s through one command with undo and redo", mode => {
+    const { store, source, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode(mode, 1, epoch)).toBeNull();
+    const ids = mode === "edge" ? [topology.edges[0]!.id] : [topology.faces[0]!.id];
+    expect(store.setSubElementSelection(ids, 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    expect(vertices.length).toBeGreaterThan(0);
+    expect(vertices).toEqual([...new Set(vertices)]);
+    const moved = store.executeCommand({ commandId: "move", type: "TRANSLATE_EDITABLE_VERTICES", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta: [0.125, 0, 0] } }, 1);
+    expect(moved.ok && moved.changed).toBe(true);
+    const after = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
+    if (after?.kind !== "mesh" || after.meshSource.kind !== "editable") throw new Error("fixture");
+    expect(after.meshSource.positions).not.toEqual(source.positions);
+    expect(after.meshSource.indices).toEqual(source.indices);
+    expect(after.meshSource.uv).toEqual(source.uv);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: source });
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: after.meshSource });
+  });
+
+  it("clears incompatible selection and rejects stale and invalid choices", () => {
+    const { store, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
+    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
+    expect(store.enterMeshEditMode("face", 1, epoch)).toBeNull();
+    expect(store.getSnapshot().meshEdit.edgeIds).toHaveLength(0);
+    expect(store.setSubElementSelection([999], 1, epoch)).toBe(false);
+    expect(store.setSubElementSelection([topology.faces[0]!.id], 0, epoch)).toBe(false);
+    store.setTool({ mode: "scene" });
+    expect(store.getSnapshot().meshEdit.mode).toBe("object");
+  });
+
+  it("picks only a near segment of the front hit triangle in screen pixels", () => {
+    const source = { kind: "editable" as const, positions: [0,0,0, 1,0,0, 0,1,0], indices: [0,1,2] };
+    const mesh = new T.Mesh(editableGeometry(source));
+    const camera = new T.PerspectiveCamera(60, 1, 0.1, 100);
+    camera.position.set(0.5, 0.5, 5); camera.lookAt(0.5, 0.5, 0); camera.updateProjectionMatrix();
+    const hit = { nodeId: "mesh", mesh, faceIndex: 0 } as Parameters<typeof pickEditableEdge>[0];
+    const midpoint = new T.Vector3(0.5, 0, 0).project(camera);
+    const rect = { left: 0, top: 0, width: 400, height: 400 };
+    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, (midpoint.x + 1) * 200, (1 - midpoint.y) * 200, rect)).toBe("0:1");
+    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, 5, 5, rect)).toBeNull();
+    mesh.geometry.dispose();
+  });
+
+  it("keeps history unchanged for zero, nonfinite and degenerate moves, and blocks hidden parents", () => {
+    const { store, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
+    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    const before = store.getSnapshot();
+    const command = (id: string, delta: [number, number, number]) => ({ commandId: id, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta } });
+    const zero = store.executeCommand(command("zero", [0, 0, 0]), 1);
+    expect(zero.ok && !zero.changed).toBe(true);
+    expect(store.executeCommand(command("bad", [NaN, 0, 0]), 1).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", visible: false } }, 1).ok).toBe(true);
+    expect(store.getSnapshot().meshEdit.mode).toBe("object");
+    expect(store.enterMeshEditMode("face", 2, epoch)).toBeTruthy();
   });
 });
 </file>
@@ -11984,6 +12241,8 @@ import type { Transform } from "../domain/types";
 import { applyTransform, type SceneSync } from "./scene-sync";
 import { vertexRepresentatives } from "../geometry/vertex-selection";
 import { pickEditableVertex } from "./vertex-picking";
+import { buildMeshTopology, type MeshTopology } from "../geometry/mesh-topology";
+import { pickEditableEdge } from "./sub-element-picking";
 
 type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
 const EPS = 1e-6;
@@ -12048,6 +12307,8 @@ export class ViewportInteractions {
   private unsubscribe: () => void;
   private markers: T.Group | null = null;
   private markerKey = "";
+  private topologySource: object | null = null;
+  private topology: MeshTopology | null = null;
 
   constructor(private graph: SceneSync, private canvas: HTMLCanvasElement, private store: EditorStore,
     private report: (message: string | null) => void, blocked: boolean) {
@@ -12077,7 +12338,7 @@ export class ViewportInteractions {
     const state = this.store.getSnapshot();
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
-    if (!id || !object || state.meshEdit.mode === "vertex" || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
+    if (!id || !object || state.meshEdit.mode !== "object" || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
     this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
       revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
     this.report(null);
@@ -12125,16 +12386,27 @@ export class ViewportInteractions {
       -(event.clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
     const hit = this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far);
     const current = this.store.getSnapshot();
-    if (current.meshEdit.mode === "vertex") {
+    if (current.meshEdit.mode !== "object") {
       const id = current.meshEdit.nodeId;
       const node = current.document.project.nodes.find(item => item.id === id);
       if (!id || node?.kind !== "mesh" || node.meshSource.kind !== "editable") return;
-      if (hit?.nodeId && hit.nodeId !== id) { this.report("Для выбора другого объекта выйдите из режима вершин."); return; }
-      const vertex = hit?.nodeId === id ? pickEditableVertex(hit, node.meshSource, this.graph.camera, event.clientX, event.clientY, rect) : null;
-      const selected = current.meshEdit.vertexIndices;
-      const next = vertex === null ? [] : event.ctrlKey || event.metaKey ? selected.includes(vertex) ? selected.filter(index => index !== vertex) : [...selected, vertex]
-        : event.shiftKey ? [...selected, vertex] : [vertex];
-      this.store.setVertexSelection(next, current.document.revision, this.store.getProjectEpoch());
+      if (hit?.nodeId && hit.nodeId !== id) { this.report("Для выбора другого объекта выйдите из режима элементов."); return; }
+      const mode = current.meshEdit.mode;
+      if (mode === "vertex") {
+        const vertex = hit?.nodeId === id ? pickEditableVertex(hit, node.meshSource, this.graph.camera, event.clientX, event.clientY, rect) : null;
+        const selected = current.meshEdit.vertexIndices;
+        const next = vertex === null ? event.shiftKey || event.ctrlKey || event.metaKey ? selected : [] : event.ctrlKey || event.metaKey ? selected.includes(vertex) ? selected.filter(index => index !== vertex) : [...selected, vertex]
+          : event.shiftKey ? [...selected, vertex] : [vertex];
+        this.store.setVertexSelection(next, current.document.revision, this.store.getProjectEpoch());
+      } else {
+        const topology = this.getTopology(node.meshSource);
+        const picked = hit?.nodeId === id && topology ? mode === "edge" ? pickEditableEdge(hit, node.meshSource, topology, this.graph.camera, event.clientX, event.clientY, rect)
+          : hit.faceIndex === undefined ? null : topology.triangleFace[hit.faceIndex] ?? null : null;
+        const selected = mode === "edge" ? current.meshEdit.edgeIds : current.meshEdit.faceIds;
+        const next = picked === null ? event.shiftKey || event.ctrlKey || event.metaKey ? [...selected] : [] : event.ctrlKey || event.metaKey ? selected.includes(picked as never) ? selected.filter(value => value !== picked) : [...selected, picked]
+          : event.shiftKey ? [...selected, picked] : [picked];
+        this.store.setSubElementSelection(next as string[] | number[], current.document.revision, this.store.getProjectEpoch());
+      }
       this.report(null);
       return;
     }
@@ -12150,12 +12422,13 @@ export class ViewportInteractions {
     const target = event.target as HTMLElement | null;
     if (event.ctrlKey || event.metaKey || event.altKey || target?.closest("input, textarea, select, [contenteditable], [role='dialog'], [aria-modal='true']")) return;
     const meshEdit = this.store.getSnapshot().meshEdit;
-    if (meshEdit.mode === "vertex") {
+    if (meshEdit.mode !== "object") {
       if (event.key === "Escape") {
-        if (meshEdit.vertexIndices.length) {
+        if (meshEdit.vertexIndices.length || meshEdit.edgeIds.length || meshEdit.faceIds.length) {
           const state = this.store.getSnapshot();
-          this.store.setVertexSelection([], state.document.revision, this.store.getProjectEpoch());
-        } else this.store.exitVertexMode();
+          if (meshEdit.mode === "vertex") this.store.setVertexSelection([], state.document.revision, this.store.getProjectEpoch());
+          else this.store.setSubElementSelection([], state.document.revision, this.store.getProjectEpoch());
+        } else this.store.exitMeshEditMode();
         event.preventDefault();
       } else if (event.key === "Delete" || ["g", "r", "s"].includes(event.key.toLowerCase())) event.preventDefault();
       else if (event.key.toLowerCase() === "f") { this.fit(); event.preventDefault(); }
@@ -12212,7 +12485,7 @@ export class ViewportInteractions {
     if (!this.markers) return;
     this.markers.removeFromParent();
     this.markers.traverse(part => {
-      if (part instanceof T.InstancedMesh) { part.geometry.dispose(); (part.material as T.Material).dispose(); }
+      if (part instanceof T.Mesh || part instanceof T.LineSegments || part instanceof T.InstancedMesh) { part.geometry.dispose(); (part.material as T.Material).dispose(); }
     });
     this.markers = null;
     this.markerKey = "";
@@ -12221,12 +12494,39 @@ export class ViewportInteractions {
     const id = state.meshEdit.nodeId;
     const node = state.document.project.nodes.find(item => item.id === id);
     const wrapper = id ? this.graph.objects.get(id)?.object : undefined;
-    if (state.meshEdit.mode !== "vertex" || node?.kind !== "mesh" || node.meshSource.kind !== "editable" || !wrapper || this.blocked) { this.clearMarkers(); return; }
-    const key = `${id}:${state.derived.generation}:${state.meshEdit.vertexIndices.join(",")}`;
+    if (state.meshEdit.mode === "object" || node?.kind !== "mesh" || node.meshSource.kind !== "editable" || !wrapper || this.blocked) { this.clearMarkers(); return; }
+    const key = `${id}:${state.derived.generation}:${state.meshEdit.mode}:${state.meshEdit.vertexIndices.join(",")}:${state.meshEdit.edgeIds.join(",")}:${state.meshEdit.faceIds.join(",")}`;
     if (key === this.markerKey && this.markers?.parent === wrapper) return;
     this.clearMarkers();
     const group = new T.Group();
-    group.name = "Временные маркеры вершин";
+    group.name = "Временное выделение элементов";
+    group.traverse(part => { part.raycast = () => {}; });
+    if (state.meshEdit.mode !== "vertex") {
+      const topology = this.getTopology(node.meshSource);
+      if (!topology) return;
+      const source = node.meshSource;
+      if (state.meshEdit.mode === "edge") {
+        const selected = new Set(state.meshEdit.edgeIds);
+        const lines: number[] = [];
+        for (const edge of topology.edges) if (selected.has(edge.id)) for (const index of edge.vertices)
+          lines.push(...source.positions.slice(index * 3, index * 3 + 3));
+        if (lines.length) {
+          const geometry = new T.BufferGeometry(); geometry.setAttribute("position", new T.Float32BufferAttribute(lines, 3));
+          const material = new T.LineBasicMaterial({ color: 0xffbb55, depthTest: true, depthWrite: false, toneMapped: false });
+          const overlay = new T.LineSegments(geometry, material); overlay.raycast = () => {}; overlay.renderOrder = 1000; group.add(overlay);
+        }
+      } else {
+        const selected = new Set(state.meshEdit.faceIds), positions: number[] = [];
+        for (const face of topology.faces) if (selected.has(face.id)) for (const triangle of face.triangles)
+          for (let corner = 0; corner < 3; corner++) positions.push(...source.positions.slice(source.indices[triangle * 3 + corner]! * 3, source.indices[triangle * 3 + corner]! * 3 + 3));
+        if (positions.length) {
+          const geometry = new T.BufferGeometry(); geometry.setAttribute("position", new T.Float32BufferAttribute(positions, 3)); geometry.computeVertexNormals();
+          const material = new T.MeshBasicMaterial({ color: 0xffbb55, transparent: true, opacity: 0.45, side: T.DoubleSide, depthTest: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, toneMapped: false });
+          const overlay = new T.Mesh(geometry, material); overlay.raycast = () => {}; overlay.renderOrder = 1000; group.add(overlay);
+        }
+      }
+      wrapper.add(group); this.markers = group; this.markerKey = key; return;
+    }
     const selected = new Set(state.meshEdit.vertexIndices);
     const normal: number[] = [], active: number[] = [];
     for (const index of vertexRepresentatives(node.meshSource)) {
@@ -12258,6 +12558,10 @@ export class ViewportInteractions {
     wrapper.add(group);
     this.markers = group;
     this.markerKey = key;
+  }
+  private getTopology(source: { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] }): MeshTopology | null {
+    if (this.topologySource !== source) { this.topologySource = source; this.topology = buildMeshTopology(source); }
+    return this.topology;
   }
   private updateOutline(object: T.Object3D | null): void {
     if (!object) { this.outline.visible = false; return; }
@@ -12380,19 +12684,21 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
   const canTransform = editable(state, state.selection.activeId, blocked);
-  const vertexMode = state.meshEdit.mode === "vertex";
+  const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
   return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
     <div className="renderer-toolbar">
       <div className="viewport-tools" role="group" aria-label="Режим выбора">
-        <button type="button" aria-pressed={!vertexMode} onClick={() => store.exitVertexMode()}>Объект</button>
-        <button type="button" aria-pressed={vertexMode} disabled={mode !== "model" || blocked || state.selection.ids.length !== 1 || activeNode?.kind !== "mesh" || activeNode.meshSource.kind !== "editable"}
-          onClick={() => { const message = store.enterVertexMode(state.document.revision, store.getProjectEpoch()); setInteractionError(message); }}>Вершины</button>
+        <button type="button" aria-pressed={!subMode} onClick={() => store.exitMeshEditMode()}>Объект</button>
+        {([ ["vertex", "Вершины"], ["edge", "Рёбра"], ["face", "Грани"] ] as const).map(([editMode, label]) => <button key={editMode} type="button" aria-pressed={state.meshEdit.mode === editMode}
+          disabled={mode !== "model" || blocked || state.selection.ids.length !== 1 || activeNode?.kind !== "mesh" || activeNode.meshSource.kind !== "editable"}
+          title={activeNode?.kind !== "mesh" || activeNode.meshSource.kind !== "editable" ? "Выберите редактируемую сетку." : blocked ? "Дождитесь завершения операции." : undefined}
+          onClick={() => { const message = store.enterMeshEditMode(editMode, state.document.revision, store.getProjectEpoch()); setInteractionError(message); }}>{label}</button>)}
       </div>
       <div className="viewport-tools" role="group" aria-label="Инструменты 3D">
         {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
           <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
-            disabled={vertexMode || tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
+            disabled={subMode || tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
       </div>
       <div className="viewport-tools" role="group" aria-label="Пространство координат">
         <button type="button" aria-pressed={state.tool.space === "local"} disabled={mode !== "model" || blocked} onClick={() => store.setTool({ space: "local" })}>Локально</button>
@@ -12410,8 +12716,8 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
     <div className="renderer-host" ref={host} />
     <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
       <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
-      {!vertexMode && state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
-      {vertexMode && <span>Выбор вершин: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
+      {!subMode && state.tool.active !== "select" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
+      {subMode && <span>Выбор элементов: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
       {interactionError && <span role="alert">{interactionError}</span>}
       {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
       {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
@@ -12545,7 +12851,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
           : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
         {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
-      {state.meshEdit.mode === "vertex" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
+      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}
     <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
@@ -12579,13 +12885,13 @@ function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; 
   }
   const epoch = store.getProjectEpoch();
   function enter() {
-    const message = store.enterVertexMode(state.document.revision, epoch);
+    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
     setError(message ?? "");
   }
   return <div className="mesh-edit-actions">
     {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
-    {node.meshSource.kind === "editable" && (state.meshEdit.mode === "vertex"
-      ? <button type="button" onClick={() => store.exitVertexMode()}>Вернуться к объектам</button>
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
+      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
       : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
     {restriction && <p className="panel-hint">{restriction}</p>}
     {error && <p className="primitive-error" role="alert">{error}</p>}
@@ -12603,9 +12909,8 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
   function apply() {
     const current = store.getSnapshot();
     const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== "vertex" || current.meshEdit.nodeId !== nodeId
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.vertexIndices.length !== state.meshEdit.vertexIndices.length
-      || current.meshEdit.vertexIndices.some((index, position) => index !== state.meshEdit.vertexIndices[position])) {
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
       setError("Проект или выделение изменилось. Повторите действие."); return;
     }
     const parsed = delta.map(parseNumber);
@@ -12613,15 +12918,19 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
     if (failure && !failure.ok) { setError(failure.message); return; }
     const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
     if (values.every(value => value === 0)) { setError(""); return; }
+    const vertices = store.selectedMeshVertices();
+    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
     const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId],
-      payload: { nodeId, vertexIndices: [...current.meshEdit.vertexIndices], delta: values } }, current.document.revision);
+      payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision);
     setError(result.ok ? "" : result.message);
   }
-  return <section aria-label="Редактирование вершин"><h4>Редактирование вершин</h4>
-    <p className="panel-hint">{node.name} · Выбрано вершин: {state.meshEdit.vertexIndices.length}</p>
+  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
+  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
+    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
     <p className="panel-hint">Локальные координаты объекта</p>
     <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !state.meshEdit.vertexIndices.length} onClick={apply}>Применить смещение</button>
+    <button type="button" disabled={!!reason || !count} onClick={apply}>Применить смещение</button>
     {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
   </section>;
 }
@@ -13518,6 +13827,7 @@ import { AssetBytes } from "../assets/asset-bytes";
 import type { LoadedProject } from "../assets/native-project-archive";
 import { createJobController, isJobActive, type JobController, type JobState } from "./job-controller";
 import { MAX_VISIBLE_VERTICES, normalizeVertexIndices } from "../geometry/vertex-selection";
+import { buildMeshTopology, MAX_TOPOLOGY_TRIANGLES, selectedTopologyVertices } from "../geometry/mesh-topology";
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
   : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;
@@ -13525,7 +13835,7 @@ export type DeepReadonly<T> = T extends (...args: never[]) => unknown ? T
 export interface EditorState {
   readonly document: { readonly project: DeepReadonly<Project>; readonly revision: number; readonly dirty: boolean };
   readonly selection: { readonly ids: readonly EntityId[]; readonly activeId: EntityId | null };
-  readonly meshEdit: { readonly mode: "object" | "vertex"; readonly nodeId: EntityId | null; readonly vertexIndices: readonly number[] };
+  readonly meshEdit: { readonly mode: "object" | "vertex" | "edge" | "face"; readonly nodeId: EntityId | null; readonly vertexIndices: readonly number[]; readonly edgeIds: readonly string[]; readonly faceIds: readonly number[] };
   readonly tool: { readonly mode: "model" | "scene"; readonly active: "select" | "move" | "rotate" | "scale"; readonly space: "local" | "world" };
   readonly view: { readonly leftTab: "structure" | "assets"; readonly timelineExpanded: boolean };
   readonly job: JobState;
@@ -13555,6 +13865,10 @@ export interface EditorStore {
   enterVertexMode(expectedRevision: number, expectedEpoch: object): string | null;
   exitVertexMode(): void;
   setVertexSelection(indices: readonly number[], expectedRevision: number, expectedEpoch: object): boolean;
+  enterMeshEditMode(mode: "vertex" | "edge" | "face", expectedRevision: number, expectedEpoch: object): string | null;
+  exitMeshEditMode(): void;
+  setSubElementSelection(ids: readonly string[] | readonly number[], expectedRevision: number, expectedEpoch: object): boolean;
+  selectedMeshVertices(): number[] | null;
   setTool(next: Partial<EditorState["tool"]>): void;
   setView(next: Partial<EditorState["view"]>): void;
   getAssetBytes(): AssetBytes;
@@ -13584,7 +13898,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   let state: EditorState = Object.freeze({
     document: Object.freeze({ project: deepFreeze(bus.getSnapshot()), revision: bus.getRevision(), dirty: false }),
     selection: Object.freeze({ ids: Object.freeze([]) as readonly EntityId[], activeId: null }),
-    meshEdit: Object.freeze({ mode: "object" as const, nodeId: null, vertexIndices: Object.freeze([]) as readonly number[] }),
+    meshEdit: Object.freeze({ mode: "object" as const, nodeId: null, vertexIndices: Object.freeze([]) as readonly number[], edgeIds: Object.freeze([]) as readonly string[], faceIds: Object.freeze([]) as readonly number[] }),
     tool: Object.freeze({ mode: "model" as const, active: "select" as const, space: "world" as const }),
     view: Object.freeze({ leftTab: "structure" as const, timelineExpanded: true }),
     job: Object.freeze({ id: null, name: null, status: "idle", progress: null, cancellable: false, error: null }),
@@ -13611,7 +13925,9 @@ export function createEditorStore(initialProject: Project): EditorStore {
     for (const id of assetBytes.ids()) if (!needed.has(id)) assetBytes.delete(id);
   }
 
-  const emptyMeshEdit = (): EditorState["meshEdit"] => Object.freeze({ mode: "object", nodeId: null, vertexIndices: Object.freeze([]) });
+  const emptyMeshEdit = (): EditorState["meshEdit"] => Object.freeze({ mode: "object", nodeId: null, vertexIndices: Object.freeze([]), edgeIds: Object.freeze([]), faceIds: Object.freeze([]) });
+  const subEdit = (mode: "vertex" | "edge" | "face", nodeId: string, vertexIndices: readonly number[] = [], edgeIds: readonly string[] = [], faceIds: readonly number[] = []): EditorState["meshEdit"] =>
+    Object.freeze({ mode, nodeId, vertexIndices: Object.freeze([...vertexIndices]), edgeIds: Object.freeze([...edgeIds]), faceIds: Object.freeze([...faceIds]) });
   function canEditVertex(project: DeepReadonly<Project>, nodeId: string | null): boolean {
     if (!nodeId || state.tool.mode !== "model" || state.selection.ids.length !== 1 || state.selection.activeId !== nodeId || jobActive()) return false;
     let node = project.nodes.find(item => item.id === nodeId);
@@ -13626,7 +13942,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
   }
   function reconcileMeshEdit(project: Project, patch?: ProjectPatch): EditorState["meshEdit"] {
     const old = state.meshEdit;
-    if (old.mode !== "vertex" || !canEditVertex(project, old.nodeId)) return emptyMeshEdit();
+    if (old.mode === "object" || !canEditVertex(project, old.nodeId)) return emptyMeshEdit();
     const node = project.nodes.find(item => item.id === old.nodeId)!;
     if (node.kind !== "mesh" || node.meshSource.kind !== "editable") return emptyMeshEdit();
     const changed = patch?.changes.some(change => change.kind === "setMeshSource" && change.nodeId === old.nodeId);
@@ -13635,9 +13951,18 @@ export function createEditorStore(initialProject: Project): EditorStore {
       if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable"
         || JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
         || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return emptyMeshEdit();
+      // Edge and face IDs describe the old geometric embedding; re-pick after a geometry edit.
+      if (old.mode !== "vertex") return subEdit(old.mode, old.nodeId!);
     }
-    const indices = normalizeVertexIndices(node.meshSource, old.vertexIndices);
-    return indices ? Object.freeze({ mode: "vertex", nodeId: old.nodeId, vertexIndices: Object.freeze(indices) }) : emptyMeshEdit();
+    if (old.mode === "vertex") {
+      const indices = normalizeVertexIndices(node.meshSource, old.vertexIndices);
+      return indices ? subEdit("vertex", old.nodeId!, indices) : emptyMeshEdit();
+    }
+    const topology = buildMeshTopology(node.meshSource);
+    if (!topology) return emptyMeshEdit();
+    const available = new Set<string | number>(old.mode === "edge" ? topology.edges.map(edge => edge.id) : topology.faces.map(face => face.id));
+    const ids = old.mode === "edge" ? old.edgeIds.filter(id => available.has(id)) : old.faceIds.filter(id => available.has(id));
+    return old.mode === "edge" ? subEdit("edge", old.nodeId!, [], ids as string[]) : subEdit("face", old.nodeId!, [], [], ids as number[]);
   }
 
   function commit(result: CommandResult, groupId?: string): CommandResult {
@@ -13804,19 +14129,23 @@ export function createEditorStore(initialProject: Project): EditorStore {
       if (active === state.selection.activeId && selected.length === state.selection.ids.length
         && selected.every((id, index) => id === state.selection.ids[index])) return;
       publish({ ...state, selection: Object.freeze({ ids: Object.freeze(selected), activeId: active }),
-        meshEdit: state.meshEdit.mode === "vertex" && (selected.length !== 1 || active !== state.meshEdit.nodeId) ? emptyMeshEdit() : state.meshEdit });
+        meshEdit: state.meshEdit.mode !== "object" && (selected.length !== 1 || active !== state.meshEdit.nodeId) ? emptyMeshEdit() : state.meshEdit });
     },
-    enterVertexMode(expectedRevision, expectedEpoch) {
+    enterVertexMode(expectedRevision, expectedEpoch) { return this.enterMeshEditMode("vertex", expectedRevision, expectedEpoch); },
+    enterMeshEditMode(mode, expectedRevision, expectedEpoch) {
       if (expectedRevision !== state.document.revision || expectedEpoch !== projectEpoch) return "Проект изменился. Повторите действие.";
       const id = state.selection.activeId;
       const node = state.document.project.nodes.find(item => item.id === id);
       if (node?.kind === "mesh" && node.meshSource.kind === "editable" && node.meshSource.positions.length / 3 > MAX_VISIBLE_VERTICES)
         return `Сетка содержит более ${MAX_VISIBLE_VERTICES} render vertices; отображение маркеров недоступно.`;
       if (!canEditVertex(state.document.project, id)) return "Выберите один видимый и разблокированный Editable Mesh в режиме «Модель».";
-      publish({ ...state, meshEdit: Object.freeze({ mode: "vertex", nodeId: id, vertexIndices: Object.freeze([]) }) });
+      if (mode !== "vertex" && node?.kind === "mesh" && node.meshSource.kind === "editable" && !buildMeshTopology(node.meshSource))
+        return `Не удалось построить топологию сетки. Предел: ${MAX_TOPOLOGY_TRIANGLES} треугольников.`;
+      publish({ ...state, meshEdit: subEdit(mode, id!) });
       return null;
     },
-    exitVertexMode() { if (state.meshEdit.mode === "vertex") publish({ ...state, meshEdit: emptyMeshEdit() }); },
+    exitVertexMode() { this.exitMeshEditMode(); },
+    exitMeshEditMode() { if (state.meshEdit.mode !== "object") publish({ ...state, meshEdit: emptyMeshEdit() }); },
     setVertexSelection(indices, expectedRevision, expectedEpoch) {
       if (expectedRevision !== state.document.revision || expectedEpoch !== projectEpoch || !canEditVertex(state.document.project, state.meshEdit.nodeId)) return false;
       const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
@@ -13824,8 +14153,33 @@ export function createEditorStore(initialProject: Project): EditorStore {
       const normalized = normalizeVertexIndices(node.meshSource, indices);
       if (!normalized) return false;
       if (normalized.length === state.meshEdit.vertexIndices.length && normalized.every((id, i) => id === state.meshEdit.vertexIndices[i])) return true;
-      publish({ ...state, meshEdit: Object.freeze({ mode: "vertex", nodeId: node.id, vertexIndices: Object.freeze(normalized) }) });
+      publish({ ...state, meshEdit: subEdit("vertex", node.id, normalized) });
       return true;
+    },
+    setSubElementSelection(ids, expectedRevision, expectedEpoch) {
+      if (expectedRevision !== state.document.revision || expectedEpoch !== projectEpoch || !canEditVertex(state.document.project, state.meshEdit.nodeId)) return false;
+      const mode = state.meshEdit.mode;
+      const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+      if ((mode !== "edge" && mode !== "face") || node?.kind !== "mesh" || node.meshSource.kind !== "editable") return false;
+      const topology = buildMeshTopology(node.meshSource);
+      if (!topology || !selectedTopologyVertices(topology, mode, ids)) return false;
+      if (mode === "edge") {
+        const normalized = [...new Set(ids as readonly string[])].sort();
+        publish({ ...state, meshEdit: subEdit(mode, node.id, [], normalized) });
+      } else {
+        const normalized = [...new Set(ids as readonly number[])].sort((a, b) => a - b);
+        publish({ ...state, meshEdit: subEdit(mode, node.id, [], [], normalized) });
+      }
+      return true;
+    },
+    selectedMeshVertices() {
+      const selection = state.meshEdit;
+      const node = state.document.project.nodes.find(item => item.id === selection.nodeId);
+      if (!canEditVertex(state.document.project, selection.nodeId) || node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
+      if (selection.mode === "vertex") return [...selection.vertexIndices];
+      if (selection.mode === "object") return null;
+      const topology = buildMeshTopology(node.meshSource);
+      return topology ? selectedTopologyVertices(topology, selection.mode, selection.mode === "edge" ? selection.edgeIds : selection.faceIds) : null;
     },
     setTool(next) {
       if (jobActive()) return;
@@ -15105,6 +15459,13 @@ function EditorShell() {
 - Manifold 3.5.4 выполняет subtract/union/intersect в Worker. Индексы, конечность чисел, площади треугольников и состояние Manifold проверяются; плохой вход и ответ Worker отвергаются типизированными ошибками. Отрицательный determinant относительного преобразования исправляет winding копии cutter. Повторное конкурентное задание получает `JOB_BUSY`; отмена уничтожает Worker и допускает новый запуск. Буферы входов копируются до transfer. Лимит 64 MiB на совокупные входные буферы и 5-минутный watchdog защитные, не измеренный бюджет производительности.
 - `faceOrigins` использует документированные Manifold `runOriginalID`/`runFlags`: 0 — target, 1 — cutter, 2 — новая поверхность вычитания. UV, авторские normals и группы/слоты материалов на выход не переносятся; предупреждения описывают потерю. `toThree()` пересчитывает normals только для просмотра. Peak WASM/браузерная память, сложные импортированные solids и другие браузеры не профилированы. ADR-003 остаётся PROPOSED; пользовательские Boolean-инструменты относятся к следующим задачам.
 - Целевые Vitest (15), полный набор (153), typecheck, lint и build проходят. Во встроенном браузере dev-маршрут выполнил subtract в Worker (`NoError`), отменил высокодетальный job (`JOB_CANCELLED`) и завершил повторный запуск (`NoError`).
+
+## CODEX-024C — Выбор и численное перемещение рёбер и граней (часть TASK-024)
+
+- Режимы «Рёбра» и «Грани» используют тот же runtime `meshEdit`, SurfaceQuery и команду переноса вершин. Геометрические рёбра дедуплицируются по UV seams; грань является связной почти копланарной областью треугольников. Shift добавляет, Ctrl переключает выбор.
+- Выделение отображается временным overlay, следует трансформациям узла и освобождается при смене режима/геометрии/renderer. После геометрического изменения выбор рёбер и граней очищается, чтобы идентификаторы не относились к прежней сетке. Проект и архив не содержат runtime selection.
+- Численное локальное смещение проходит через `TRANSLATE_EDITABLE_VERTICES`, валидацию и Undo/Redo. Extrude и масштабирование элементов остаются незавершёнными; TASK-024 остаётся PARTIAL.
+- Проверки: typecheck, lint, целевые Vitest и build прошли. Ручной browser smoke для CODEX-024C не выполнен (UNVERIFIED).
 </file>
 
 </files>

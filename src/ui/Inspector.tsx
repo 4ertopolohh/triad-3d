@@ -171,38 +171,48 @@ function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; 
 
 function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
   const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
-  const [error, setError] = useState("");
+  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
+  const [moveError, setMoveError] = useState("");
+  const [scaleError, setScaleError] = useState("");
   const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
   const epoch = store.getProjectEpoch();
   if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
   const nodeId = node.id;
   const reason = meshRestriction(state, node, blocked);
-  function apply() {
+  function apply(kind: "move" | "scale") {
+    const setError = kind === "move" ? setMoveError : setScaleError;
     const current = store.getSnapshot();
     const active = current.document.project.nodes.find(item => item.id === nodeId);
     if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
       || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
       setError("Проект или выделение изменилось. Повторите действие."); return;
     }
-    const parsed = delta.map(parseNumber);
+    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
     const failure = parsed.find(item => !item.ok);
     if (failure && !failure.ok) { setError(failure.message); return; }
     const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
-    if (values.every(value => value === 0)) { setError(""); return; }
+    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
+    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
     const vertices = store.selectedMeshVertices();
     if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId],
-      payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision);
+    const result = kind === "move"
+      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
+      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
     setError(result.ok ? "" : result.message);
   }
   const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
   const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
   return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
     <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
     <p className="panel-hint">Локальные координаты объекта</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count} onClick={apply}>Применить смещение</button>
-    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
+    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
+    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
+    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
   </section>;
 }
 

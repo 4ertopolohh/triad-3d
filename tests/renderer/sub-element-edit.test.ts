@@ -16,6 +16,30 @@ function setup() {
 }
 
 describe("edge and face editing", () => {
+  it.each(["vertex", "edge", "face"] as const)("scales selected %s vertices and reconciles selection", mode => {
+    const { store, source, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode(mode, 1, epoch)).toBeNull();
+    if (mode === "vertex") expect(store.setVertexSelection(topology.edges[0]!.vertices, 1, epoch)).toBe(true);
+    else expect(store.setSubElementSelection(mode === "edge" ? [topology.edges[0]!.id] : [topology.faces[0]!.id], 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    const result = store.executeCommand({ commandId: "scale", type: "SCALE_EDITABLE_VERTICES", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", vertexIndices: vertices, factors: [1.25, 1.25, 1.25] } }, 1);
+    expect(result.ok && result.changed).toBe(true);
+    const after = store.getSnapshot();
+    const mesh = after.document.project.nodes.find(item => item.id === "mesh-node");
+    if (mesh?.kind !== "mesh" || mesh.meshSource.kind !== "editable") throw new Error("fixture");
+    expect(mesh.meshSource.positions).not.toEqual(source.positions);
+    expect(mesh.meshSource.indices).toEqual(source.indices);
+    expect(mesh.meshSource.uv).toEqual(source.uv);
+    expect(after.meshEdit.mode).toBe(mode);
+    expect(mode === "vertex" ? after.meshEdit.vertexIndices.length : mode === "edge" ? after.meshEdit.edgeIds.length : after.meshEdit.faceIds.length)
+      .toBe(mode === "vertex" ? vertices.length : 0);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: mesh.meshSource });
+  });
+
   it.each(["edge", "face"] as const)("translates a selected %s through one command with undo and redo", mode => {
     const { store, source, topology } = setup();
     const epoch = store.getProjectEpoch();
@@ -71,7 +95,7 @@ describe("edge and face editing", () => {
     expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
     const vertices = store.selectedMeshVertices()!;
     const before = store.getSnapshot();
-    const command = (id: string, delta: [number, number, number]) => ({ commandId: id, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta } });
+    const command = (id: string, delta: [number, number, number]) => ({ commandId: id, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["mesh-node"] as [string], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta } });
     const zero = store.executeCommand(command("zero", [0, 0, 0]), 1);
     expect(zero.ok && !zero.changed).toBe(true);
     expect(store.executeCommand(command("bad", [NaN, 0, 0]), 1).ok).toBe(false);
