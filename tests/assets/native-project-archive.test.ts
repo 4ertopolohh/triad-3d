@@ -13,6 +13,24 @@ async function zip(entries: readonly [string, string][]): Promise<Blob> {
 }
 
 describe("native project archive", () => {
+  it("round-trips mixed deformation order, parameters and disabled state", async () => {
+    const project = createProject();
+    const root = project.nodes[0]!;
+    const node = createPrimitiveNode("cube", root.id, "deform-target");
+    root.children.push(node.id); project.nodes.push(node);
+    node.modifierIds.push("bend-1", "array-1", "twist-1", "taper-1");
+    project.modifiers.push(
+      { id: "bend-1", nodeId: node.id, kind: "bend", order: 0, enabled: true, version: 2, parameters: { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } },
+      { id: "array-1", nodeId: node.id, kind: "array", order: 1, enabled: true, version: 0, parameters: { mode: "linear", count: 2, axis: "x", step: 1, offset: [0, 0, 0] } },
+      { id: "twist-1", nodeId: node.id, kind: "twist", order: 2, enabled: false, version: 1, parameters: { axis: "z", angleDegrees: 45, pivot: [0, 1, 0] } },
+      { id: "taper-1", nodeId: node.id, kind: "taper", order: 3, enabled: true, version: 3, parameters: { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } },
+    );
+    const saved = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    const opened = await openNativeProjectArchive(saved.value);
+    expect(opened.ok && opened.value.project).toEqual(project);
+  });
   it("round-trips Array parameters, order, enabled state and version", async () => {
     const project = createProject();
     const root = project.nodes[0]!;

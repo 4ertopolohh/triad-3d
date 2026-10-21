@@ -106,6 +106,7 @@ src/
       types.ts
     modifiers/
       array.ts
+      deform.ts
       evaluator.ts
       index.ts
       mirror.ts
@@ -184,6 +185,7 @@ tests/
     projects.ts
   geometry/
     array.test.ts
+    deform.test.ts
     mesh-edit.test.ts
     mesh-extrude-integration.test.ts
     mesh-extrude.test.ts
@@ -5113,6 +5115,124 @@ export async function evaluateArray(mesh: MeshData, params: ArrayParameters, sig
 }
 </file>
 
+<file path="src/geometry/modifiers/deform.ts">
+import type { MeshData } from "../csg";
+import { MAX_CSG_INPUT_BYTES } from "../csg/core";
+import type { BendParameters, DeformAxis, TaperParameters, TwistParameters } from "./types";
+
+export class DeformError extends Error {
+  constructor(readonly code: "INVALID_MODIFIER" | "RESOURCE_TOO_LARGE" | "JOB_CANCELLED" | "GEOMETRY_DEGENERATE" | "FILE_INVALID", message: string) { super(message); }
+}
+const axes: Record<DeformAxis, number> = { x: 0, y: 1, z: 2 };
+const isAxis = (v: unknown): v is DeformAxis => v === "x" || v === "y" || v === "z";
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+const vector = (v: unknown): v is [number, number, number] => Array.isArray(v) && v.length === 3 && v.every(finite) && v.every(n => Number.isFinite(Math.fround(n)));
+function record(value: unknown, keys: string[]): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== keys.length || Object.keys(value).some(k => !keys.includes(k)))
+    throw new DeformError("INVALID_MODIFIER", `Ожидаются только параметры: ${keys.join(", ")}.`);
+  return value as Record<string, unknown>;
+}
+function angle(value: unknown): value is number {
+  // Ten full turns bound repeated folding and loss of angular precision.
+  return finite(value) && Math.abs(value) <= 3600;
+}
+export function parseBendParameters(value: unknown): BendParameters {
+  const p = record(value, ["axis", "direction", "angleDegrees", "pivot"]);
+  if (!isAxis(p.axis) || !isAxis(p.direction) || p.axis === p.direction || !angle(p.angleDegrees) || !vector(p.pivot))
+    throw new DeformError("INVALID_MODIFIER", "Bend требует разные оси, угол не более 10 оборотов и конечный pivot.");
+  return { axis: p.axis, direction: p.direction, angleDegrees: p.angleDegrees, pivot: p.pivot };
+}
+export function parseTwistParameters(value: unknown): TwistParameters {
+  const p = record(value, ["axis", "angleDegrees", "pivot"]);
+  if (!isAxis(p.axis) || !angle(p.angleDegrees) || !vector(p.pivot))
+    throw new DeformError("INVALID_MODIFIER", "Twist требует ось, угол не более 10 оборотов и конечный pivot.");
+  return { axis: p.axis, angleDegrees: p.angleDegrees, pivot: p.pivot };
+}
+export function parseTaperParameters(value: unknown): TaperParameters {
+  const p = record(value, ["axis", "startScale", "endScale", "pivot"]);
+  // The range limits near-collapse and excessive amplification before Float32 rounding.
+  if (!isAxis(p.axis) || !finite(p.startScale) || !finite(p.endScale) || p.startScale < 1e-6 || p.endScale < 1e-6 || p.startScale > 1e6 || p.endScale > 1e6 || !vector(p.pivot))
+    throw new DeformError("INVALID_MODIFIER", "Taper требует положительные масштабы от 1e-6 до 1e6, ось и конечный pivot.");
+  return { axis: p.axis, startScale: p.startScale, endScale: p.endScale, pivot: p.pivot };
+}
+const yieldTurn = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+function areaSquared(positions: Float32Array, a: number, b: number, c: number): number {
+  const ax = positions[b * 3]! - positions[a * 3]!, ay = positions[b * 3 + 1]! - positions[a * 3 + 1]!, az = positions[b * 3 + 2]! - positions[a * 3 + 2]!;
+  const bx = positions[c * 3]! - positions[a * 3]!, by = positions[c * 3 + 1]! - positions[a * 3 + 1]!, bz = positions[c * 3 + 2]! - positions[a * 3 + 2]!;
+  const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+  return cx * cx + cy * cy + cz * cz;
+}
+function check(signal?: AbortSignal): void { if (signal?.aborted) throw new DeformError("JOB_CANCELLED", "Деформация отменена."); }
+function bounded(mesh: MeshData): void {
+  if (!(mesh.positions instanceof Float32Array) || !(mesh.indices instanceof Uint32Array) || mesh.positions.length % 3 || mesh.indices.length % 3)
+    throw new DeformError("FILE_INVALID", "Некорректные буферы сетки.");
+  if (mesh.positions.byteLength + mesh.indices.byteLength > MAX_CSG_INPUT_BYTES) throw new DeformError("RESOURCE_TOO_LARGE", "Сетка превышает лимит 64 MiB.");
+}
+function sinc(x: number): number { return Math.abs(x) < 1e-4 ? 1 - x * x / 6 + x ** 4 / 120 : Math.sin(x) / x; }
+function cosc(x: number): number { return Math.abs(x) < 1e-4 ? x / 2 - x ** 3 / 24 + x ** 5 / 720 : (1 - Math.cos(x)) / x; }
+
+/** Local-space deformation with detached buffers and cooperative, chunked validation. */
+export async function evaluateDeform(mesh: MeshData, kind: "bend", params: BendParameters, signal?: AbortSignal): Promise<MeshData>;
+export async function evaluateDeform(mesh: MeshData, kind: "twist", params: TwistParameters, signal?: AbortSignal): Promise<MeshData>;
+export async function evaluateDeform(mesh: MeshData, kind: "taper", params: TaperParameters, signal?: AbortSignal): Promise<MeshData>;
+export async function evaluateDeform(mesh: MeshData, kind: "bend" | "twist" | "taper", params: BendParameters | TwistParameters | TaperParameters, signal?: AbortSignal): Promise<MeshData> {
+  check(signal); bounded(mesh);
+  const source = mesh.positions, axis = axes[params.axis], vertexCount = source.length / 3;
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < source.length; i += 3) {
+    if (i && i % 300000 === 0) { await yieldTurn(); check(signal); }
+    const x = source[i + axis]!;
+    if (!Number.isFinite(x)) throw new DeformError("FILE_INVALID", "Вход содержит нечисловую координату.");
+    min = Math.min(min, x); max = Math.max(max, x);
+  }
+  const span = max - min;
+  const identity = kind === "taper" ? (params as TaperParameters).startScale === 1 && (params as TaperParameters).endScale === 1 : (params as BendParameters | TwistParameters).angleDegrees === 0;
+  if (!identity && !(span > Math.max(1e-7, Math.max(Math.abs(min), Math.abs(max)) * 1e-7)))
+    throw new DeformError("GEOMETRY_DEGENERATE", "Диапазон вдоль оси деформации численно неразличим.");
+  const output = new Float32Array(source.length);
+  const a = (axis + 1) % 3, b = (axis + 2) % 3;
+  for (let i = 0; i < source.length; i += 3) {
+    if (i && i % 300000 === 0) { await yieldTurn(); check(signal); }
+    const x = source[i]!, y = source[i + 1]!, z = source[i + 2]!;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) throw new DeformError("FILE_INVALID", "Вход содержит нечисловую координату.");
+    const p = [x, y, z];
+    if (!identity) {
+      const t = (p[axis]! - min) / span;
+      if (kind === "bend") {
+        const bend = params as BendParameters, d = axes[bend.direction], theta = bend.angleDegrees * Math.PI / 180 * t;
+        const longitudinal = p[axis]! - min, transverse = p[d]! - bend.pivot[d]!;
+        p[axis] = min + longitudinal * sinc(theta) - transverse * Math.sin(theta);
+        p[d] = bend.pivot[d]! + longitudinal * cosc(theta) + transverse * Math.cos(theta);
+      } else if (kind === "twist") {
+        const theta = (params as TwistParameters).angleDegrees * Math.PI / 180 * t;
+        const u = p[a]! - params.pivot[a]!, v = p[b]! - params.pivot[b]!;
+        p[a] = params.pivot[a]! + u * Math.cos(theta) - v * Math.sin(theta);
+        p[b] = params.pivot[b]! + u * Math.sin(theta) + v * Math.cos(theta);
+      } else {
+        const taper = params as TaperParameters, scale = taper.startScale + (taper.endScale - taper.startScale) * t;
+        p[a] = params.pivot[a]! + (p[a]! - params.pivot[a]!) * scale;
+        p[b] = params.pivot[b]! + (p[b]! - params.pivot[b]!) * scale;
+      }
+    }
+    for (let component = 0; component < 3; component++) {
+      const rounded = Math.fround(p[component]!);
+      if (!Number.isFinite(rounded)) throw new DeformError("INVALID_MODIFIER", "Результат деформации переполнен в Float32.");
+      output[i + component] = rounded;
+    }
+  }
+  const indices = mesh.indices.slice();
+  for (let i = 0; i < indices.length; i += 3) {
+    if (i && i % 300000 === 0) { await yieldTurn(); check(signal); }
+    const ia = indices[i]!, ib = indices[i + 1]!, ic = indices[i + 2]!;
+    if (ia >= vertexCount || ib >= vertexCount || ic >= vertexCount) throw new DeformError("FILE_INVALID", "Индекс вне диапазона.");
+    if (areaSquared(source, ia, ib, ic) < 1e-20) throw new DeformError("GEOMETRY_DEGENERATE", `Вырожденный входной треугольник ${i / 3}.`);
+    if (areaSquared(output, ia, ib, ic) < 1e-20) throw new DeformError("GEOMETRY_DEGENERATE", `Вырожденный треугольник ${i / 3}.`);
+  }
+  check(signal);
+  return { positions: output, indices };
+}
+</file>
+
 <file path="src/geometry/modifiers/mirror.ts">
 import { CsgError, validateMesh, type CsgRequest, type CsgResult, type MeshData } from "../csg";
 import { MAX_CSG_INPUT_BYTES } from "../csg/core";
@@ -7881,6 +8001,89 @@ describe("regular arrays", () => {
 });
 </file>
 
+<file path="tests/geometry/deform.test.ts">
+import { describe, expect, it } from "vitest";
+import { evaluateDeform, parseBendParameters, parseTaperParameters, parseTwistParameters } from "../../src/geometry/modifiers";
+import { toThree, type MeshData } from "../../src/geometry/csg";
+
+const triangle = (): MeshData => ({ positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 1]), indices: new Uint32Array([0, 1, 2]) });
+const bend = { axis: "x" as const, direction: "y" as const, angleDegrees: 90, pivot: [0, 0, 0] as const };
+const twist = { axis: "z" as const, angleDegrees: 90, pivot: [0, 0, 0] as const };
+const taper = { axis: "z" as const, startScale: 1, endScale: 2, pivot: [0, 0, 0] as const };
+
+describe("deform", () => {
+  it("strictly parses all parameter kinds", () => {
+    expect(parseBendParameters(bend)).toEqual(bend);
+    expect(parseTwistParameters(twist)).toEqual(twist);
+    expect(parseTaperParameters(taper)).toEqual(taper);
+    for (const invalid of [{ ...bend, direction: "x" }, { ...bend, extra: 1 }, { ...twist, angleDegrees: Infinity }, { ...taper, endScale: 0 }, { ...taper, pivot: [0, 0, NaN] }, { ...taper, startScale: 1e7 }]) {
+      const parse = "direction" in invalid ? parseBendParameters : "angleDegrees" in invalid ? parseTwistParameters : parseTaperParameters;
+      expect(() => parse(invalid)).toThrow();
+    }
+  });
+  it("bends continuously from the anchored start and reverses with angle", async () => {
+    const mesh = triangle(), before = mesh.positions.slice();
+    const positive = await evaluateDeform(mesh, "bend", bend);
+    const negative = await evaluateDeform(mesh, "bend", { ...bend, angleDegrees: -90 });
+    expect(positive.positions[0]).toBe(0);
+    expect(positive.positions[1]).toBe(0);
+    expect(positive.positions[3]).toBeCloseTo(2 / Math.PI, 5);
+    expect(positive.positions[4]).toBeCloseTo(2 / Math.PI, 5);
+    expect(negative.positions[4]).toBeCloseTo(-2 / Math.PI, 5);
+    expect(mesh.positions).toEqual(before);
+    expect(positive.indices).toEqual(mesh.indices);
+    expect(positive.indices).not.toBe(mesh.indices);
+    expect((await evaluateDeform(mesh, "bend", bend)).positions).toEqual(positive.positions);
+    expect((await evaluateDeform(mesh, "bend", { ...bend, angleDegrees: 0 })).positions).toEqual(mesh.positions);
+  });
+  it("twists around z and x with unchanged longitudinal coordinates", async () => {
+    const mesh = triangle();
+    const z = await evaluateDeform(mesh, "twist", twist);
+    expect(z.positions[6]).toBeCloseTo(-1, 5);
+    expect(z.positions[7]).toBeCloseTo(0, 5);
+    expect(z.positions[8]).toBe(1);
+    const alongX: MeshData = { positions: new Float32Array([0, 0, 0, 1, 1, 0, 1, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    const x = await evaluateDeform(alongX, "twist", { axis: "x", angleDegrees: 90, pivot: [0, 0, 0] });
+    expect(x.positions[3]).toBe(1);
+    expect(x.positions[4]).toBeCloseTo(0, 5);
+    expect(x.positions[5]).toBeCloseTo(1, 5);
+    const reverse = await evaluateDeform(alongX, "twist", { axis: "x", angleDegrees: -90, pivot: [0, 0, 0] });
+    expect(reverse.positions[5]).toBeCloseTo(-1, 5);
+    expect((await evaluateDeform(mesh, "twist", { ...twist, angleDegrees: 0 })).positions).toEqual(mesh.positions);
+  });
+  it("tapers transverse dimensions and keeps normals finite", async () => {
+    const mesh = triangle();
+    const result = await evaluateDeform(mesh, "taper", taper);
+    expect(result.positions[7]).toBe(2);
+    expect(result.positions[8]).toBe(1);
+    expect((await evaluateDeform(mesh, "taper", { ...taper, startScale: 1, endScale: 1 })).positions).toEqual(mesh.positions);
+    const geometry = toThree(result);
+    expect(Array.from(geometry.getAttribute("normal").array).every(Number.isFinite)).toBe(true);
+    geometry.dispose();
+  });
+  it("rejects degenerate output, zero span, bad indices and Float32 overflow", async () => {
+    const top: MeshData = { positions: new Float32Array([0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 1]), indices: new Uint32Array([1, 2, 3]) };
+    await expect(evaluateDeform(top, "taper", { ...taper, endScale: 1e-6 })).rejects.toMatchObject({ code: "GEOMETRY_DEGENERATE" });
+    await expect(evaluateDeform(triangle(), "twist", { axis: "y", angleDegrees: 90, pivot: [0, 0, 0] })).resolves.toBeDefined();
+    const flat: MeshData = { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 0, 1]), indices: new Uint32Array([0, 1, 2]) };
+    await expect(evaluateDeform(flat, "twist", { axis: "y", angleDegrees: 90, pivot: [0, 0, 0] })).rejects.toMatchObject({ code: "GEOMETRY_DEGENERATE" });
+    await expect(evaluateDeform({ ...triangle(), indices: new Uint32Array([0, 1, 9]) }, "twist", twist)).rejects.toMatchObject({ code: "FILE_INVALID" });
+    const huge: MeshData = { positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1e33, 1]), indices: new Uint32Array([0, 1, 2]) };
+    await expect(evaluateDeform(huge, "taper", { ...taper, endScale: 1e6 })).rejects.toMatchObject({ code: "INVALID_MODIFIER" });
+  });
+  it("yields during large work and cancels without a result", async () => {
+    const source = triangle();
+    const positions = new Float32Array(300006);
+    positions.set(source.positions);
+    for (let i = 9; i < positions.length; i += 3) { positions[i] = i / 3; positions[i + 1] = 1; positions[i + 2] = 1; }
+    const controller = new AbortController();
+    const pending = evaluateDeform({ positions, indices: source.indices }, "bend", bend, controller.signal);
+    setTimeout(() => controller.abort(), 0);
+    await expect(pending).rejects.toMatchObject({ code: "JOB_CANCELLED" });
+  });
+});
+</file>
+
 <file path="tests/geometry/mesh-extrude-integration.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -10257,98 +10460,6 @@ export class ThreeRendererAdapter implements RendererAdapter {
 }
 </file>
 
-<file path="src/renderer/modifier-preview.ts">
-import type { EditorStore } from "../app/editor-store";
-import type { Project } from "../domain/types";
-import { ModifierEvaluator } from "../geometry/modifiers";
-import type { EvaluationResult } from "../geometry/modifiers/types";
-import type { SceneSync } from "./scene-sync";
-
-/** Serializes renderer-owned evaluations. A cancelled job may settle before its Worker does. */
-export class ModifierPreview {
-  private readonly evaluator: ModifierEvaluator;
-  private generation = -1;
-  private epoch: object | undefined;
-  private token = 0;
-  private active = false;
-  private closed = false;
-  private pending: Promise<void> = Promise.resolve();
-  constructor(private store: EditorStore, private scene: SceneSync, evaluator?: ModifierEvaluator) {
-    this.evaluator = evaluator ?? new ModifierEvaluator();
-  }
-  sync(): void {
-    if (this.closed) return;
-    const state = this.store.getSnapshot();
-    const epoch = this.store.getProjectEpoch();
-    if (this.generation === state.derived.generation && this.epoch === epoch) return;
-    this.generation = state.derived.generation; this.epoch = epoch;
-    const token = ++this.token;
-    if (this.active) this.store.jobs.cancelJob();
-    const project = state.document.project;
-    this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
-    const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
-    const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));
-    this.pending = this.pending.then(async () => {
-      for (const node of nodes) {
-        if (!this.current(token, epoch)) return;
-        if (node.kind !== "mesh") continue;
-        if (node.meshSource.kind === "asset") {
-          this.scene.setModifierDiagnostics(node.id, ["Модификаторы для GLB пока недоступны; показана исходная геометрия."]);
-          continue;
-        }
-        try { await this.evaluate(project as Project, node.id, token, epoch); }
-        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра модификатора."]); }
-      }
-    });
-  }
-  private current(token: number, epoch: object): boolean {
-    return !this.closed && token === this.token && epoch === this.store.getProjectEpoch()
-      && this.generation === this.store.getSnapshot().derived.generation;
-  }
-  private async evaluate(project: Project, nodeId: string, token: number, epoch: object): Promise<void> {
-    let result: EvaluationResult | undefined;
-    let computation: Promise<EvaluationResult> | undefined;
-    this.active = true;
-    try {
-    const outcome = await this.store.jobs.run({
-      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление модификаторов", cancellable: true,
-      validate: () => null,
-      compute: async (_input, signal) => {
-        computation = this.evaluator.evaluate(project, nodeId, signal);
-        result = await computation;
-        return result.ok ? { ok: true as const, value: result } : {
-          ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` },
-        };
-      },
-    });
-    // JobController releases the UI immediately on Cancel; wait for the evaluator to
-    // release its single active slot before scheduling another node or generation.
-    if (computation) await computation;
-    if (!this.current(token, epoch)) return;
-    if (outcome.ok && result?.ok) {
-      const messages = result.warnings.map(warning => warning.message);
-      if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
-      if ((project.nodes.find(node => node.id === nodeId)?.materialSlots.length ?? 0) > 1)
-        messages.push("Назначения нескольких материалов после Boolean не сохраняются.");
-      this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
-    } else if (!outcome.ok) {
-      const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;
-      if (result && !result.ok && result.fallback && result.mesh) {
-        this.scene.setDerived(nodeId, result.mesh, !!result.empty, [`Fallback последнего валидного этапа: ${description}`]);
-      } else this.scene.setModifierDiagnostics(nodeId, [`${description}; показана исходная геометрия.`]);
-      if (outcome.status === "cancelled") this.token++;
-    }
-    } finally { this.active = false; }
-  }
-  dispose(): void {
-    if (this.closed) return;
-    this.closed = true; this.token++;
-    if (this.active) this.store.jobs.cancelJob();
-    this.evaluator.dispose();
-  }
-}
-</file>
-
 <file path="src/spikes/csg/client.ts">
 import { CsgService } from "../../geometry/csg";
 import type { MeshData, Operation } from "./core";
@@ -11741,32 +11852,6 @@ export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
 </file>
 
-<file path="src/geometry/modifiers/index.ts">
-export { ModifierEvaluator } from "./evaluator";
-export { evaluateMirror, parseMirrorParameters } from "./mirror";
-export type { ArrayParameters, BooleanParameters, MirrorParameters, EvaluationResult, ModifierDiagnostic, ModifierErrorCode, ModifierWarning, AssetGeometryResolver } from "./types";
-</file>
-
-<file path="src/geometry/modifiers/types.ts">
-import type { Project, MeshNode } from "../../domain/types";
-import type { CsgErrorCode, CsgOperation, CsgWarning, MeshData } from "../csg";
-
-export type BooleanParameters = { operation: CsgOperation; cutterNodeId: string };
-export type MirrorParameters = { axes: "x" | "y" | "z" | "xy" | "xz" | "yz" | "xyz"; pivot: readonly [number, number, number]; mergeSeam: boolean };
-export type ArrayParameters =
-  | { mode: "linear"; count: number; axis: "x" | "y" | "z"; step: number; offset: readonly [number, number, number] }
-  | { mode: "radial"; count: number; axis: "x" | "y" | "z"; angleStepDegrees: number; pivot: readonly [number, number, number]; offset: readonly [number, number, number] };
-export type ModifierErrorCode = CsgErrorCode | "INVALID_REFERENCE" | "DEPENDENCY_CYCLE" | "INVALID_MODIFIER" | "UNSUPPORTED_MODIFIER" | "ASSET_DECODE_FAILED" | "STALE_PROJECT";
-export type ModifierDiagnostic = { code: ModifierErrorCode; message: string; nodeId?: string; modifierId?: string };
-export type ModifierWarning = CsgWarning | { code: "MIRROR_UNMERGED"; message: string };
-export type GeometryAttributes = { uv?: boolean; normals?: boolean; materialGroups?: boolean; materialSlots?: number };
-/** Resolver returns detached local-space buffers and a content fingerprint (normally Asset.hash). No network access. */
-export type AssetGeometryResolver = (node: Readonly<MeshNode>, project: Readonly<Project>, signal?: AbortSignal) => Promise<{ mesh: MeshData; fingerprint: string; attributes?: GeometryAttributes }>;
-export type EvaluationResult =
-  | { ok: true; mesh: MeshData; empty: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: false }
-  | { ok: false; error: ModifierDiagnostic; mesh?: MeshData; empty?: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: boolean };
-</file>
-
 <file path="src/geometry/mesh-edit.ts">
 import * as T from "three";
 import type { MeshSource, Vec3 } from "../domain/types";
@@ -12059,6 +12144,96 @@ export function extrudeEditableFace(source: EditableMeshSource, faceId: number, 
 }
 </file>
 
+<file path="src/renderer/modifier-preview.ts">
+import type { EditorStore } from "../app/editor-store";
+import type { Project } from "../domain/types";
+import { ModifierEvaluator } from "../geometry/modifiers";
+import type { EvaluationResult } from "../geometry/modifiers/types";
+import type { SceneSync } from "./scene-sync";
+
+/** Serializes renderer-owned evaluations. A cancelled job may settle before its Worker does. */
+export class ModifierPreview {
+  private readonly evaluator: ModifierEvaluator;
+  private generation = -1;
+  private epoch: object | undefined;
+  private token = 0;
+  private active = false;
+  private closed = false;
+  private pending: Promise<void> = Promise.resolve();
+  constructor(private store: EditorStore, private scene: SceneSync, evaluator?: ModifierEvaluator) {
+    this.evaluator = evaluator ?? new ModifierEvaluator();
+  }
+  sync(): void {
+    if (this.closed) return;
+    const state = this.store.getSnapshot();
+    const epoch = this.store.getProjectEpoch();
+    if (this.generation === state.derived.generation && this.epoch === epoch) return;
+    this.generation = state.derived.generation; this.epoch = epoch;
+    const token = ++this.token;
+    if (this.active) this.store.jobs.cancelJob();
+    const project = state.document.project;
+    this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
+    const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
+    const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));
+    this.pending = this.pending.then(async () => {
+      for (const node of nodes) {
+        if (!this.current(token, epoch)) return;
+        if (node.kind !== "mesh") continue;
+        if (node.meshSource.kind === "asset") {
+          this.scene.setModifierDiagnostics(node.id, ["Модификаторы для GLB пока недоступны; показана исходная геометрия."]);
+          continue;
+        }
+        try { await this.evaluate(project as Project, node.id, token, epoch); }
+        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра модификатора."]); }
+      }
+    });
+  }
+  private current(token: number, epoch: object): boolean {
+    return !this.closed && token === this.token && epoch === this.store.getProjectEpoch()
+      && this.generation === this.store.getSnapshot().derived.generation;
+  }
+  private async evaluate(project: Project, nodeId: string, token: number, epoch: object): Promise<void> {
+    let result: EvaluationResult | undefined;
+    let computation: Promise<EvaluationResult> | undefined;
+    this.active = true;
+    try {
+    const outcome = await this.store.jobs.run({
+      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление модификаторов", cancellable: true,
+      validate: () => null,
+      compute: async (_input, signal) => {
+        computation = this.evaluator.evaluate(project, nodeId, signal);
+        result = await computation;
+        return result.ok ? { ok: true as const, value: result } : {
+          ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` },
+        };
+      },
+    });
+    // JobController releases the UI immediately on Cancel; wait for the evaluator to
+    // release its single active slot before scheduling another node or generation.
+    if (computation) await computation;
+    if (!this.current(token, epoch)) return;
+    if (outcome.ok && result?.ok) {
+      const messages = result.warnings.map(warning => warning.message);
+      if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
+      this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
+    } else if (!outcome.ok) {
+      const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;
+      if (result && !result.ok && result.fallback && result.mesh) {
+        this.scene.setDerived(nodeId, result.mesh, !!result.empty, [`Fallback последнего валидного этапа: ${description}`]);
+      } else this.scene.setModifierDiagnostics(nodeId, [`${description}; показана исходная геометрия.`]);
+      if (outcome.status === "cancelled") this.token++;
+    }
+    } finally { this.active = false; }
+  }
+  dispose(): void {
+    if (this.closed) return;
+    this.closed = true; this.token++;
+    if (this.active) this.store.jobs.cancelJob();
+    this.evaluator.dispose();
+  }
+}
+</file>
+
 <file path="src/renderer/primitive.ts">
 export { primitiveGeometry } from "../geometry/primitive-geometry";
 </file>
@@ -12129,6 +12304,165 @@ export function BooleanEditor({ store, project, target, disabled, reason }: { st
 }
 </file>
 
+<file path="tests/renderer/scene-sync.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
+
+const noAssets = () => undefined;
+describe("domain scene synchronization", () => {
+  it("keeps wrapper and geometry identity while reparenting and reordering", () => {
+    const project = createNestedMeshProject();
+    const root = project.nodes[0]!;
+    const group = project.nodes.find(node => node.id === "nested-group")!;
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const wrapper = sync.objects.get(mesh.id)!.object;
+    const content = sync.objects.get(mesh.id)!.content;
+    root.children = [mesh.id, group.id]; group.children = []; mesh.parentId = root.id;
+    sync.sync(project, noAssets);
+    expect(sync.objects.get(mesh.id)!.object).toBe(wrapper);
+    expect(sync.objects.get(mesh.id)!.content).toBe(content);
+    expect(wrapper.parent).toBe(sync.objects.get(root.id)!.object);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([wrapper, sync.objects.get(group.id)!.object]);
+    root.children = [group.id, mesh.id]; sync.sync(project, noAssets);
+    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([sync.objects.get(group.id)!.object, wrapper]);
+    sync.dispose();
+  });
+  it("preserves stable objects and local hierarchy while transforms and visibility change", () => {
+    const project = createNestedMeshProject();
+    const states = [] as unknown[];
+    const sync = new SceneSync(state => states.push(state));
+    sync.sync(project, noAssets);
+    const root = sync.objects.get(project.model.rootNodeId)!.object;
+    const group = sync.objects.get("nested-group")!.object;
+    const mesh = sync.objects.get("mesh-node")!.object;
+    const originalContent = sync.objects.get("mesh-node")!.content;
+    expect(group.parent).toBe(root);
+    expect(mesh.parent).toBe(group);
+    const node = project.nodes.find(n => n.id === "mesh-node")!;
+    node.transform.position = [3, 2, 1]; node.visible = false;
+    sync.sync(project, noAssets);
+    expect(sync.objects.get("mesh-node")!.object).toBe(mesh);
+    expect(sync.objects.get("mesh-node")!.content).toBe(originalContent);
+    expect(mesh.position.toArray()).toEqual([3, 2, 1]);
+    expect(mesh.visible).toBe(false);
+    const oldGeometry = (originalContent as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    project.nodes = project.nodes.filter(n => n.id !== "mesh-node");
+    project.nodes.find(n => n.id === "nested-group")!.children = [];
+    sync.sync(project, noAssets);
+    expect(disposed).toHaveBeenCalledOnce();
+    expect(sync.objects.has("mesh-node")).toBe(false);
+    sync.dispose();
+  });
+  it("clears old project and ignores late asset results after replacement", async () => {
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find(n => n.id === "mesh-node");
+    if (!mesh || mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "asset", assetId: "a" };
+    project.assets.push({ id: "a", hash: "f".repeat(64), mediaType: "model/gltf-binary", path: "assets/a.glb", colorSpace: "none" });
+    let resolve!: (root: T.Object3D) => void;
+    const pending = new Promise<T.Object3D>(r => { resolve = r; });
+    const statuses = [] as { loading: number; diagnostics: string[] }[];
+    const sync = new SceneSync(status => statuses.push(status), () => pending);
+    const firstEpoch = {};
+    sync.sync(project, () => new Uint8Array([1]), firstEpoch);
+    expect(statuses.at(-1)?.loading).toBe(1);
+    const oldObject = sync.objects.get("mesh-node")!.object;
+    const replacement = structuredClone(emptyProject);
+    replacement.id = project.id;
+    sync.sync(replacement, noAssets, {});
+    const geometry = new T.BoxGeometry();
+    const disposed = vi.spyOn(geometry, "dispose");
+    resolve(new T.Mesh(geometry, new T.MeshBasicMaterial()));
+    await pending; await Promise.resolve();
+    expect(disposed).toHaveBeenCalledOnce();
+    expect(oldObject.parent).toBeNull();
+    expect(sync.objects.has("mesh-node")).toBe(false);
+    sync.dispose();
+  });
+  it("rejects invalid transforms without corrupting a valid world matrix", () => {
+    const sync = new SceneSync(() => {});
+    const project = createNestedMeshProject();
+    sync.sync(project, noAssets);
+    project.nodes.find(n => n.id === "nested-group")!.transform.position = [Infinity, 0, 0];
+    expect(() => sync.sync(project, noAssets)).toThrow(/матрица/);
+    sync.dispose();
+  });
+  it("preserves temporary navigation across document sync and restores project camera on replacement", () => {
+    const sync = new SceneSync(() => {});
+    const project = createNestedMeshProject();
+    const epoch = {};
+    sync.sync(project, noAssets, epoch);
+    const version = sync.cameraVersion;
+    sync.camera.position.set(20, 11, 7);
+    project.nodes.find(n => n.id === "mesh-node")!.transform.position = [2, 0, 0];
+    sync.sync(project, noAssets, epoch);
+    expect(sync.camera.position.toArray()).toEqual([20, 11, 7]);
+    expect(sync.cameraVersion).toBe(version);
+    sync.sync(project, noAssets, {});
+    expect(sync.camera.position.toArray()).toEqual(project.scene.camera.position);
+    expect(sync.cameraVersion).toBe(version + 1);
+    sync.dispose();
+  });
+});
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
+<file path="src/geometry/modifiers/index.ts">
+export { ModifierEvaluator } from "./evaluator";
+export { evaluateMirror, parseMirrorParameters } from "./mirror";
+export { evaluateDeform, parseBendParameters, parseTwistParameters, parseTaperParameters } from "./deform";
+export type { ArrayParameters, BooleanParameters, MirrorParameters, BendParameters, TwistParameters, TaperParameters, EvaluationResult, ModifierDiagnostic, ModifierErrorCode, ModifierWarning, AssetGeometryResolver } from "./types";
+</file>
+
+<file path="src/geometry/modifiers/types.ts">
+import type { Project, MeshNode } from "../../domain/types";
+import type { CsgErrorCode, CsgOperation, CsgWarning, MeshData } from "../csg";
+
+export type BooleanParameters = { operation: CsgOperation; cutterNodeId: string };
+export type DeformAxis = "x" | "y" | "z";
+export type BendParameters = { axis: DeformAxis; direction: DeformAxis; angleDegrees: number; pivot: readonly [number, number, number] };
+export type TwistParameters = { axis: DeformAxis; angleDegrees: number; pivot: readonly [number, number, number] };
+export type TaperParameters = { axis: DeformAxis; startScale: number; endScale: number; pivot: readonly [number, number, number] };
+export type MirrorParameters = { axes: "x" | "y" | "z" | "xy" | "xz" | "yz" | "xyz"; pivot: readonly [number, number, number]; mergeSeam: boolean };
+export type ArrayParameters =
+  | { mode: "linear"; count: number; axis: "x" | "y" | "z"; step: number; offset: readonly [number, number, number] }
+  | { mode: "radial"; count: number; axis: "x" | "y" | "z"; angleStepDegrees: number; pivot: readonly [number, number, number]; offset: readonly [number, number, number] };
+export type ModifierErrorCode = CsgErrorCode | "INVALID_REFERENCE" | "DEPENDENCY_CYCLE" | "INVALID_MODIFIER" | "UNSUPPORTED_MODIFIER" | "ASSET_DECODE_FAILED" | "STALE_PROJECT";
+export type ModifierDiagnostic = { code: ModifierErrorCode; message: string; nodeId?: string; modifierId?: string };
+export type ModifierWarning = CsgWarning | { code: "MIRROR_UNMERGED"; message: string };
+export type GeometryAttributes = { uv?: boolean; normals?: boolean; materialGroups?: boolean; materialSlots?: number };
+/** Resolver returns detached local-space buffers and a content fingerprint (normally Asset.hash). No network access. */
+export type AssetGeometryResolver = (node: Readonly<MeshNode>, project: Readonly<Project>, signal?: AbortSignal) => Promise<{ mesh: MeshData; fingerprint: string; attributes?: GeometryAttributes }>;
+export type EvaluationResult =
+  | { ok: true; mesh: MeshData; empty: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: false }
+  | { ok: false; error: ModifierDiagnostic; mesh?: MeshData; empty?: boolean; warnings: ModifierWarning[]; appliedModifierIds: string[]; fallback: boolean };
+</file>
+
 <file path="tests/domain/serialization.test.ts">
 import { describe, expect, it } from "vitest";
 import {
@@ -12170,6 +12504,26 @@ describe("project document schema v1", () => {
     const result = serializeProjectDocument(project);
     expect(result.ok, JSON.stringify(result)).toBe(true);
     if (result.ok) expect(deserializeProjectDocument(result.value)).toEqual({ ok: true, value: project });
+  });
+  it("round-trips deformation stacks and rejects invalid disabled parameters", () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.kind === "mesh");
+    if (!mesh) throw new Error("Missing mesh");
+    const params = [
+      { axis: "x", direction: "y", angleDegrees: 20, pivot: [0, 0, 0] },
+      { axis: "z", angleDegrees: -30, pivot: [1, 0, 0] },
+      { axis: "y", startScale: 0.5, endScale: 2, pivot: [0, 1, 0] },
+    ];
+    for (const [order, kind] of (["bend", "twist", "taper"] as const).entries()) {
+      const id = `deform-${order}`;
+      project.modifiers.push({ id, nodeId: mesh.id, kind, order, version: order + 1, enabled: order !== 1, parameters: params[order]! });
+      mesh.modifierIds.push(id);
+    }
+    const saved = serializeProjectDocument(project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toEqual({ ok: true, value: project });
+    project.modifiers[1]!.parameters.angleDegrees = Infinity;
+    expect(serializeProjectDocument(project).ok).toBe(false);
   });
 
   it.each([
@@ -12360,7 +12714,7 @@ describe("ModifierEvaluator", () => {
     p.nodes.find(n => n.id === "b")!.modifierIds = []; p.modifiers.pop();
     m.parameters = { operation: "wrong", cutterNodeId: "b" };
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "INVALID_MODIFIER" } });
-    m.kind = "bend";
+    m.kind = "bevel";
     expect(await evaluator.evaluate(p, "a")).toMatchObject({ error: { code: "UNSUPPORTED_MODIFIER" } });
   });
   it("keeps a fallback on worker failure and recovers on retry", async () => {
@@ -12429,135 +12783,44 @@ describe("ModifierEvaluator", () => {
     complete({ jobId: "late", coordinateSpace: "target-local", output: csg.calls[0]!.target.mesh, empty: false, faceOrigins: new Uint8Array(), stats: { inputTriangles: 0, outputTriangles: 0, computeMs: 0 }, warnings: [] });
     expect(await pending).toMatchObject({ ok: false, error: { code: "STALE_PROJECT" }, fallback: false });
   });
-});
-</file>
-
-<file path="tests/renderer/scene-sync.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
-
-const noAssets = () => undefined;
-describe("domain scene synchronization", () => {
-  it("keeps wrapper and geometry identity while reparenting and reordering", () => {
-    const project = createNestedMeshProject();
-    const root = project.nodes[0]!;
-    const group = project.nodes.find(node => node.id === "nested-group")!;
-    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
-    const sync = new SceneSync(() => {});
-    sync.sync(project, noAssets);
-    const wrapper = sync.objects.get(mesh.id)!.object;
-    const content = sync.objects.get(mesh.id)!.content;
-    root.children = [mesh.id, group.id]; group.children = []; mesh.parentId = root.id;
-    sync.sync(project, noAssets);
-    expect(sync.objects.get(mesh.id)!.object).toBe(wrapper);
-    expect(sync.objects.get(mesh.id)!.content).toBe(content);
-    expect(wrapper.parent).toBe(sync.objects.get(root.id)!.object);
-    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([wrapper, sync.objects.get(group.id)!.object]);
-    root.children = [group.id, mesh.id]; sync.sync(project, noAssets);
-    expect(sync.objects.get(root.id)!.object.children.slice(0, 2)).toEqual([sync.objects.get(group.id)!.object, wrapper]);
-    sync.dispose();
+  it("runs deformations in stack order, caches them, and keeps source state detached", async () => {
+    const p = fixture(), evaluator = new ModifierEvaluator({ csg: fake() });
+    const node = p.nodes.find(n => n.id === "a")!;
+    const m1: Modifier = { id: "bend", nodeId: "a", kind: "bend", order: 0, version: 0, enabled: true, parameters: { axis: "x", direction: "y", angleDegrees: 30, pivot: [0, 0, 0] } };
+    const m2: Modifier = { id: "twist", nodeId: "a", kind: "twist", order: 1, version: 0, enabled: true, parameters: { axis: "z", angleDegrees: 30, pivot: [0, 0, 0] } };
+    p.modifiers.push(m1, m2); node.modifierIds.push(m1.id, m2.id);
+    const before = JSON.stringify(p), first = await evaluator.evaluate(p, "a");
+    expect(first.ok && first.appliedModifierIds).toEqual(["bend", "twist"]);
+    expect(JSON.stringify(p)).toBe(before);
+    if (!first.ok) return;
+    const baseline = first.mesh.positions.slice(), size = evaluator.cacheSizeBytes;
+    first.mesh.positions[0] = 100;
+    const hit = await evaluator.evaluate(p, "a");
+    expect(hit.ok && hit.mesh.positions).toEqual(baseline);
+    expect(evaluator.cacheSizeBytes).toBe(size);
+    node.modifierIds.reverse(); m1.order = 1; m2.order = 0;
+    const reordered = await evaluator.evaluate(p, "a");
+    expect(reordered.ok && reordered.mesh.positions).not.toEqual(baseline);
+    m1.parameters.angleDegrees = -30; m1.version++;
+    const changed = await evaluator.evaluate(p, "a");
+    expect(changed.ok && changed.mesh.positions).not.toEqual(reordered.ok && reordered.mesh.positions);
+    m2.enabled = false;
+    expect((await evaluator.evaluate(p, "a")).appliedModifierIds).toEqual(["bend"]);
   });
-  it("preserves stable objects and local hierarchy while transforms and visibility change", () => {
-    const project = createNestedMeshProject();
-    const states = [] as unknown[];
-    const sync = new SceneSync(state => states.push(state));
-    sync.sync(project, noAssets);
-    const root = sync.objects.get(project.model.rootNodeId)!.object;
-    const group = sync.objects.get("nested-group")!.object;
-    const mesh = sync.objects.get("mesh-node")!.object;
-    const originalContent = sync.objects.get("mesh-node")!.content;
-    expect(group.parent).toBe(root);
-    expect(mesh.parent).toBe(group);
-    const node = project.nodes.find(n => n.id === "mesh-node")!;
-    node.transform.position = [3, 2, 1]; node.visible = false;
-    sync.sync(project, noAssets);
-    expect(sync.objects.get("mesh-node")!.object).toBe(mesh);
-    expect(sync.objects.get("mesh-node")!.content).toBe(originalContent);
-    expect(mesh.position.toArray()).toEqual([3, 2, 1]);
-    expect(mesh.visible).toBe(false);
-    const oldGeometry = (originalContent as T.Mesh).geometry;
-    const disposed = vi.spyOn(oldGeometry, "dispose");
-    project.nodes = project.nodes.filter(n => n.id !== "mesh-node");
-    project.nodes.find(n => n.id === "nested-group")!.children = [];
-    sync.sync(project, noAssets);
-    expect(disposed).toHaveBeenCalledOnce();
-    expect(sync.objects.has("mesh-node")).toBe(false);
-    sync.dispose();
-  });
-  it("clears old project and ignores late asset results after replacement", async () => {
-    const project = createNestedMeshProject();
-    const mesh = project.nodes.find(n => n.id === "mesh-node");
-    if (!mesh || mesh.kind !== "mesh") throw new Error("fixture");
-    mesh.meshSource = { kind: "asset", assetId: "a" };
-    project.assets.push({ id: "a", hash: "f".repeat(64), mediaType: "model/gltf-binary", path: "assets/a.glb", colorSpace: "none" });
-    let resolve!: (root: T.Object3D) => void;
-    const pending = new Promise<T.Object3D>(r => { resolve = r; });
-    const statuses = [] as { loading: number; diagnostics: string[] }[];
-    const sync = new SceneSync(status => statuses.push(status), () => pending);
-    const firstEpoch = {};
-    sync.sync(project, () => new Uint8Array([1]), firstEpoch);
-    expect(statuses.at(-1)?.loading).toBe(1);
-    const oldObject = sync.objects.get("mesh-node")!.object;
-    const replacement = structuredClone(emptyProject);
-    replacement.id = project.id;
-    sync.sync(replacement, noAssets, {});
-    const geometry = new T.BoxGeometry();
-    const disposed = vi.spyOn(geometry, "dispose");
-    resolve(new T.Mesh(geometry, new T.MeshBasicMaterial()));
-    await pending; await Promise.resolve();
-    expect(disposed).toHaveBeenCalledOnce();
-    expect(oldObject.parent).toBeNull();
-    expect(sync.objects.has("mesh-node")).toBe(false);
-    sync.dispose();
-  });
-  it("rejects invalid transforms without corrupting a valid world matrix", () => {
-    const sync = new SceneSync(() => {});
-    const project = createNestedMeshProject();
-    sync.sync(project, noAssets);
-    project.nodes.find(n => n.id === "nested-group")!.transform.position = [Infinity, 0, 0];
-    expect(() => sync.sync(project, noAssets)).toThrow(/матрица/);
-    sync.dispose();
-  });
-  it("preserves temporary navigation across document sync and restores project camera on replacement", () => {
-    const sync = new SceneSync(() => {});
-    const project = createNestedMeshProject();
-    const epoch = {};
-    sync.sync(project, noAssets, epoch);
-    const version = sync.cameraVersion;
-    sync.camera.position.set(20, 11, 7);
-    project.nodes.find(n => n.id === "mesh-node")!.transform.position = [2, 0, 0];
-    sync.sync(project, noAssets, epoch);
-    expect(sync.camera.position.toArray()).toEqual([20, 11, 7]);
-    expect(sync.cameraVersion).toBe(version);
-    sync.sync(project, noAssets, {});
-    expect(sync.camera.position.toArray()).toEqual(project.scene.camera.position);
-    expect(sync.cameraVersion).toBe(version + 1);
-    sync.dispose();
+  it("reports attribute loss and falls back after a failed later deformation", async () => {
+    const p = fixture(), evaluator = new ModifierEvaluator({ csg: fake() });
+    const node = p.nodes.find(n => n.id === "a")!;
+    const one: Modifier = { id: "one", nodeId: "a", kind: "taper", order: 0, version: 0, enabled: true, parameters: { axis: "z", startScale: 1, endScale: 1.2, pivot: [0, 0, 0] } };
+    const two: Modifier = { id: "two", nodeId: "a", kind: "twist", order: 1, version: 0, enabled: true, parameters: { axis: "z", angleDegrees: 1e6, pivot: [0, 0, 0] } };
+    p.modifiers.push(one, two); node.modifierIds.push(one.id, two.id);
+    const failed = await evaluator.evaluate(p, "a");
+    expect(failed).toMatchObject({ ok: false, error: { code: "INVALID_MODIFIER", modifierId: "two" }, fallback: true, appliedModifierIds: ["one"] });
+    expect(failed.warnings.map(w => w.code)).toContain("UV_DROPPED");
+    expect(failed.warnings.map(w => w.code)).toContain("NORMALS_RECOMPUTED");
+    two.enabled = false;
+    expect(await evaluator.evaluate(p, "a")).toMatchObject({ ok: true, appliedModifierIds: ["one"] });
   });
 });
-</file>
-
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "resolveJsonModule": true,
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "lib": ["ES2022", "DOM"]
-  },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
-}
 </file>
 
 <file path="src/geometry/modifiers/evaluator.ts">
@@ -12569,6 +12832,7 @@ import { CsgError, CsgService, fromThree, validateMesh, type MeshData } from "..
 import type { AssetGeometryResolver, BooleanParameters, EvaluationResult, GeometryAttributes, ModifierDiagnostic, ModifierErrorCode, ModifierWarning } from "./types";
 import { ArrayError, evaluateArray, parseArrayParameters } from "./array";
 import { MirrorError, evaluateMirror, parseMirrorParameters } from "./mirror";
+import { DeformError, evaluateDeform, parseBendParameters, parseTwistParameters, parseTaperParameters } from "./deform";
 
 type CsgRunner = Pick<CsgService, "run" | "cancel">;
 type Stage = { mesh: MeshData; key: string; attributes: GeometryAttributes; warnings: ModifierWarning[]; applied: string[]; empty: boolean };
@@ -12668,7 +12932,7 @@ export class ModifierEvaluator {
       this.checkProject(ctx, nodeId);
       return { ok: true, mesh: cloneMesh(stage.mesh), empty: stage.empty, warnings: [...stage.warnings], appliedModifierIds: [...stage.applied], fallback: false };
     } catch (error) {
-      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError || error instanceof ArrayError || error instanceof MirrorError ? error.code : "WORKER_FAILED";
+      const code: ModifierErrorCode = error instanceof EvaluationFailure || error instanceof CsgError || error instanceof ArrayError || error instanceof MirrorError || error instanceof DeformError ? error.code : "WORKER_FAILED";
       const message = error instanceof Error ? error.message : String(error);
       const diagnostic: ModifierDiagnostic = { code, message, ...(error instanceof EvaluationFailure && error.nodeId ? { nodeId: error.nodeId } : { nodeId }), ...(error instanceof EvaluationFailure && error.modifierId ? { modifierId: error.modifierId } : {}) };
       return fail(diagnostic, code === "JOB_CANCELLED" || code === "STALE_PROJECT" ? undefined : last);
@@ -12723,6 +12987,29 @@ export class ModifierEvaluator {
       for (const modifier of modifiers) {
         this.check(ctx.signal, ctx.epoch);
         if (!modifier.enabled) continue;
+        if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") {
+          const key = stable([stage.key, modifier.id, modifier.kind, modifier.version, modifier.order, modifier.parameters]);
+          let params;
+          try {
+            params = modifier.kind === "bend" ? parseBendParameters(modifier.parameters) : modifier.kind === "twist" ? parseTwistParameters(modifier.parameters) : parseTaperParameters(modifier.parameters);
+          } catch (error) { throw new EvaluationFailure(error instanceof DeformError ? error.code : "INVALID_MODIFIER", error instanceof Error ? error.message : "Некорректная деформация.", nodeId, modifier.id); }
+          const hit = this.read(key);
+          if (hit) { stage = hit; progress?.(stage); continue; }
+          let output: MeshData;
+          try {
+            output = modifier.kind === "bend" ? await evaluateDeform(stage.mesh, "bend", params as ReturnType<typeof parseBendParameters>, ctx.signal)
+              : modifier.kind === "twist" ? await evaluateDeform(stage.mesh, "twist", params as ReturnType<typeof parseTwistParameters>, ctx.signal)
+                : await evaluateDeform(stage.mesh, "taper", params as ReturnType<typeof parseTaperParameters>, ctx.signal);
+          } catch (error) { throw new EvaluationFailure(error instanceof DeformError ? error.code : "WORKER_FAILED", error instanceof Error ? error.message : "Ошибка деформации.", nodeId, modifier.id); }
+          this.check(ctx.signal, ctx.epoch); this.checkProject(ctx, nodeId);
+          const warnings = [...stage.warnings];
+          if (stage.attributes.uv) warnings.push({ code: "UV_DROPPED", message: "MeshData деформации не переносит исходные UV." });
+          if (stage.attributes.normals) warnings.push({ code: "NORMALS_RECOMPUTED", message: "Авторские нормали не сохраняются; отображение пересчитывает их." });
+          if (stage.attributes.materialGroups || (stage.attributes.materialSlots ?? 0) > 1) warnings.push({ code: "MATERIALS_DROPPED", message: "Группы и слоты материалов не сохраняются." });
+          stage = { ...stage, mesh: output, key, attributes: {}, warnings, applied: [...stage.applied, modifier.id] };
+          this.write(stage); progress?.(stage);
+          continue;
+        }
         if (modifier.kind === "array") {
           let params;
           try { params = parseArrayParameters(modifier.parameters); }
@@ -13819,274 +14106,6 @@ export class SceneSync {
 }
 </file>
 
-<file path="src/domain/validate-project.ts">
-import type { EntityId, Keyframe, Light, Node, Project } from "./types";
-import { validatePrimitiveSource } from "../geometry/primitives";
-import { validateEditableSource } from "../geometry/mesh-edit";
-import { parseArrayParameters } from "../geometry/modifiers/array";
-import { parseMirrorParameters } from "../geometry/modifiers/mirror";
-
-export type ValidationCode =
-  | "DUPLICATE_ID"
-  | "MISSING_REFERENCE"
-  | "INVALID_HIERARCHY"
-  | "HIERARCHY_CYCLE"
-  | "DEPENDENCY_CYCLE"
-  | "INVALID_NUMBER"
-  | "INVALID_STRUCTURE";
-
-export interface ValidationIssue {
-  code: ValidationCode;
-  path: string;
-  message: string;
-}
-
-export function validateProject(project: Project): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const entities = new Map<EntityId, string>();
-  const register = (id: EntityId, path: string): void => {
-    const previous = entities.get(id);
-    if (previous !== undefined) {
-      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
-    } else {
-      entities.set(id, path);
-    }
-  };
-  const finite = (value: number, path: string): void => {
-    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
-  };
-  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
-    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
-  };
-
-  register(project.id, "id");
-  register(project.model.id, "model.id");
-  finite(project.model.revision, "model.revision");
-  register(project.scene.id, "scene.id");
-  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
-  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
-  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
-  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
-  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
-  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
-  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
-  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
-  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
-
-  const nodeIds = new Set(project.nodes.map((node) => node.id));
-  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
-  const materialIds = new Set(project.materials.map((material) => material.id));
-  const assetIds = new Set(project.assets.map((asset) => asset.id));
-  const trackIds = new Set(project.tracks.map((track) => track.id));
-  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
-
-  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
-  if (root === undefined) {
-    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
-  } else if (root.parentId !== null) {
-    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
-  }
-
-  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
-  const booleanEdges = new Map<EntityId, EntityId[]>();
-  for (const node of project.nodes) {
-    if (node.id !== project.model.rootNodeId && node.parentId === null) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
-    }
-    const childSet = new Set<EntityId>();
-    for (const childId of node.children) {
-      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
-      childSet.add(childId);
-      const child = nodesById.get(childId);
-      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
-      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
-    }
-    if (node.parentId !== null) {
-      const parent = nodesById.get(node.parentId);
-      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
-      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
-    }
-    checkTransform(node, finite, `nodes.${node.id}.transform`);
-    if (node.kind === "mesh") {
-      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
-      else if (node.meshSource.kind === "primitive") {
-        const message = validatePrimitiveSource(node.meshSource);
-        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
-      } else {
-        const message = validateEditableSource(node.meshSource);
-        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
-      }
-    }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
-    const seenModifiers = new Set<EntityId>();
-    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
-      if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
-      seenModifiers.add(modifierId);
-      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
-      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
-      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
-    }
-    const orderedModifiers = node.modifierIds
-      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
-      .filter((modifier) => modifier !== undefined);
-    for (let index = 1; index < orderedModifiers.length; index += 1) {
-      const previous = orderedModifiers[index - 1];
-      const current = orderedModifiers[index];
-      if (previous && current && previous.order >= current.order) {
-        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
-        break;
-      }
-    }
-  }
-
-  if (root !== undefined) {
-    const visited = new Set<EntityId>();
-    const active = new Set<EntityId>();
-    const visit = (node: Node): void => {
-      if (active.has(node.id)) {
-        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
-        return;
-      }
-      if (visited.has(node.id)) return;
-      active.add(node.id);
-      visited.add(node.id);
-      for (const childId of node.children) {
-        const child = nodesById.get(childId);
-        if (child) visit(child);
-      }
-      active.delete(node.id);
-    };
-    visit(root);
-    for (const node of project.nodes) {
-      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
-    }
-  }
-
-  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
-  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
-  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
-  finite(project.scene.camera.near, "scene.camera.near");
-  finite(project.scene.camera.far, "scene.camera.far");
-  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
-  finite(project.scene.background.intensity, "scene.background.intensity");
-  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
-  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
-  project.scene.instances.forEach((instance, index) => {
-    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
-    checkTransform(instance, finite, `scene.instances[${index}].transform`);
-  });
-
-  for (const modifier of project.modifiers) {
-    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
-    finite(modifier.order, `modifiers.${modifier.id}.order`);
-    finite(modifier.version, `modifiers.${modifier.id}.version`);
-    if (!Number.isSafeInteger(modifier.order) || modifier.order < 0 || !Number.isSafeInteger(modifier.version) || modifier.version < 0)
-      issues.push({ code: "INVALID_NUMBER", path: `modifiers.${modifier.id}`, message: "Порядок и версия должны быть неотрицательными целыми числами." });
-    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
-      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
-    }
-    for (const [name, value] of Object.entries(modifier.parameters)) {
-      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
-      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
-    }
-    if (modifier.kind === "array") {
-      try { parseArrayParameters(modifier.parameters); }
-      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры массива." }); }
-    }
-    if (modifier.kind === "mirror") {
-      try { parseMirrorParameters(modifier.parameters); }
-      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Mirror." }); }
-    }
-    if (modifier.kind === "boolean") {
-      const params = modifier.parameters;
-      const keys = Object.keys(params);
-      if (keys.length !== 2 || !keys.includes("operation") || !keys.includes("cutterNodeId")
-        || !["subtract", "union", "intersect"].includes(String(params.operation))
-        || typeof params.cutterNodeId !== "string" || !params.cutterNodeId.trim()) {
-        issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: "Некорректные параметры Boolean." });
-      } else {
-        const owner = nodesById.get(modifier.nodeId);
-        const cutter = nodesById.get(params.cutterNodeId);
-        if (owner?.kind !== "mesh" || (owner.meshSource.kind === "primitive" && owner.meshSource.primitive === "plane"))
-          issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.nodeId`, message: "Boolean target должен быть замкнутым mesh." });
-        if (!cutter || cutter.kind !== "mesh" || (cutter.meshSource.kind === "primitive" && cutter.meshSource.primitive === "plane"))
-          issues.push({ code: "MISSING_REFERENCE", path: `modifiers.${modifier.id}.parameters.cutterNodeId`, message: "Boolean cutter должен быть существующим замкнутым mesh." });
-        if (owner?.kind === "mesh" && cutter?.kind === "mesh")
-          booleanEdges.set(owner.id, [...booleanEdges.get(owner.id) ?? [], cutter.id]);
-      }
-    }
-  }
-  const visitedBoolean = new Set<EntityId>();
-  const activeBoolean = new Set<EntityId>();
-  for (const start of booleanEdges.keys()) {
-    if (visitedBoolean.has(start)) continue;
-    const stack: { id: EntityId; next: number }[] = [{ id: start, next: 0 }];
-    activeBoolean.add(start);
-    while (stack.length) {
-      const frame = stack[stack.length - 1]!;
-      const edges = booleanEdges.get(frame.id) ?? [];
-      if (frame.next === edges.length) {
-        activeBoolean.delete(frame.id);
-        visitedBoolean.add(frame.id);
-        stack.pop();
-        continue;
-      }
-      const next = edges[frame.next++]!;
-      if (activeBoolean.has(next)) {
-        issues.push({ code: "DEPENDENCY_CYCLE", path: `nodes.${frame.id}.modifierIds`, message: "Обнаружен цикл зависимостей Boolean." });
-        continue;
-      }
-      if (!visitedBoolean.has(next)) { activeBoolean.add(next); stack.push({ id: next, next: 0 }); }
-    }
-  }
-  for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
-  }
-  for (const clip of project.animations) {
-    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
-    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
-  }
-  for (const track of project.tracks) {
-    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
-    const usedKeys = new Set<EntityId>();
-    for (const keyframeId of track.keyframeIds) {
-      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
-      usedKeys.add(keyframeId);
-      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
-    }
-  }
-  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
-  return issues;
-}
-
-function checkTransform(
-  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
-  finite: (value: number, path: string) => void,
-  path: string,
-): void {
-  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
-  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
-  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
-}
-
-function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
-  finite(light.intensity, `scene.lights[${index}].intensity`);
-  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
-  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
-  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
-}
-
-function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
-  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
-  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
-  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
-}
-</file>
-
 <file path="src/ui/Inspector.tsx">
 import { useEffect, useRef, useState } from "react";
 import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
@@ -14362,6 +14381,282 @@ function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore
     {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
     <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
   </div>;
+}
+</file>
+
+<file path="src/domain/validate-project.ts">
+import type { EntityId, Keyframe, Light, Node, Project } from "./types";
+import { validatePrimitiveSource } from "../geometry/primitives";
+import { validateEditableSource } from "../geometry/mesh-edit";
+import { parseArrayParameters } from "../geometry/modifiers/array";
+import { parseMirrorParameters } from "../geometry/modifiers/mirror";
+import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
+
+export type ValidationCode =
+  | "DUPLICATE_ID"
+  | "MISSING_REFERENCE"
+  | "INVALID_HIERARCHY"
+  | "HIERARCHY_CYCLE"
+  | "DEPENDENCY_CYCLE"
+  | "INVALID_NUMBER"
+  | "INVALID_STRUCTURE";
+
+export interface ValidationIssue {
+  code: ValidationCode;
+  path: string;
+  message: string;
+}
+
+export function validateProject(project: Project): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const entities = new Map<EntityId, string>();
+  const register = (id: EntityId, path: string): void => {
+    const previous = entities.get(id);
+    if (previous !== undefined) {
+      issues.push({ code: "DUPLICATE_ID", path, message: `ID «${id}» уже используется в ${previous}.` });
+    } else {
+      entities.set(id, path);
+    }
+  };
+  const finite = (value: number, path: string): void => {
+    if (!Number.isFinite(value)) issues.push({ code: "INVALID_NUMBER", path, message: "Значение должно быть конечным числом." });
+  };
+  const reference = (id: EntityId, known: Set<EntityId>, path: string): void => {
+    if (!known.has(id)) issues.push({ code: "MISSING_REFERENCE", path, message: `Ссылка «${id}» не найдена.` });
+  };
+
+  register(project.id, "id");
+  register(project.model.id, "model.id");
+  finite(project.model.revision, "model.revision");
+  register(project.scene.id, "scene.id");
+  for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
+  for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
+  for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);
+  for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
+  for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
+  for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
+  for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
+  for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
+
+  const nodeIds = new Set(project.nodes.map((node) => node.id));
+  const modifierIds = new Set(project.modifiers.map((modifier) => modifier.id));
+  const materialIds = new Set(project.materials.map((material) => material.id));
+  const assetIds = new Set(project.assets.map((asset) => asset.id));
+  const trackIds = new Set(project.tracks.map((track) => track.id));
+  const keyframeIds = new Set(project.keyframes.map((keyframe) => keyframe.id));
+
+  const root = project.nodes.find((node) => node.id === project.model.rootNodeId);
+  if (root === undefined) {
+    issues.push({ code: "MISSING_REFERENCE", path: "model.rootNodeId", message: "Корневой узел модели не найден." });
+  } else if (root.parentId !== null) {
+    issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${root.id}.parentId`, message: "Корневой узел не может иметь родителя." });
+  }
+
+  const nodesById = new Map(project.nodes.map((node) => [node.id, node]));
+  const booleanEdges = new Map<EntityId, EntityId[]>();
+  for (const node of project.nodes) {
+    if (node.id !== project.model.rootNodeId && node.parentId === null) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: "Только корневой узел может не иметь родителя." });
+    }
+    const childSet = new Set<EntityId>();
+    for (const childId of node.children) {
+      if (childSet.has(childId)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» указан повторно.` });
+      childSet.add(childId);
+      const child = nodesById.get(childId);
+      if (child === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.children`, message: `Дочерний узел «${childId}» не найден.` });
+      else if (child.parentId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.children`, message: `Узел «${childId}» не ссылается на родителя «${node.id}».` });
+    }
+    if (node.parentId !== null) {
+      const parent = nodesById.get(node.parentId);
+      if (parent === undefined) issues.push({ code: "MISSING_REFERENCE", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не найден.` });
+      else if (!parent.children.includes(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.parentId`, message: `Родитель «${node.parentId}» не содержит узел в children.` });
+    }
+    checkTransform(node, finite, `nodes.${node.id}.transform`);
+    if (node.kind === "mesh") {
+      if (node.meshSource.kind === "asset") reference(node.meshSource.assetId, assetIds, `nodes.${node.id}.meshSource.assetId`);
+      else if (node.meshSource.kind === "primitive") {
+        const message = validatePrimitiveSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      } else {
+        const message = validateEditableSource(node.meshSource);
+        if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
+      }
+    }
+    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    const seenModifiers = new Set<EntityId>();
+    for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
+      if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
+      seenModifiers.add(modifierId);
+      reference(modifierId, modifierIds, `nodes.${node.id}.modifierIds[${modifierIndex}]`);
+      const modifier = project.modifiers.find((candidate) => candidate.id === modifierId);
+      if (modifier && modifier.nodeId !== node.id) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "Модификатор привязан к другому узлу." });
+    }
+    const orderedModifiers = node.modifierIds
+      .map((id) => project.modifiers.find((modifier) => modifier.id === id))
+      .filter((modifier) => modifier !== undefined);
+    for (let index = 1; index < orderedModifiers.length; index += 1) {
+      const previous = orderedModifiers[index - 1];
+      const current = orderedModifiers[index];
+      if (previous && current && previous.order >= current.order) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds`, message: "Порядок стека должен строго соответствовать значениям order." });
+        break;
+      }
+    }
+  }
+
+  if (root !== undefined) {
+    const visited = new Set<EntityId>();
+    const active = new Set<EntityId>();
+    const visit = (node: Node): void => {
+      if (active.has(node.id)) {
+        issues.push({ code: "HIERARCHY_CYCLE", path: `nodes.${node.id}`, message: "В иерархии обнаружен цикл." });
+        return;
+      }
+      if (visited.has(node.id)) return;
+      active.add(node.id);
+      visited.add(node.id);
+      for (const childId of node.children) {
+        const child = nodesById.get(childId);
+        if (child) visit(child);
+      }
+      active.delete(node.id);
+    };
+    visit(root);
+    for (const node of project.nodes) {
+      if (!visited.has(node.id)) issues.push({ code: "INVALID_HIERARCHY", path: `nodes.${node.id}`, message: "Узел недостижим из корня модели (возможен отдельный цикл)." });
+    }
+  }
+
+  project.scene.camera.position.forEach((value, index) => finite(value, `scene.camera.position[${index}]`));
+  project.scene.camera.target.forEach((value, index) => finite(value, `scene.camera.target[${index}]`));
+  finite(project.scene.camera.fovDegrees, "scene.camera.fovDegrees");
+  finite(project.scene.camera.near, "scene.camera.near");
+  finite(project.scene.camera.far, "scene.camera.far");
+  project.scene.background.color.forEach((value, index) => finite(value, `scene.background.color[${index}]`));
+  finite(project.scene.background.intensity, "scene.background.intensity");
+  if (project.scene.background.environmentAssetId) reference(project.scene.background.environmentAssetId, assetIds, "scene.background.environmentAssetId");
+  project.scene.lights.forEach((light, index) => validateLight(light, index, finite));
+  project.scene.instances.forEach((instance, index) => {
+    reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
+    checkTransform(instance, finite, `scene.instances[${index}].transform`);
+  });
+
+  for (const modifier of project.modifiers) {
+    reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);
+    finite(modifier.order, `modifiers.${modifier.id}.order`);
+    finite(modifier.version, `modifiers.${modifier.id}.version`);
+    if (!Number.isSafeInteger(modifier.order) || modifier.order < 0 || !Number.isSafeInteger(modifier.version) || modifier.version < 0)
+      issues.push({ code: "INVALID_NUMBER", path: `modifiers.${modifier.id}`, message: "Порядок и версия должны быть неотрицательными целыми числами." });
+    if (!project.nodes.find((node) => node.id === modifier.nodeId)?.modifierIds.includes(modifier.id)) {
+      issues.push({ code: "INVALID_HIERARCHY", path: `modifiers.${modifier.id}.nodeId`, message: "Узел не содержит ID модификатора в ordered stack." });
+    }
+    for (const [name, value] of Object.entries(modifier.parameters)) {
+      if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
+      else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+    if (modifier.kind === "array") {
+      try { parseArrayParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры массива." }); }
+    }
+    if (modifier.kind === "mirror") {
+      try { parseMirrorParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры Mirror." }); }
+    }
+    if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper") {
+      try {
+        if (modifier.kind === "bend") parseBendParameters(modifier.parameters);
+        else if (modifier.kind === "twist") parseTwistParameters(modifier.parameters);
+        else parseTaperParameters(modifier.parameters);
+      } catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректная деформация." }); }
+    }
+    if (modifier.kind === "boolean") {
+      const params = modifier.parameters;
+      const keys = Object.keys(params);
+      if (keys.length !== 2 || !keys.includes("operation") || !keys.includes("cutterNodeId")
+        || !["subtract", "union", "intersect"].includes(String(params.operation))
+        || typeof params.cutterNodeId !== "string" || !params.cutterNodeId.trim()) {
+        issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: "Некорректные параметры Boolean." });
+      } else {
+        const owner = nodesById.get(modifier.nodeId);
+        const cutter = nodesById.get(params.cutterNodeId);
+        if (owner?.kind !== "mesh" || (owner.meshSource.kind === "primitive" && owner.meshSource.primitive === "plane"))
+          issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.nodeId`, message: "Boolean target должен быть замкнутым mesh." });
+        if (!cutter || cutter.kind !== "mesh" || (cutter.meshSource.kind === "primitive" && cutter.meshSource.primitive === "plane"))
+          issues.push({ code: "MISSING_REFERENCE", path: `modifiers.${modifier.id}.parameters.cutterNodeId`, message: "Boolean cutter должен быть существующим замкнутым mesh." });
+        if (owner?.kind === "mesh" && cutter?.kind === "mesh")
+          booleanEdges.set(owner.id, [...booleanEdges.get(owner.id) ?? [], cutter.id]);
+      }
+    }
+  }
+  const visitedBoolean = new Set<EntityId>();
+  const activeBoolean = new Set<EntityId>();
+  for (const start of booleanEdges.keys()) {
+    if (visitedBoolean.has(start)) continue;
+    const stack: { id: EntityId; next: number }[] = [{ id: start, next: 0 }];
+    activeBoolean.add(start);
+    while (stack.length) {
+      const frame = stack[stack.length - 1]!;
+      const edges = booleanEdges.get(frame.id) ?? [];
+      if (frame.next === edges.length) {
+        activeBoolean.delete(frame.id);
+        visitedBoolean.add(frame.id);
+        stack.pop();
+        continue;
+      }
+      const next = edges[frame.next++]!;
+      if (activeBoolean.has(next)) {
+        issues.push({ code: "DEPENDENCY_CYCLE", path: `nodes.${frame.id}.modifierIds`, message: "Обнаружен цикл зависимостей Boolean." });
+        continue;
+      }
+      if (!visitedBoolean.has(next)) { activeBoolean.add(next); stack.push({ id: next, next: 0 }); }
+    }
+  }
+  for (const material of project.materials) {
+    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
+      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
+    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
+    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
+    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+  }
+  for (const clip of project.animations) {
+    finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
+    for (const trackId of clip.trackIds) reference(trackId, trackIds, `animations.${clip.id}.trackIds`);
+  }
+  for (const track of project.tracks) {
+    reference(track.nodeId, nodeIds, `tracks.${track.id}.nodeId`);
+    const usedKeys = new Set<EntityId>();
+    for (const keyframeId of track.keyframeIds) {
+      if (usedKeys.has(keyframeId)) issues.push({ code: "INVALID_STRUCTURE", path: `tracks.${track.id}.keyframeIds`, message: `Ключ «${keyframeId}» повторяется.` });
+      usedKeys.add(keyframeId);
+      reference(keyframeId, keyframeIds, `tracks.${track.id}.keyframeIds`);
+    }
+  }
+  for (const keyframe of project.keyframes) validateKeyframe(keyframe, finite);
+  return issues;
+}
+
+function checkTransform(
+  value: { transform: { position: readonly number[]; rotationQuat: readonly number[]; scale: readonly number[] } },
+  finite: (value: number, path: string) => void,
+  path: string,
+): void {
+  value.transform.position.forEach((number, index) => finite(number, `${path}.position[${index}]`));
+  value.transform.rotationQuat.forEach((number, index) => finite(number, `${path}.rotationQuat[${index}]`));
+  value.transform.scale.forEach((number, index) => finite(number, `${path}.scale[${index}]`));
+}
+
+function validateLight(light: Light, index: number, finite: (value: number, path: string) => void): void {
+  finite(light.intensity, `scene.lights[${index}].intensity`);
+  light.color.forEach((value, component) => finite(value, `scene.lights[${index}].color[${component}]`));
+  light.position.forEach((value, component) => finite(value, `scene.lights[${index}].position[${component}]`));
+  light.target.forEach((value, component) => finite(value, `scene.lights[${index}].target[${component}]`));
+}
+
+function validateKeyframe(keyframe: Keyframe, finite: (value: number, path: string) => void): void {
+  finite(keyframe.timeSeconds, `keyframes.${keyframe.id}.timeSeconds`);
+  if (typeof keyframe.value === "number") finite(keyframe.value, `keyframes.${keyframe.id}.value`);
+  else keyframe.value.forEach((value, component) => finite(value, `keyframes.${keyframe.id}.value[${component}]`));
 }
 </file>
 
@@ -16074,6 +16369,13 @@ function EditorShell() {
 - `scaleEditableVertices` масштабирует выбранные геометрические вершины относительно общего локального центра и обновляет совпадающие render vertices на UV seams. Результат проверяется после Float32; вырожденная или нечисловая геометрия отклоняется целиком. Единичное и фактически неизменное масштабирование не создаёт историю.
 - `SCALE_EDITABLE_VERTICES` проходит через CommandBus с прежними проверками доступа, ревизии, модификаторов и зависимых Boolean. Inspector предоставляет русскоязычные поля X/Y/Z для Vertex/Edge/Face; одна выбранная вершина сопровождается объяснением недоступности. EditorStore сохраняет допустимый Vertex selection и очищает Edge/Face selection после изменения геометрии.
 - Целевые Vitest: 6 файлов, 64 теста PASS; `npm run typecheck`, `npm run lint`, `npm run build` PASS. Подтверждены Undo/Redo, SceneSync/GPU disposal и round trip `.triad3d` на уровне тестов. Ручной browser smoke не выполнен (UNVERIFIED). Extrude остаётся незавершённым; TASK-024 и FR-013 остаются PARTIAL. Build сохраняет прежнее предупреждение о крупном chunk.
+
+## CODEX-025A — Детерминированное ядро Bend / Twist / Taper (часть TASK-025)
+
+- Реализованы локальные недеструктивные Bend (ось, направление, угол, pivot), Twist (ось, угол, pivot) и Taper (ось, начальный/конечный масштаб, pivot). Строгий разбор отклоняет лишние/отсутствующие поля, нечисловые значения и опасные диапазоны: углы ограничены 10 оборотами, чтобы ограничить повторное сворачивание и потерю точности, масштаб — 1e-6…1e6 для защиты от коллапса и чрезмерного усиления. Результат Float32, индексы и площади треугольников проверяются до публикации; большие проходы отдают управление event loop и поддерживают отмену.
+- Этапы встроены в существующий упорядоченный ModifierEvaluator и его RAM cache с fallback. Доменная валидация проверяет также отключённые модификаторы; schemaVersion не изменялась. Предпросмотр использует прежний SceneSync с пересчётом нормалей и освобождением GPU-ресурсов.
+- MeshData переносит только XYZ/индексы: UV, авторские нормали и группы материалов теряются с предупреждениями. Проверка не гарантирует отсутствие самопересечений или manifoldness. Bevel, команды/Inspector деформаций и остальная часть TASK-025 не реализованы; FR-018 остаётся частичным.
+- Проверки: `npm run typecheck` PASS, `npm run lint` PASS, 7 целевых файлов Vitest / 85 тестов PASS, `npm run build` PASS. Build сохраняет существующее предупреждение о крупном chunk; ручной browser smoke не выполнен.
 </file>
 
 </files>
