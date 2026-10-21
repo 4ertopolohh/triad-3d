@@ -12,6 +12,7 @@ import { createPrimitiveNode, primitiveDefinitions, type PrimitiveKind } from ".
 import { ObjectTree } from "./ObjectTree";
 import { Inspector } from "./Inspector";
 import { JobOverlay } from "./JobOverlay";
+import { MaterialLibrary } from "./MaterialLibrary";
 import { isJobActive } from "../app/job-controller";
 
 const RendererSpike = import.meta.env.DEV
@@ -58,6 +59,7 @@ function EditorShell() {
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
   const [dragging, setDragging] = useState(false);
+  const [librarySection, setLibrarySection] = useState<"geometry" | "materials">("geometry");
   const dragCleanup = useRef<(() => void) | null>(null);
   const project = selectProject(state);
   const dirty = selectDirty(state);
@@ -272,7 +274,7 @@ function EditorShell() {
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
             <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
-          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
+          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} />}</div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">

@@ -48,7 +48,7 @@ http://127.0.0.1:5173/?spike=renderer
 
 Оба режима создают сцену одной фабрикой. Сферы имеют одинаковую геометрию с UV и нормалями. Хром: `MeshPhysicalMaterial`, metalness 1, roughness 0.08. Стекло: transmission 1, IOR 1.5, thickness 1.4, opacity 1. Normal map детерминированно генерируется в canvas, помечена `NoColorSpace` и накладывается на UV-сферу. Общие камера, свет, HDRI, ACES Filmic tone mapping, exposure 1.25 и выходной `SRGBColorSpace` заданы независимо от backend. HDRI загружается как radiance data через `HDRLoader` и используется с `EquirectangularReflectionMapping`; Three.js выполняет необходимую обработку environment для PBR. При ошибке HDRI сцена остаётся с нейтральным освещением, а статус становится `FAILED`.
 
-HDRI: [Poly Haven — Studio Small 03](https://polyhaven.com/a/studio_small_03), автор Greg Zaal, 1K `.hdr`, 1 686 299 байт, SHA-256 `30933D55E45F0795DAF49F3CBEFBE0E5EBCB821EE04FB0A2818C02FFC3938817`. [Лицензия CC0](https://polyhaven.com/license). Файл хранится локально в `src/spikes/renderer/assets/` и включается только в dev-режим; сетевое соединение при запуске сцены не требуется.
+HDRI: [Poly Haven — Studio Small 03](https://polyhaven.com/a/studio_small_03), автор Greg Zaal, 1K `.hdr`, 1 686 299 байт, SHA-256 `30933D55E45F0795DAF49F3CBEFBE0E5EBCB821EE04FB0A2818C02FFC3938817`. [Лицензия CC0](https://polyhaven.com/license). Файл хранится локально в `src/spikes/renderer/assets/`; с CODEX-030A он также включён в production build для ленивой генерации превью материалов. Внешнее сетевое соединение не требуется.
 
 ## Решение и ограничения
 

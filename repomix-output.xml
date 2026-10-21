@@ -95,6 +95,7 @@ src/
     index.ts
     project-serialization.ts
     types.ts
+    validate-material.ts
     validate-project.ts
   geometry/
     csg/
@@ -181,6 +182,7 @@ tests/
     commands.test.ts
     deform-commands.test.ts
     hierarchy.test.ts
+    material-commands.test.ts
     mirror-commands.test.ts
     project.test.ts
     serialization.test.ts
@@ -3846,32 +3848,6 @@ export async function openNativeProjectArchive(input: Blob | ArrayBuffer): Promi
 }
 </file>
 
-<file path="src/assets/three-resources.ts">
-import { Mesh, Texture, type Object3D } from "three";
-
-/** Each decoded/primitive subtree owns its resources; sharing inside it is deduplicated.
- * No resources are shared across independently owned subtrees. */
-export function disposeObject(root: Object3D): void {
-  const resources = new Set<{ dispose(): void }>();
-  const images = new Set<ImageBitmap>();
-  root.traverse((object) => {
-    if (!(object instanceof Mesh)) return;
-    resources.add(object.geometry);
-    for (const material of Array.isArray(object.material) ? object.material : [object.material]) {
-      resources.add(material);
-      for (const value of Object.values(material)) if (value instanceof Texture) {
-        resources.add(value);
-        if (typeof ImageBitmap !== "undefined" && value.image instanceof ImageBitmap) images.add(value.image);
-      }
-    }
-  });
-  for (const resource of resources) resource.dispose();
-  for (const image of images) image.close();
-  root.removeFromParent();
-  root.clear();
-}
-</file>
-
 <file path="src/domain/schemas/document-v1.1.schema.json">
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4730,6 +4706,45 @@ export function disposeObject(root: Object3D): void {
     "asset": { "type": "object", "additionalProperties": false, "required": ["id", "path", "sha256"], "properties": { "id": { "type": "string", "minLength": 1, "pattern": "\\S" }, "path": { "$ref": "#/$defs/path" }, "sha256": { "$ref": "#/$defs/sha256" } } }
   }
 }
+</file>
+
+<file path="src/domain/validate-material.ts">
+import type { Material } from "./types";
+import type { ValidationIssue } from "./validate-project";
+
+/** Color components are stored in Linear-sRGB. Texture roles are intentionally unspecified. */
+export function validateMaterial(value: unknown, path = "material"): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const add = (field: string, message: string): void => { issues.push({ code: "INVALID_STRUCTURE", path: `${path}.${field}`, message }); };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    add("", "Материал должен быть объектом."); return issues;
+  }
+  const material = value as Record<string, unknown>;
+  const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
+  if (Object.keys(material).length !== keys.length || Object.keys(material).some(key => !keys.includes(key))) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
+  for (const field of ["baseColor", "emissive"] as const) {
+    const color = material[field];
+    if (!Array.isArray(color) || color.length !== 3 || color.some(component => typeof component !== "number" || !Number.isFinite(component) || component < 0))
+      add(field, "Цвет Linear-sRGB должен содержать три конечных неотрицательных числа.");
+  }
+  for (const field of ["metalness", "roughness", "opacity", "transmission", "clearcoat"] as const) {
+    const number = material[field];
+    if (typeof number !== "number" || !Number.isFinite(number) || number < 0 || number > 1) add(field, "Значение должно быть конечным числом от 0 до 1.");
+  }
+  if (typeof material.ior !== "number" || !Number.isFinite(material.ior) || material.ior < 1 || material.ior > 2.333)
+    add("ior", "Показатель преломления должен быть от 1 до 2,333.");
+  if (typeof material.envIntensity !== "number" || !Number.isFinite(material.envIntensity) || material.envIntensity < 0)
+    add("envIntensity", "Интенсивность окружения должна быть конечным неотрицательным числом.");
+  if (typeof material.transmission === "number" && material.transmission > 0 && material.opacity !== 1)
+    add("opacity", "При передаче света transmission непрозрачность opacity должна быть равна 1.");
+  if (!Array.isArray(material.textureAssetIds) || material.textureAssetIds.some(id => typeof id !== "string" || !id.trim())
+    || new Set(material.textureAssetIds).size !== material.textureAssetIds.length)
+    add("textureAssetIds", "Ссылки на текстуры должны быть непустыми и уникальными ID.");
+  return issues;
+}
+
+export function isMaterial(value: unknown): value is Material { return validateMaterial(value).length === 0; }
 </file>
 
 <file path="src/geometry/csg/core.ts">
@@ -7956,6 +7971,112 @@ describe("hierarchy commands", () => {
 });
 </file>
 
+<file path="tests/domain/material-commands.test.ts">
+import { describe, expect, it } from "vitest";
+import { createCommandBus, applyProjectPatch } from "../../src/domain/command-bus";
+import { createEditorStore } from "../../src/app/editor-store";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import type { Material } from "../../src/domain/types";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+const material = (id = "mat-1"): Material => ({ id, name: "Материал", baseColor: [0.25, 0.5, 1], metalness: 0.4,
+  roughness: 0.3, emissive: [0, 0, 0], opacity: 1, transmission: 0, ior: 1.5, clearcoat: 0.2, envIntensity: 1, textureAssetIds: [] });
+const add = (value: Material) => ({ commandId: `add-${value.id}`, type: "ADD_MATERIAL" as const, targetIds: [value.id] as [string], payload: { material: value } });
+const slot = (nodeId: string, materialId: string | null, commandId = "slot") => ({ commandId, type: "SET_MATERIAL_SLOT" as const,
+  targetIds: (materialId ? [nodeId, materialId] : [nodeId]) as [string] | [string, string], payload: { nodeId, slotName: "Основной", materialId } });
+
+describe("material commands", () => {
+  it("creates, shares, updates, serializes and reverses material changes", () => {
+    const project = createNestedMeshProject();
+    const second = structuredClone(project.nodes.find(node => node.id === "mesh-node")!);
+    second.id = "mesh-2"; project.nodes.push(second); project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
+    const store = createEditorStore(project);
+    const commands = [add(material()), slot("mesh-node", "mat-1", "slot-1"), slot("mesh-2", "mat-1", "slot-2")];
+    const created = store.executeTransaction(commands, 0);
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.project.nodes.filter(node => node.materialSlots[0]?.materialId === "mat-1")).toHaveLength(2);
+    const updated = { ...material(), roughness: 0.9 };
+    expect(store.executeCommand({ commandId: "update", type: "UPDATE_MATERIAL", targetIds: ["mat-1"], payload: { material: updated } }, 1)).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials[0]?.roughness).toBe(0.9);
+    expect(store.executeCommand({ commandId: "same", type: "UPDATE_MATERIAL", targetIds: ["mat-1"], payload: { material: updated } }, 2)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.executeCommand({ commandId: "remove", type: "REMOVE_MATERIAL", targetIds: ["mat-1"], payload: { materialId: "mat-1" } }, 2)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    const saved = serializeProjectDocument(store.captureDocument().project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: store.captureDocument().project });
+    expect(store.undo(2)).toMatchObject({ ok: true });
+    expect(store.getSnapshot().document.project.materials[0]?.roughness).toBe(0.3);
+    expect(store.redo(3)).toMatchObject({ ok: true });
+    expect(store.getSnapshot().document.project.materials[0]?.roughness).toBe(0.9);
+    expect(applyProjectPatch(project, created.patch)).toEqual(created.project);
+  });
+
+  it("rejects malformed values, duplicates, locked nodes and partial transactions", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const bad = { ...material(), roughness: Infinity };
+    expect(bus.executeCommand(add(bad), 0)).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(bus.executeCommand(add({ ...material(), transmission: 0.5, opacity: 0.5 }), 0).ok).toBe(false);
+    expect(bus.executeCommand(add({ ...material(), ior: 3 }), 0).ok).toBe(false);
+    expect(bus.executeCommand(add({ ...material(), baseColor: [0, 1] as unknown as Material["baseColor"] }), 0).ok).toBe(false);
+    expect(bus.executeCommand(add(material("mesh-node")), 0)).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(bus.executeCommand(slot("mesh-node", "missing"), 0)).toMatchObject({ ok: false, code: "INVALID_REFERENCE" });
+    const before = bus.getSnapshot();
+    expect(bus.executeTransaction([add(material()), slot("mesh-node", "missing")], 0).ok).toBe(false);
+    expect(bus.getSnapshot()).toEqual(before);
+    expect(bus.executeCommand(add(material()), 0)).toMatchObject({ ok: true });
+    expect(bus.executeCommand(add(material()), 1)).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(bus.executeCommand({ commandId: "lock", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: true } }, 1).ok).toBe(true);
+    expect(bus.executeCommand(slot("mesh-node", "mat-1"), 2)).toMatchObject({ ok: false, code: "NODE_LOCKED" });
+    expect(bus.executeCommand(slot("mesh-node", "mat-1"), 1)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(bus.executeCommand({ commandId: "unlock", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: false, visible: false } }, 2).ok).toBe(true);
+    expect(bus.executeCommand(slot("mesh-node", "mat-1"), 3)).toMatchObject({ ok: false, code: "NODE_HIDDEN" });
+  });
+
+  it("unassigns then removes an unused material in one reversible transaction", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    const created = bus.executeTransaction([add(material()), slot("mesh-node", "mat-1")], 0);
+    expect(created.ok).toBe(true);
+    const removed = bus.executeTransaction([slot("mesh-node", null, "clear"),
+      { commandId: "remove", type: "REMOVE_MATERIAL", targetIds: ["mat-1"], payload: { materialId: "mat-1" } }], 1);
+    expect(removed.ok).toBe(true);
+    if (!removed.ok) return;
+    expect(bus.applyHistoryPatch(removed.undoPatch, 2)).toMatchObject({ ok: true });
+    expect(bus.getSnapshot().nodes.find(node => node.id === "mesh-node")?.materialSlots[0]?.materialId).toBe("mat-1");
+  });
+  it("replays replacement of an unused material at the same catalog index", () => {
+    const bus = createCommandBus(createNestedMeshProject());
+    expect(bus.executeCommand(add(material("old")), 0).ok).toBe(true);
+    const before = bus.getSnapshot();
+    const result = bus.executeTransaction([
+      { commandId: "remove-old", type: "REMOVE_MATERIAL", targetIds: ["old"], payload: { materialId: "old" } },
+      add(material("new")),
+    ], 1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(applyProjectPatch(before, result.patch)).toEqual(result.project);
+    expect(bus.applyHistoryPatch(result.undoPatch, 2)).toMatchObject({ ok: true, project: before });
+  });
+  it("round-trips shared material references through the native archive", async () => {
+    const project = createNestedMeshProject();
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    const copy = structuredClone(mesh); copy.id = "mesh-2"; project.nodes.push(copy);
+    project.nodes.find(node => node.id === "nested-group")!.children.push(copy.id);
+    const bus = createCommandBus(project);
+    const result = bus.executeTransaction([add(material()), slot(mesh.id, "mat-1", "slot-a"), slot(copy.id, "mat-1", "slot-b")], 0);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const archive = await createNativeProjectArchive(result.project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (!archive.ok) return;
+    const reopened = await openNativeProjectArchive(archive.value);
+    expect(reopened.ok && reopened.value.project).toEqual(result.project);
+  });
+});
+</file>
+
 <file path="tests/domain/mirror-commands.test.ts">
 import { describe, expect, it } from "vitest";
 import { createCommandBus, type ProjectCommand } from "../../src/domain/command-bus";
@@ -10132,6 +10253,34 @@ export class AssetBytes {
   delete(id: string): void { this.values.delete(id); }
   clear(): void { this.values.clear(); }
   clone(): AssetBytes { return new AssetBytes(this.values); }
+}
+</file>
+
+<file path="src/assets/three-resources.ts">
+import { Mesh, Texture, type Object3D } from "three";
+
+/** Each decoded/primitive subtree owns its resources; sharing inside it is deduplicated.
+ * No resources are shared across independently owned subtrees. */
+export function disposeObject(root: Object3D): void {
+  const resources = new Set<{ dispose(): void }>();
+  const images = new Set<ImageBitmap>();
+  root.traverse((object) => {
+    if (!(object instanceof Mesh)) return;
+    resources.add(object.geometry);
+    const retained = object.userData.originalMaterials as unknown;
+    const originals = Array.isArray(retained) ? retained.filter((item): item is typeof object.material => item && typeof item === "object" && "dispose" in item) : [];
+    for (const material of [...(Array.isArray(object.material) ? object.material : [object.material]), ...originals].flat()) {
+      resources.add(material);
+      for (const value of Object.values(material)) if (value instanceof Texture) {
+        resources.add(value);
+        if (typeof ImageBitmap !== "undefined" && value.image instanceof ImageBitmap) images.add(value.image);
+      }
+    }
+  });
+  for (const resource of resources) resource.dispose();
+  for (const image of images) image.close();
+  root.removeFromParent();
+  root.clear();
 }
 </file>
 
@@ -12819,18 +12968,6 @@ export default tseslint.config(
 );
 </file>
 
-<file path="src/domain/index.ts">
-export { createProject } from "./create-project";
-export type { IdFactory } from "./create-project";
-export { validateProject } from "./validate-project";
-export type { ValidationCode, ValidationIssue } from "./validate-project";
-export type * from "./types";
-export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
-export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
-export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
-export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
-</file>
-
 <file path="src/geometry/mesh-edit.ts">
 import * as T from "three";
 import type { MeshSource, Vec3 } from "../domain/types";
@@ -13123,96 +13260,6 @@ export function extrudeEditableFace(source: EditableMeshSource, faceId: number, 
 }
 </file>
 
-<file path="src/renderer/modifier-preview.ts">
-import type { EditorStore } from "../app/editor-store";
-import type { Project } from "../domain/types";
-import { ModifierEvaluator } from "../geometry/modifiers";
-import type { EvaluationResult } from "../geometry/modifiers/types";
-import type { SceneSync } from "./scene-sync";
-
-/** Serializes renderer-owned evaluations. A cancelled job may settle before its Worker does. */
-export class ModifierPreview {
-  private readonly evaluator: ModifierEvaluator;
-  private generation = -1;
-  private epoch: object | undefined;
-  private token = 0;
-  private active = false;
-  private closed = false;
-  private pending: Promise<void> = Promise.resolve();
-  constructor(private store: EditorStore, private scene: SceneSync, evaluator?: ModifierEvaluator) {
-    this.evaluator = evaluator ?? new ModifierEvaluator();
-  }
-  sync(): void {
-    if (this.closed) return;
-    const state = this.store.getSnapshot();
-    const epoch = this.store.getProjectEpoch();
-    if (this.generation === state.derived.generation && this.epoch === epoch) return;
-    this.generation = state.derived.generation; this.epoch = epoch;
-    const token = ++this.token;
-    if (this.active) this.store.jobs.cancelJob();
-    const project = state.document.project;
-    this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
-    const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
-    const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));
-    this.pending = this.pending.then(async () => {
-      for (const node of nodes) {
-        if (!this.current(token, epoch)) return;
-        if (node.kind !== "mesh") continue;
-        if (node.meshSource.kind === "asset") {
-          this.scene.setModifierDiagnostics(node.id, ["Модификаторы для GLB пока недоступны; показана исходная геометрия."]);
-          continue;
-        }
-        try { await this.evaluate(project as Project, node.id, token, epoch); }
-        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра модификатора."]); }
-      }
-    });
-  }
-  private current(token: number, epoch: object): boolean {
-    return !this.closed && token === this.token && epoch === this.store.getProjectEpoch()
-      && this.generation === this.store.getSnapshot().derived.generation;
-  }
-  private async evaluate(project: Project, nodeId: string, token: number, epoch: object): Promise<void> {
-    let result: EvaluationResult | undefined;
-    let computation: Promise<EvaluationResult> | undefined;
-    this.active = true;
-    try {
-    const outcome = await this.store.jobs.run({
-      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление модификаторов", cancellable: true,
-      validate: () => null,
-      compute: async (_input, signal) => {
-        computation = this.evaluator.evaluate(project, nodeId, signal);
-        result = await computation;
-        return result.ok ? { ok: true as const, value: result } : {
-          ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` },
-        };
-      },
-    });
-    // JobController releases the UI immediately on Cancel; wait for the evaluator to
-    // release its single active slot before scheduling another node or generation.
-    if (computation) await computation;
-    if (!this.current(token, epoch)) return;
-    if (outcome.ok && result?.ok) {
-      const messages = result.warnings.map(warning => warning.message);
-      if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
-      this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
-    } else if (!outcome.ok) {
-      const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;
-      if (result && !result.ok && result.fallback && result.mesh) {
-        this.scene.setDerived(nodeId, result.mesh, !!result.empty, [`Fallback последнего валидного этапа: ${description}`]);
-      } else this.scene.setModifierDiagnostics(nodeId, [`${description}; показана исходная геометрия.`]);
-      if (outcome.status === "cancelled") this.token++;
-    }
-    } finally { this.active = false; }
-  }
-  dispose(): void {
-    if (this.closed) return;
-    this.closed = true; this.token++;
-    if (this.active) this.store.jobs.cancelJob();
-    this.evaluator.dispose();
-  }
-}
-</file>
-
 <file path="src/renderer/primitive.ts">
 export { primitiveGeometry } from "../geometry/primitive-geometry";
 </file>
@@ -13343,14 +13390,181 @@ describe("native project archive", () => {
 });
 </file>
 
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
+}
+</file>
+
+<file path="src/domain/index.ts">
+export { createProject } from "./create-project";
+export type { IdFactory } from "./create-project";
+export { validateProject } from "./validate-project";
+export { validateMaterial } from "./validate-material";
+export type { ValidationCode, ValidationIssue } from "./validate-project";
+export type * from "./types";
+export { serializeProjectDocument, deserializeProjectDocument, validateNativeManifest, migrateProjectDocument, DOCUMENT_SCHEMA_VERSION, NATIVE_FORMAT_VERSION, SERIALIZATION_LIMITS } from "./project-serialization";
+export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
+export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
+export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
+<file path="src/renderer/modifier-preview.ts">
+import type { EditorStore } from "../app/editor-store";
+import type { Project } from "../domain/types";
+import { ModifierEvaluator } from "../geometry/modifiers";
+import type { EvaluationResult } from "../geometry/modifiers/types";
+import type { SceneSync } from "./scene-sync";
+
+/** Serializes renderer-owned evaluations. A cancelled job may settle before its Worker does. */
+export class ModifierPreview {
+  private readonly evaluator: ModifierEvaluator;
+  private generation = -1;
+  private epoch: object | undefined;
+  private geometryKey = "";
+  private token = 0;
+  private active = false;
+  private closed = false;
+  private pending: Promise<void> = Promise.resolve();
+  constructor(private store: EditorStore, private scene: SceneSync, evaluator?: ModifierEvaluator) {
+    this.evaluator = evaluator ?? new ModifierEvaluator();
+  }
+  sync(): void {
+    if (this.closed) return;
+    const state = this.store.getSnapshot();
+    const epoch = this.store.getProjectEpoch();
+    if (this.generation === state.derived.generation && this.epoch === epoch) return;
+    const project = state.document.project;
+    const geometryKey = JSON.stringify([project.nodes.map(node => [node.id, node.parentId, node.transform, node.kind === "mesh" ? node.meshSource : null, node.modifierIds]), project.modifiers, project.assets]);
+    if (this.epoch === epoch && this.geometryKey === geometryKey) { this.generation = state.derived.generation; return; }
+    this.geometryKey = geometryKey;
+    this.generation = state.derived.generation; this.epoch = epoch;
+    const token = ++this.token;
+    if (this.active) this.store.jobs.cancelJob();
+    this.scene.resetDerived(project, this.store.readAssetBytes, epoch);
+    const modifiers = new Map(project.modifiers.map(modifier => [modifier.id, modifier]));
+    const nodes = project.nodes.filter(node => node.kind === "mesh" && node.modifierIds.some(id => modifiers.get(id)?.enabled));
+    this.pending = this.pending.then(async () => {
+      for (const node of nodes) {
+        if (!this.current(token, epoch)) return;
+        if (node.kind !== "mesh") continue;
+        if (node.meshSource.kind === "asset") {
+          this.scene.setModifierDiagnostics(node.id, ["Модификаторы для GLB пока недоступны; показана исходная геометрия."]);
+          continue;
+        }
+        try { await this.evaluate(project as Project, node.id, token, epoch); }
+        catch (error) { if (this.current(token, epoch)) this.scene.setModifierDiagnostics(node.id, [error instanceof Error ? error.message : "Ошибка предпросмотра модификатора."]); }
+      }
+    });
+  }
+  private current(token: number, epoch: object): boolean {
+    return !this.closed && token === this.token && epoch === this.store.getProjectEpoch()
+      && this.generation === this.store.getSnapshot().derived.generation;
+  }
+  private async evaluate(project: Project, nodeId: string, token: number, epoch: object): Promise<void> {
+    let result: EvaluationResult | undefined;
+    let computation: Promise<EvaluationResult> | undefined;
+    this.active = true;
+    try {
+    const outcome = await this.store.jobs.run({
+      id: `modifier-preview-${token}-${nodeId}`, name: "Вычисление модификаторов", cancellable: true,
+      validate: () => null,
+      compute: async (_input, signal) => {
+        computation = this.evaluator.evaluate(project, nodeId, signal);
+        result = await computation;
+        return result.ok ? { ok: true as const, value: result } : {
+          ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` },
+        };
+      },
+    });
+    // JobController releases the UI immediately on Cancel; wait for the evaluator to
+    // release its single active slot before scheduling another node or generation.
+    if (computation) await computation;
+    if (!this.current(token, epoch)) return;
+    if (outcome.ok && result?.ok) {
+      const messages = result.warnings.map(warning => warning.message);
+      if (result.empty) messages.push("Результат Boolean пуст; геометрия узла не отображается.");
+      this.scene.setDerived(nodeId, result.mesh, result.empty, messages);
+    } else if (!outcome.ok) {
+      const description = result && !result.ok ? `${result.error.code}: ${result.error.message}` : `${outcome.error.code}: ${outcome.error.message}`;
+      if (result && !result.ok && result.fallback && result.mesh) {
+        this.scene.setDerived(nodeId, result.mesh, !!result.empty, [`Fallback последнего валидного этапа: ${description}`]);
+      } else this.scene.setModifierDiagnostics(nodeId, [`${description}; показана исходная геометрия.`]);
+      if (outcome.status === "cancelled") this.token++;
+    }
+    } finally { this.active = false; }
+  }
+  dispose(): void {
+    if (this.closed) return;
+    this.closed = true; this.token++;
+    if (this.active) this.store.jobs.cancelJob();
+    this.evaluator.dispose();
+  }
+}
+</file>
+
 <file path="tests/renderer/scene-sync.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
 import { SceneSync } from "../../src/renderer/scene-sync";
-import { createNestedMeshProject, emptyProject } from "../fixtures/projects";
+import { createNestedMeshProject, createMaterialAnimationProject, emptyProject } from "../fixtures/projects";
 
 const noAssets = () => undefined;
 describe("domain scene synchronization", () => {
+  it("updates a shared PBR material without replacing geometry or mesh", () => {
+    const project = createMaterialAnimationProject();
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const content = sync.objects.get("mesh-node")!.content as T.Mesh;
+    const geometry = content.geometry;
+    const old = content.material as T.MeshPhysicalMaterial;
+    const disposed = vi.spyOn(old, "dispose");
+    project.materials[0]!.roughness = 0.8;
+    project.materials[0]!.baseColor = [0.1, 0.2, 0.3];
+    sync.sync(project, noAssets);
+    expect(sync.objects.get("mesh-node")!.content).toBe(content);
+    expect(content.geometry).toBe(geometry);
+    expect(disposed).toHaveBeenCalledOnce();
+    expect((content.material as T.MeshPhysicalMaterial).roughness).toBe(0.8);
+    expect((content.material as T.MeshPhysicalMaterial).color.toArray()).toEqual([0.1, 0.2, 0.3]);
+    sync.dispose();
+  });
+  it("retains imported texture ownership while a domain override changes", async () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    if (mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "asset", assetId: "glb" };
+    project.assets.push({ id: "glb", hash: "f".repeat(64), path: `assets/${"f".repeat(64)}.glb`, mediaType: "model/gltf-binary", colorSpace: "none" });
+    const texture = new T.Texture();
+    const original = new T.MeshStandardMaterial({ map: texture });
+    const disposedTexture = vi.spyOn(texture, "dispose");
+    const disposedOriginal = vi.spyOn(original, "dispose");
+    const sync = new SceneSync(() => {}, async () => new T.Mesh(new T.BoxGeometry(), original));
+    sync.sync(project, () => new Uint8Array([1]));
+    await Promise.resolve(); await Promise.resolve();
+    project.materials[0]!.roughness = 0.9;
+    sync.sync(project, () => new Uint8Array([1]));
+    expect(disposedTexture).not.toHaveBeenCalled();
+    expect(disposedOriginal).not.toHaveBeenCalled();
+    sync.dispose();
+    expect(disposedTexture).toHaveBeenCalledOnce();
+    expect(disposedOriginal).toHaveBeenCalledOnce();
+  });
   it("keeps wrapper and geometry identity while reparenting and reordering", () => {
     const project = createNestedMeshProject();
     const root = project.nodes[0]!;
@@ -13448,27 +13662,6 @@ describe("domain scene synchronization", () => {
     sync.dispose();
   });
 });
-</file>
-
-<file path="tsconfig.json">
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "resolveJsonModule": true,
-    "jsx": "react-jsx",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
-    "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "lib": ["ES2022", "DOM"]
-  },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "vite.config.ts"]
-}
 </file>
 
 <file path="src/geometry/modifiers/index.ts">
@@ -14578,20 +14771,24 @@ export function applyTransform(object: T.Object3D, transform: Transform): void {
 function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
   if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
   return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.transmission > 0 ? 1 : value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
     transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
 }
+const editorMaterials = new WeakSet<T.Material>();
+function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  const created = material(value); editorMaterials.add(created); return created;
+}
 function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
-  const oldMaterials = new Set<T.Material>(); const oldTextures = new Set<T.Texture>();
+  const oldMaterials = new Set<T.Material>();
   content.traverse(object => { if (!(object instanceof T.Mesh)) return;
     for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
-      oldMaterials.add(old);
-      for (const value of Object.values(old)) if (value instanceof T.Texture) oldTextures.add(value);
+      if (editorMaterials.has(old)) oldMaterials.add(old);
+      else if (!object.userData.originalMaterials) object.userData.originalMaterials = Array.isArray(object.material) ? [...object.material] : [object.material];
     }
-    object.material = values.length > 1 ? values.map(value => material(value)) : material(values[0]);
+    object.material = values.length > 1 && object.geometry.groups.length > 0
+      ? values.map(value => ownedMaterial(value)) : ownedMaterial(values[0]);
   });
   for (const old of oldMaterials) old.dispose();
-  for (const texture of oldTextures) { texture.dispose(); if (typeof ImageBitmap !== "undefined" && texture.image instanceof ImageBitmap) texture.image.close(); }
 }
 
 export class SceneSync {
@@ -14671,8 +14868,8 @@ export class SceneSync {
         this.surfaces.register(node.id, next.object, content); this.emit();
       };
       try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), material(materials[0])));
-        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), material(materials[0])));
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), ownedMaterial(materials[0])));
+        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), ownedMaterial(materials[0])));
         else {
           if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
           const bytes = readAsset(source.assetId);
@@ -14718,7 +14915,7 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
-        content = new T.Mesh(geometry, material(this.nodeMaterials.get(nodeId)));
+        content = new T.Mesh(geometry, ownedMaterial(this.nodeMaterials.get(nodeId)));
       }
       if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
       if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
@@ -15736,6 +15933,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { parseBevelParameters } from "../geometry/modifiers/bevel";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
+import { validateMaterial } from "./validate-material";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -15828,7 +16026,15 @@ export function validateProject(project: Project): ValidationIssue[] {
         if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
       }
     }
-    for (const [slotIndex, slot] of node.materialSlots.entries()) reference(slot.materialId, materialIds, `nodes.${node.id}.materialSlots[${slotIndex}].materialId`);
+    const slotNames = new Set<string>();
+    if (node.kind !== "mesh" && node.materialSlots.length) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.materialSlots`, message: "Слоты материалов разрешены только у mesh." });
+    for (const [slotIndex, slot] of node.materialSlots.entries()) {
+      const path = `nodes.${node.id}.materialSlots[${slotIndex}]`;
+      if (!slot || typeof slot.name !== "string" || !slot.name.trim() || slotNames.has(slot.name))
+        issues.push({ code: "INVALID_STRUCTURE", path: `${path}.name`, message: "Имя слота должно быть непустым и уникальным." });
+      else slotNames.add(slot.name);
+      reference(slot.materialId, materialIds, `${path}.materialId`);
+    }
     const seenModifiers = new Set<EntityId>();
     for (const [modifierIndex, modifierId] of node.modifierIds.entries()) {
       if (seenModifiers.has(modifierId)) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.modifierIds[${modifierIndex}]`, message: "ID модификатора повторяется в стеке." });
@@ -15962,11 +16168,8 @@ export function validateProject(project: Project): ValidationIssue[] {
     }
   }
   for (const material of project.materials) {
-    [material.metalness, material.roughness, material.opacity, material.transmission, material.ior, material.clearcoat, material.envIntensity]
-      .forEach((value, index) => finite(value, `materials.${material.id}.pbr[${index}]`));
-    material.baseColor.forEach((value, index) => finite(value, `materials.${material.id}.baseColor[${index}]`));
-    material.emissive.forEach((value, index) => finite(value, `materials.${material.id}.emissive[${index}]`));
-    material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+    issues.push(...validateMaterial(material, `materials.${material.id}`));
+    if (Array.isArray(material.textureAssetIds)) material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
   }
   for (const clip of project.animations) {
     finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);
@@ -16853,8 +17056,9 @@ function EditorShell() {
 </file>
 
 <file path="src/domain/command-bus.ts">
-import type { Asset, EntityId, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
+import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
+import { validateMaterial } from "./validate-material";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import type { ArrayParameters } from "../geometry/modifiers/types";
 import { parseArrayParameters } from "../geometry/modifiers/array";
@@ -16870,6 +17074,10 @@ import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, ty
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
+  | { commandId: string; type: "UPDATE_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
+  | { commandId: string; type: "REMOVE_MATERIAL"; targetIds: [EntityId]; payload: { materialId: EntityId } }
+  | { commandId: string; type: "SET_MATERIAL_SLOT"; targetIds: [EntityId] | [EntityId, EntityId]; payload: { nodeId: EntityId; slotName: string; materialId: EntityId | null } }
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
   | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
   | { commandId: string; type: "RENAME_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId; name: string } }
@@ -16910,6 +17118,10 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | { kind: "addMaterial"; material: Material; index: number }
+  | { kind: "removeMaterial"; material: Material; index: number }
+  | { kind: "setMaterial"; materialId: EntityId; before: Material; after: Material }
+  | { kind: "setMaterialSlots"; nodeId: EntityId; before: MaterialSlot[]; after: MaterialSlot[] }
   | { kind: "addNode"; node: Node }
   | { kind: "removeNode"; node: Node }
   | { kind: "addAsset"; asset: Asset }
@@ -16983,6 +17195,13 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_MATERIAL" || value.type === "UPDATE_MATERIAL") return ownKeys(payload, ["material"])
+    && validateMaterial(payload.material).length === 0 && same(value.targetIds, [(payload.material as Material).id]);
+  if (value.type === "REMOVE_MATERIAL") return ownKeys(payload, ["materialId"])
+    && id(payload.materialId) && same(value.targetIds, [payload.materialId]);
+  if (value.type === "SET_MATERIAL_SLOT") return ownKeys(payload, ["nodeId", "slotName", "materialId"])
+    && id(payload.nodeId) && typeof payload.slotName === "string" && !!payload.slotName.trim()
+    && (payload.materialId === null || id(payload.materialId)) && same(value.targetIds, payload.materialId === null ? [payload.nodeId] : [payload.nodeId, payload.materialId]);
   if (value.type === "ADD_BOOLEAN_MODIFIER") return ownKeys(payload, ["nodeId", "modifierId", "operation", "cutterNodeId"])
     && id(payload.nodeId) && id(payload.modifierId) && id(payload.cutterNodeId)
     && booleanOperation(payload.operation) && same(value.targetIds, [payload.nodeId, payload.modifierId, payload.cutterNodeId]);
@@ -17157,6 +17376,41 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_MATERIAL") {
+    if (entityIds(project).has(command.payload.material.id)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID материала уже занят.");
+    project.materials.push(structuredClone(command.payload.material)); return null;
+  }
+  if (command.type === "UPDATE_MATERIAL") {
+    const index = project.materials.findIndex(item => item.id === command.payload.material.id);
+    if (index < 0) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    if (!same(project.materials[index], command.payload.material)) project.materials[index] = structuredClone(command.payload.material);
+    return null;
+  }
+  if (command.type === "REMOVE_MATERIAL") {
+    const index = project.materials.findIndex(item => item.id === command.payload.materialId);
+    if (index < 0) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    if (project.nodes.some(node => node.materialSlots.some(slot => slot.materialId === command.payload.materialId)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал назначен узлу. Сначала снимите назначение.");
+    project.materials.splice(index, 1); return null;
+  }
+  if (command.type === "SET_MATERIAL_SLOT") {
+    const { nodeId, slotName, materialId } = command.payload;
+    const node = nodeById(project, nodeId);
+    if (!node || node.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Mesh-узел не найден.");
+    const block = blocked(project, node);
+    if (block) return failure(command.commandId, block, "Узел недоступен для редактирования.");
+    if (materialId !== null && !project.materials.some(item => item.id === materialId))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Материал не найден.");
+    const matches = node.materialSlots.filter(slot => slot.name === slotName);
+    if (matches.length > 1) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Имя слота повторяется.");
+    // Geometry without material groups has only one effective slot.
+    if (materialId !== null && matches.length === 0 && node.materialSlots.length > 0)
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Для этой геометрии доступен только один действующий слот.");
+    if (materialId === null) node.materialSlots = node.materialSlots.filter(slot => slot.name !== slotName);
+    else if (matches.length) node.materialSlots = node.materialSlots.map(slot => slot.name === slotName ? { name: slotName, materialId } : slot);
+    else node.materialSlots.push({ name: slotName, materialId });
+    return null;
+  }
   if (command.type === "MOVE_NODE") {
     const node = nodeById(project, command.payload.nodeId); const parent = nodeById(project, command.payload.parentId);
     if (!node || !parent) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Узел или новая группа не найдены.");
@@ -17396,11 +17650,20 @@ function entityIds(project: Project): Set<string> {
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
   for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
+  for (const [index, material] of [...before.materials.entries()].reverse()) if (!after.materials.some(item => item.id === material.id))
+    changes.push({ kind: "removeMaterial", material: structuredClone(material), index });
+  for (const [index, material] of after.materials.entries()) {
+    const old = before.materials.find(item => item.id === material.id);
+    if (!old) changes.push({ kind: "addMaterial", material: structuredClone(material), index });
+    else if (!same(old, material)) changes.push({ kind: "setMaterial", materialId: material.id, before: structuredClone(old), after: structuredClone(material) });
+  }
   for (const node of after.nodes) {
     const old = before.nodes.find((entry) => entry.id === node.id);
     if (!old) { changes.push({ kind: "addNode", node: structuredClone(node) }); continue; }
     if (!same(old.modifierIds, node.modifierIds)) changes.push({ kind: "setModifierIds", nodeId: node.id,
       before: structuredClone(old.modifierIds), after: structuredClone(node.modifierIds) });
+    if (!same(old.materialSlots, node.materialSlots)) changes.push({ kind: "setMaterialSlots", nodeId: node.id,
+      before: structuredClone(old.materialSlots), after: structuredClone(node.materialSlots) });
     for (const field of ["name", "transform", "visible", "locked", "children", "parentId"] as const) {
       if (!same(old[field], node[field])) changes.push({ kind: "setNode", nodeId: node.id, field,
         before: structuredClone(old[field]), after: structuredClone(node[field]) });
@@ -17426,6 +17689,10 @@ function inverse(patch: ProjectPatch): ProjectPatch {
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
     if (change.kind === "removeAsset") return { kind: "addAsset", asset: structuredClone(change.asset) };
+    if (change.kind === "addMaterial") return { kind: "removeMaterial", material: structuredClone(change.material), index: change.index };
+    if (change.kind === "removeMaterial") return { kind: "addMaterial", material: structuredClone(change.material), index: change.index };
+    if (change.kind === "setMaterial") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
+    if (change.kind === "setMaterialSlots") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "addModifier") return { kind: "removeModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "removeModifier") return { kind: "addModifier", modifier: structuredClone(change.modifier), index: change.index };
     if (change.kind === "modelRevision") return { kind: "modelRevision", before: change.after, after: change.before };
@@ -17440,7 +17707,21 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
-    if (change.kind === "addAsset") {
+    if (change.kind === "addMaterial") {
+      if (entityIds(result).has(change.material.id) || change.index < 0 || change.index > result.materials.length) throw new Error("Patch material conflict");
+      result.materials.splice(change.index, 0, structuredClone(change.material));
+    } else if (change.kind === "removeMaterial") {
+      if (!same(result.materials[change.index], change.material)) throw new Error("Patch material conflict");
+      result.materials.splice(change.index, 1);
+    } else if (change.kind === "setMaterial") {
+      const index = result.materials.findIndex(item => item.id === change.materialId);
+      if (index < 0 || !same(result.materials[index], change.before) || change.after.id !== change.materialId) throw new Error("Patch material conflict");
+      result.materials[index] = structuredClone(change.after);
+    } else if (change.kind === "setMaterialSlots") {
+      const node = result.nodes.find(item => item.id === change.nodeId);
+      if (!node || node.kind !== "mesh" || !same(node.materialSlots, change.before)) throw new Error("Patch material slots conflict");
+      node.materialSlots = structuredClone(change.after);
+    } else if (change.kind === "addAsset") {
       if (entityIds(result).has(change.asset.id) || result.assets.some((asset) => asset.path === change.asset.path)) throw new Error("Patch asset conflict");
       result.assets.push(structuredClone(change.asset));
     } else if (change.kind === "removeAsset") {

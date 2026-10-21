@@ -7,6 +7,7 @@ import { primitiveGeometry } from "./primitive";
 import { editableGeometry } from "../geometry/mesh-edit";
 import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
+import { createPhysicalMaterial } from "./pbr-material";
 
 export type RenderProject = DeepReadonly<Project>;
 export type AssetReader = (id: string) => Uint8Array | undefined;
@@ -28,15 +29,9 @@ export function applyTransform(object: T.Object3D, transform: Transform): void {
   object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
   object.updateMatrix();
 }
-function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
-  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
-    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
-}
 const editorMaterials = new WeakSet<T.Material>();
 function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  const created = material(value); editorMaterials.add(created); return created;
+  const created = createPhysicalMaterial(value); editorMaterials.add(created); return created;
 }
 function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
   const oldMaterials = new Set<T.Material>();
