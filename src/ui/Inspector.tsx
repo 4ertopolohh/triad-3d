@@ -174,6 +174,8 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
   const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
   const [moveError, setMoveError] = useState("");
   const [scaleError, setScaleError] = useState("");
+  const [extrudeDistance, setExtrudeDistance] = useState("0.25");
+  const [extrudeError, setExtrudeError] = useState("");
   const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
   const epoch = store.getProjectEpoch();
   if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
@@ -200,6 +202,21 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
       : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
     setError(result.ok ? "" : result.message);
   }
+  function extrude() {
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.project.id !== state.document.project.id || current.document.revision !== state.document.revision
+      || store.getProjectEpoch() !== epoch || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)
+      || current.selection.ids.length !== 1 || current.selection.activeId !== nodeId || current.tool.mode !== "model"
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.mode !== "face" || current.meshEdit.faceIds.length !== 1) {
+      setExtrudeError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = parseNumber(extrudeDistance);
+    if (!parsed.ok) { setExtrudeError(parsed.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "EXTRUDE_EDITABLE_FACE", targetIds: [nodeId],
+      payload: { nodeId, faceId: current.meshEdit.faceIds[0]!, distance: parsed.value } }, current.document.revision);
+    setExtrudeError(result.ok ? "" : result.message);
+  }
   const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
   const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
   const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
@@ -213,6 +230,16 @@ function VertexEditor({ store, state, blocked }: { store: EditorStore; state: Ed
     <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
     <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
     {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
+    {state.meshEdit.mode === "face" && <div className="mesh-edit-actions"><h4>Выдавливание грани</h4>
+      <p className="panel-hint">Выдавливание выполняется вдоль локальной нормали выбранной грани.</p>
+      <label>Глубина выдавливания<input type="text" inputMode="decimal" aria-label="Глубина выдавливания" value={extrudeDistance}
+        onChange={event => { setExtrudeDistance(event.target.value); setExtrudeError(""); }}
+        onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); extrude(); } }} /></label>
+      <button type="button" disabled={!!reason || state.meshEdit.faceIds.length !== 1}
+        title={reason || (state.meshEdit.faceIds.length !== 1 ? "Выберите ровно одну грань." : undefined)} onClick={extrude}>Выдавить грань</button>
+      {state.meshEdit.faceIds.length !== 1 && <p className="panel-hint">Выберите ровно одну грань.</p>}
+      {extrudeError && <p className="primitive-error" role="alert">{extrudeError}</p>}
+    </div>}
   </section>;
 }
 

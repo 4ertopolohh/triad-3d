@@ -6,7 +6,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
-import { convertPrimitiveToEditable, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
+import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
@@ -19,6 +19,7 @@ export type ProjectCommand =
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
   | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
+  | { commandId: string; type: "EXTRUDE_EDITABLE_FACE"; targetIds: [EntityId]; payload: { nodeId: EntityId; faceId: number; distance: number } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
@@ -174,6 +175,9 @@ function validCommand(value: unknown): value is ProjectCommand {
       && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
       && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
       && numbers(payload.factors, 3);
+    case "EXTRUDE_EDITABLE_FACE": return ownKeys(payload, ["nodeId", "faceId", "distance"])
+      && Number.isSafeInteger(payload.faceId) && (payload.faceId as number) >= 0
+      && typeof payload.distance === "number" && Number.isFinite(payload.distance);
     case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
     case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
     case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
@@ -462,12 +466,15 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       break;
     case "TRANSLATE_EDITABLE_VERTICES":
     case "SCALE_EDITABLE_VERTICES":
+    case "EXTRUDE_EDITABLE_FACE":
       if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
         const source = command.type === "TRANSLATE_EDITABLE_VERTICES"
           ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
-          : scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors);
+          : command.type === "SCALE_EDITABLE_VERTICES"
+            ? scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors)
+            : extrudeEditableFace(current.meshSource, command.payload.faceId, command.payload.distance);
         if (source !== current.meshSource && (current.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled) || activeDependents(project, current.id)))
           return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перед редактированием отключите активные модификаторы и зависимые Boolean.");
         next = source === current.meshSource ? current : { ...current, meshSource: source };

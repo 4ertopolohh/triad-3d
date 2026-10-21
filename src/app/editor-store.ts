@@ -127,9 +127,9 @@ export function createEditorStore(initialProject: Project): EditorStore {
     const changed = patch?.changes.some(change => change.kind === "setMeshSource" && change.nodeId === old.nodeId);
     if (changed) {
       const change = patch!.changes.find(item => item.kind === "setMeshSource" && item.nodeId === old.nodeId);
-      if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable"
-        || JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
-        || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return emptyMeshEdit();
+      if (change?.kind !== "setMeshSource" || change.before.kind !== "editable" || change.after.kind !== "editable") return emptyMeshEdit();
+      if (JSON.stringify(change.before.indices) !== JSON.stringify(change.after.indices)
+        || JSON.stringify(change.before.uv) !== JSON.stringify(change.after.uv)) return subEdit(old.mode, old.nodeId!);
       // Edge and face IDs describe the old geometric embedding; re-pick after a geometry edit.
       if (old.mode !== "vertex") return subEdit(old.mode, old.nodeId!);
     }
