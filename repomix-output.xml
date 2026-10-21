@@ -5229,103 +5229,6 @@ export async function evaluateMirror(mesh: MeshData, params: MirrorParameters, s
 }
 </file>
 
-<file path="src/geometry/mesh-edit.ts">
-import * as T from "three";
-import type { MeshSource, Vec3 } from "../domain/types";
-import { primitiveGeometry } from "./primitive-geometry";
-import { MAX_CSG_INPUT_BYTES, validateMesh, type MeshData } from "./csg/core";
-
-export type EditableMeshSource = Extract<MeshSource, { kind: "editable" }>;
-type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
-type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
-
-/** Absolute coordinate quantization at 1e-6 local units. Keys are never written to the Project. */
-export const SEAM_TOLERANCE = 1e-6;
-const key = (positions: readonly number[], i: number): string =>
-  [0, 1, 2].map(axis => Math.round(positions[3 * i + axis]! / SEAM_TOLERANCE)).join(":");
-
-type Checked = { error: string; mesh?: never } | { error: null; mesh: MeshData };
-const invalid = (error: string): Checked => ({ error });
-
-function checkedEditableData(value: unknown): Checked {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return invalid("Редактируемая сетка должна быть объектом.");
-  const source = value as Partial<EditableMeshSource>;
-  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv"].includes(k)) || source.kind !== "editable")
-    return invalid("Некорректный тип или поле редактируемой сетки.");
-  if (!Array.isArray(source.positions) || !Array.isArray(source.indices) || source.positions.length % 3 || source.indices.length % 3 || !source.indices.length)
-    return invalid("Позиции и индексы должны задавать треугольники.");
-  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
-  if (source.positions.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))) return invalid("Координаты должны быть конечными Float32 числами.");
-  if (source.indices.some(n => !Number.isSafeInteger(n) || n < 0 || n >= source.positions!.length / 3 || n > 0xffffffff)) return invalid("Индекс вершины вне диапазона.");
-  if (source.uv !== undefined && (!Array.isArray(source.uv) || source.uv.length !== source.positions.length / 3 * 2 || source.uv.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))))
-    return invalid("UV должны содержать две конечные координаты на render vertex.");
-  const mesh = { positions: Float32Array.from(source.positions), indices: Uint32Array.from(source.indices) };
-  try { validateMesh(mesh); }
-  catch (error) { return invalid(error instanceof Error ? error.message : "Некорректная геометрия."); }
-  return { error: null, mesh };
-}
-
-export function validateEditableSource(value: unknown): string | null {
-  return checkedEditableData(value).error;
-}
-
-export function editableMeshData(source: EditableInput) {
-  const checked = checkedEditableData(source);
-  if (checked.error !== null) throw new Error(checked.error);
-  return checked.mesh;
-}
-
-export function editableGeometry(source: EditableInput): T.BufferGeometry {
-  const data = editableMeshData(source);
-  const geometry = new T.BufferGeometry();
-  geometry.setAttribute("position", new T.BufferAttribute(data.positions, 3));
-  geometry.setIndex(new T.BufferAttribute(data.indices, 1));
-  if (source.uv) geometry.setAttribute("uv", new T.Float32BufferAttribute(source.uv, 2));
-  geometry.computeVertexNormals();
-  return geometry;
-}
-
-export function convertPrimitiveToEditable(source: PrimitiveSource): EditableMeshSource {
-  if (source.primitive === "plane") throw new Error("Плоскость не является замкнутой сеткой для преобразования.");
-  const geometry = primitiveGeometry(source);
-  try {
-    const position = geometry.getAttribute("position");
-    const uvAttribute = geometry.getAttribute("uv");
-    const index = geometry.getIndex();
-    if (!position || position.itemSize !== 3) throw new Error("Примитив не содержит XYZ координат.");
-    const result: EditableMeshSource = {
-      kind: "editable",
-      positions: Array.from({ length: position.count * 3 }, (_, i) => position.getComponent(Math.floor(i / 3), i % 3)),
-      indices: index ? Array.from(index.array) : Array.from({ length: position.count }, (_, i) => i),
-      ...(uvAttribute ? { uv: Array.from({ length: uvAttribute.count * 2 }, (_, i) => uvAttribute.getComponent(Math.floor(i / 2), i % 2)) } : {}),
-    };
-    const error = validateEditableSource(result);
-    if (error) throw new Error(`Примитив нельзя преобразовать без потерь: ${error}`);
-    return result;
-  } finally { geometry.dispose(); }
-}
-
-/** Selection uses render vertex indices; all vertices with the same quantized local XYZ move together. */
-export function translateEditableVertices(source: EditableMeshSource, selected: readonly number[], delta: Vec3): EditableMeshSource {
-  const error = validateEditableSource(source);
-  if (error) throw new Error(error);
-  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
-    throw new Error("Выбор содержит несуществующую вершину.");
-  if (!Array.isArray(delta) || delta.length !== 3 || delta.some(n => !Number.isFinite(n))) throw new Error("Delta должна содержать три конечных числа.");
-  if (delta.every(n => n === 0)) return source;
-  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
-  const positions = source.positions.slice();
-  for (let i = 0; i < positions.length / 3; i++) {
-    if (!selectedKeys.has(key(source.positions, i))) continue;
-    for (let axis = 0; axis < 3; axis++) positions[3 * i + axis] = Math.fround(source.positions[3 * i + axis]! + delta[axis]!);
-  }
-  const result: EditableMeshSource = { ...source, positions };
-  const resultError = validateEditableSource(result);
-  if (resultError) throw new Error(resultError);
-  return result;
-}
-</file>
-
 <file path="src/geometry/mesh-topology.ts">
 type EditableMeshSource = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
 import { vertexKey } from "./vertex-selection";
@@ -7976,228 +7879,6 @@ describe("regular arrays", () => {
 });
 </file>
 
-<file path="tests/geometry/mesh-edit.test.ts">
-import { describe, expect, it, vi } from "vitest";
-import * as T from "three";
-import { AssetBytes } from "../../src/assets/asset-bytes";
-import { createEditorStore } from "../../src/app/editor-store";
-import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
-import { createCommandBus } from "../../src/domain/command-bus";
-import { createProject } from "../../src/domain/create-project";
-import { deserializeProjectDocument, serializeProjectDocument } from "../../src/domain/project-serialization";
-import type { MeshNode, Project } from "../../src/domain/types";
-import { ModifierEvaluator } from "../../src/geometry/modifiers";
-import { convertPrimitiveToEditable, translateEditableVertices, validateEditableSource } from "../../src/geometry/mesh-edit";
-import { createPrimitiveNode } from "../../src/geometry/primitives";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
-
-function fixture(): { project: Project; mesh: MeshNode } {
-  let id = 0;
-  const project = createProject(() => `id-${++id}`);
-  const root = project.nodes[0]!;
-  const mesh = createPrimitiveNode("cube", root.id, "cube");
-  root.children.push(mesh.id); project.nodes.push(mesh);
-  return { project, mesh };
-}
-const convert = () => ({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube" } });
-const translate = (vertexIndices: number[], delta: [number, number, number], commandId = "move") =>
-  ({ commandId, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube", vertexIndices, delta } });
-
-describe("editable mesh foundation", () => {
-  it.each(["cube", "sphere", "torus", "cylinder", "cone"] as const)("converts valid closed %s primitive", kind => {
-    const source = createPrimitiveNode(kind, "root", "mesh").meshSource;
-    if (source.kind !== "primitive") throw new Error("fixture");
-    expect(validateEditableSource(convertPrimitiveToEditable(source))).toBeNull();
-  });
-  it("diagnoses open primitive conversion", () => {
-    const source = createPrimitiveNode("plane", "root", "mesh").meshSource;
-    if (source.kind !== "primitive") throw new Error("fixture");
-    expect(() => convertPrimitiveToEditable(source)).toThrow(/Плоскость/);
-  });
-  it("converts cube with UV seams and moves every matching render vertex without changing input", () => {
-    const { mesh } = fixture();
-    if (mesh.meshSource.kind !== "primitive") throw new Error("fixture");
-    const original = structuredClone(mesh.meshSource);
-    const source = convertPrimitiveToEditable(mesh.meshSource);
-    expect(mesh.meshSource).toEqual(original);
-    expect(source.positions.length).toBe(72);
-    expect(source.uv?.length).toBe(48);
-    const point = source.positions.slice(0, 3);
-    const duplicates = Array.from({ length: source.positions.length / 3 }, (_, i) => i)
-      .filter(i => source.positions.slice(3 * i, 3 * i + 3).every((v, axis) => v === point[axis]));
-    expect(duplicates.length).toBeGreaterThan(1);
-    const moved = translateEditableVertices(source, [0, 0, duplicates[1]!], [0.1, 0, 0]);
-    expect(validateEditableSource(moved)).toBeNull();
-    expect(moved.indices).toEqual(source.indices);
-    expect(moved.uv).toEqual(source.uv);
-    for (const i of duplicates) expect(moved.positions[3 * i]).toBeCloseTo(point[0]! + 0.1);
-    expect(source.positions.slice(0, 3)).toEqual(point);
-    const again = translateEditableVertices(moved, [duplicates[0]!], [0, 0.1, 0]);
-    expect(again.positions[1]).toBeCloseTo(point[1]! + 0.1);
-    expect(translateEditableVertices(again, [0], [0, 0, 0])).toBe(again);
-  });
-
-  it("rejects bad selection, nonfinite values, overflow and degenerate triangles", () => {
-    const { mesh } = fixture();
-    if (mesh.meshSource.kind !== "primitive") throw new Error("fixture");
-    const source = convertPrimitiveToEditable(mesh.meshSource);
-    expect(() => translateEditableVertices(source, [], [1, 0, 0])).toThrow();
-    expect(() => translateEditableVertices(source, [999], [1, 0, 0])).toThrow();
-    expect(() => translateEditableVertices(source, [0], [Infinity, 0, 0])).toThrow();
-    expect(validateEditableSource({ ...source, indices: [0, 1, 999] })).not.toBeNull();
-    expect(validateEditableSource({ ...source, positions: [NaN, ...source.positions.slice(1)] })).not.toBeNull();
-    const a = source.indices[0]!, b = source.indices[1]!;
-    const delta: [number, number, number] = [0, 1, 2].map(axis => source.positions[3 * b + axis]! - source.positions[3 * a + axis]!) as [number, number, number];
-    expect(() => translateEditableVertices(source, [a], delta)).toThrow(/вырожденный/i);
-    expect(validateEditableSource(source)).toBeNull();
-  });
-
-  it("commits semantic commands, rejects stale/invalid edits, and replays patches", () => {
-    const bus = createCommandBus(fixture().project);
-    const first = bus.executeCommand(convert(), 0);
-    expect(first.ok && first.changed).toBe(true);
-    if (!first.ok) return;
-    const mesh = first.project.nodes.find(n => n.id === "cube") as MeshNode;
-    expect(mesh.meshSource.kind).toBe("editable");
-    const unchanged = bus.getSnapshot();
-    expect(bus.executeCommand(translate([999], [1, 0, 0]), 1).ok).toBe(false);
-    expect(bus.executeCommand(translate([0], [NaN, 0, 0]), 1).ok).toBe(false);
-    expect(bus.executeCommand(translate([0], [1, 0, 0]), 0).ok).toBe(false);
-    expect(bus.getSnapshot()).toEqual(unchanged);
-    const noOp = bus.executeCommand(translate([0], [0, 0, 0]), 1);
-    expect(noOp.ok && noOp.changed).toBe(false);
-    const moved = bus.executeCommand(translate([0, 0], [0.1, 0, 0]), 1);
-    expect(moved.ok && moved.changed).toBe(true);
-    if (!moved.ok) return;
-    expect(moved.project.model.revision).toBe(2);
-    const undoMove = bus.applyHistoryPatch(moved.undoPatch, 2);
-    expect(undoMove.ok && undoMove.project).toEqual(unchanged);
-    const redoMove = bus.applyHistoryPatch(moved.patch, 3);
-    expect(redoMove.ok && redoMove.project).toEqual(moved.project);
-    const undoAgain = bus.applyHistoryPatch(moved.undoPatch, 4);
-    expect(undoAgain.ok).toBe(true);
-    const undoConvert = bus.applyHistoryPatch(first.undoPatch, 5);
-    expect(undoConvert.ok && (undoConvert.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource.kind).toBe("primitive");
-    expect(bus.applyHistoryPatch(first.patch, 6).ok).toBe(true);
-  });
-
-  it("respects inherited lock/visibility and active modifier dependencies", () => {
-    const { project, mesh } = fixture();
-    project.nodes[0]!.locked = true;
-    expect(createCommandBus(project).executeCommand(convert(), 0).ok).toBe(false);
-    project.nodes[0]!.locked = false;
-    project.nodes[0]!.visible = false;
-    expect(createCommandBus(project).executeCommand(convert(), 0).ok).toBe(false);
-    project.nodes[0]!.visible = true;
-    mesh.modifierIds.push("mirror");
-    project.modifiers.push({ id: "mirror", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 0, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
-    const bus = createCommandBus(project);
-    expect(bus.executeCommand(convert(), 0).ok).toBe(true);
-    const after = bus.getSnapshot();
-    after.modifiers[0]!.enabled = true;
-    const active = createCommandBus(after);
-    expect(active.executeCommand(translate([0], [0.1, 0, 0]), 0).ok).toBe(false);
-    expect(active.getSnapshot()).toEqual(after);
-    const noOp = active.executeCommand(translate([0], [0, 0, 0]), 0);
-    expect(noOp.ok && noOp.changed).toBe(false);
-  });
-
-  it("publishes one history step per edit and no state change on rejection", () => {
-    const store = createEditorStore(fixture().project);
-    const start = store.getSnapshot();
-    expect(store.executeCommand(translate([0], [1, 0, 0]), 0).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(start);
-    expect(store.executeCommand(convert(), 0).ok).toBe(true);
-    const converted = store.getSnapshot();
-    expect(converted.history.entries).toHaveLength(1);
-    expect(converted.derived.generation).toBe(1);
-    expect(converted.document.dirty).toBe(true);
-    expect(store.executeCommand(translate([0], [0, 0, 0]), 1).ok).toBe(true);
-    expect(store.getSnapshot()).toBe(converted);
-    expect(store.executeCommand(translate([999], [1, 0, 0]), 1).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(converted);
-    expect(store.executeCommand(translate([0], [0.1, 0, 0]), 1).ok).toBe(true);
-    expect(store.getSnapshot().history.entries).toHaveLength(2);
-    expect(store.getSnapshot().derived.generation).toBe(2);
-    expect(store.undo(2).ok).toBe(true);
-    expect(store.undo(3).ok).toBe(true);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    expect(store.redo(4).ok).toBe(true);
-    expect(store.redo(5).ok).toBe(true);
-  });
-
-  it("round trips v1.1 JSON and ZIP, and migrates strict v1 without changing model data", async () => {
-    const { project } = fixture();
-    const old = structuredClone(project);
-    old.schemaVersion = "1.0.0";
-    const migrated = deserializeProjectDocument(JSON.stringify(old));
-    expect(migrated.ok && migrated.value).toEqual(project);
-    const oldWithEditable = structuredClone(old);
-    (oldWithEditable.nodes.find(n => n.id === "cube") as MeshNode).meshSource = convertPrimitiveToEditable(fixture().mesh.meshSource as Extract<MeshNode["meshSource"], { kind: "primitive" }>);
-    expect(deserializeProjectDocument(JSON.stringify(oldWithEditable)).ok).toBe(false);
-    const bus = createCommandBus(project);
-    const first = bus.executeCommand(convert(), 0);
-    if (!first.ok) throw new Error(first.message);
-    const second = bus.executeCommand(translate([0], [0.1, 0, 0]), 1);
-    if (!second.ok) throw new Error(second.message);
-    const json = serializeProjectDocument(second.project);
-    expect(json.ok).toBe(true);
-    if (json.ok) expect(deserializeProjectDocument(json.value)).toEqual({ ok: true, value: second.project });
-    const archive = await createNativeProjectArchive(second.project, new AssetBytes(), "0.1.0");
-    expect(archive.ok).toBe(true);
-    if (archive.ok) {
-      const opened = await openNativeProjectArchive(archive.value);
-      expect(opened.ok && opened.value.project).toEqual(second.project);
-    }
-    const invalid = structuredClone(second.project);
-    (invalid.nodes.find(n => n.id === "cube") as MeshNode).meshSource = { kind: "editable", positions: [0, 0, 0], indices: [0, 1, 2] };
-    expect(deserializeProjectDocument(JSON.stringify(invalid)).ok).toBe(false);
-  });
-
-  it("refreshes renderer and evaluator from the domain source, and spike export rejects it", async () => {
-    const bus = createCommandBus(fixture().project);
-    const first = bus.executeCommand(convert(), 0);
-    if (!first.ok) throw new Error(first.message);
-    const sync = new SceneSync(() => {});
-    const epoch = {};
-    sync.sync(first.project, () => undefined, epoch);
-    const wrapper = sync.objects.get("cube")!.object;
-    const oldGeometry = (sync.objects.get("cube")!.content as T.Mesh).geometry;
-    const disposed = vi.spyOn(oldGeometry, "dispose");
-    const ray = new T.Ray(new T.Vector3(0, 0, 10), new T.Vector3(0, 0, -1));
-    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe(oldGeometry);
-    const evaluator = new ModifierEvaluator();
-    const originalEvaluation = await evaluator.evaluate(first.project, "cube");
-    expect(originalEvaluation.ok).toBe(true);
-    const moved = bus.executeCommand(translate([0], [0.1, 0, 0]), 1);
-    if (!moved.ok) throw new Error(moved.message);
-    sync.sync(moved.project, () => undefined, epoch);
-    expect(disposed).toHaveBeenCalledOnce();
-    expect(sync.objects.get("cube")!.object).toBe(wrapper);
-    const rendered = (sync.objects.get("cube")!.content as T.Mesh).geometry;
-    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe(rendered);
-    expect((rendered.getAttribute("position") as T.BufferAttribute).getX(0)).toBeCloseTo(((moved.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource as Extract<MeshNode["meshSource"], { kind: "editable" }>).positions[0]!);
-    const before = JSON.stringify(moved.project);
-    const evaluated = await evaluator.evaluate(moved.project, "cube");
-    expect(evaluated.ok).toBe(true);
-    if (originalEvaluation.ok && evaluated.ok) expect(evaluated.mesh.positions[0]).not.toBe(originalEvaluation.mesh.positions[0]);
-    if (evaluated.ok) evaluated.mesh.positions[0] = 999;
-    const again = await evaluator.evaluate(moved.project, "cube");
-    expect(again.ok && again.mesh.positions[0]).not.toBe(999);
-    expect(JSON.stringify(moved.project)).toBe(before);
-    expect(() => generateSpikeTsx(moved.project)).toThrow(SpikeExportError);
-    const undo = bus.applyHistoryPatch(moved.undoPatch, 2);
-    if (!undo.ok) throw new Error(undo.message);
-    sync.sync(undo.project, () => undefined, epoch);
-    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe((sync.objects.get("cube")!.content as T.Mesh).geometry);
-    const evaluatedUndo = await evaluator.evaluate(undo.project, "cube");
-    if (originalEvaluation.ok && evaluatedUndo.ok) expect(evaluatedUndo.mesh.positions).toEqual(originalEvaluation.mesh.positions);
-    evaluator.dispose(); sync.dispose();
-  });
-});
-</file>
-
 <file path="tests/geometry/mesh-topology.test.ts">
 import { describe, expect, it } from "vitest";
 import { convertPrimitiveToEditable } from "../../src/geometry/mesh-edit";
@@ -8920,92 +8601,6 @@ describe("parametric primitives", () => {
     sync.sync(project, () => undefined);
     expect(sync.objects.has(node.id)).toBe(false);
     sync.dispose();
-  });
-});
-</file>
-
-<file path="tests/renderer/sub-element-edit.test.ts">
-import { describe, expect, it } from "vitest";
-import { createEditorStore } from "../../src/app/editor-store";
-import { buildMeshTopology } from "../../src/geometry/mesh-topology";
-import { editableGeometry } from "../../src/geometry/mesh-edit";
-import { pickEditableEdge } from "../../src/renderer/sub-element-picking";
-import { createNestedMeshProject } from "../fixtures/projects";
-import * as T from "three";
-
-function setup() {
-  const store = createEditorStore(createNestedMeshProject());
-  store.setSelection(["mesh-node"]);
-  expect(store.executeCommand({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0).ok).toBe(true);
-  const node = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
-  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") throw new Error("fixture");
-  return { store, source: node.meshSource, topology: buildMeshTopology(node.meshSource)! };
-}
-
-describe("edge and face editing", () => {
-  it.each(["edge", "face"] as const)("translates a selected %s through one command with undo and redo", mode => {
-    const { store, source, topology } = setup();
-    const epoch = store.getProjectEpoch();
-    expect(store.enterMeshEditMode(mode, 1, epoch)).toBeNull();
-    const ids = mode === "edge" ? [topology.edges[0]!.id] : [topology.faces[0]!.id];
-    expect(store.setSubElementSelection(ids, 1, epoch)).toBe(true);
-    const vertices = store.selectedMeshVertices()!;
-    expect(vertices.length).toBeGreaterThan(0);
-    expect(vertices).toEqual([...new Set(vertices)]);
-    const moved = store.executeCommand({ commandId: "move", type: "TRANSLATE_EDITABLE_VERTICES", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta: [0.125, 0, 0] } }, 1);
-    expect(moved.ok && moved.changed).toBe(true);
-    const after = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
-    if (after?.kind !== "mesh" || after.meshSource.kind !== "editable") throw new Error("fixture");
-    expect(after.meshSource.positions).not.toEqual(source.positions);
-    expect(after.meshSource.indices).toEqual(source.indices);
-    expect(after.meshSource.uv).toEqual(source.uv);
-    expect(store.undo(2).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: source });
-    expect(store.redo(3).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: after.meshSource });
-  });
-
-  it("clears incompatible selection and rejects stale and invalid choices", () => {
-    const { store, topology } = setup();
-    const epoch = store.getProjectEpoch();
-    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
-    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
-    expect(store.enterMeshEditMode("face", 1, epoch)).toBeNull();
-    expect(store.getSnapshot().meshEdit.edgeIds).toHaveLength(0);
-    expect(store.setSubElementSelection([999], 1, epoch)).toBe(false);
-    expect(store.setSubElementSelection([topology.faces[0]!.id], 0, epoch)).toBe(false);
-    store.setTool({ mode: "scene" });
-    expect(store.getSnapshot().meshEdit.mode).toBe("object");
-  });
-
-  it("picks only a near segment of the front hit triangle in screen pixels", () => {
-    const source = { kind: "editable" as const, positions: [0,0,0, 1,0,0, 0,1,0], indices: [0,1,2] };
-    const mesh = new T.Mesh(editableGeometry(source));
-    const camera = new T.PerspectiveCamera(60, 1, 0.1, 100);
-    camera.position.set(0.5, 0.5, 5); camera.lookAt(0.5, 0.5, 0); camera.updateProjectionMatrix();
-    const hit = { nodeId: "mesh", mesh, faceIndex: 0 } as Parameters<typeof pickEditableEdge>[0];
-    const midpoint = new T.Vector3(0.5, 0, 0).project(camera);
-    const rect = { left: 0, top: 0, width: 400, height: 400 };
-    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, (midpoint.x + 1) * 200, (1 - midpoint.y) * 200, rect)).toBe("0:1");
-    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, 5, 5, rect)).toBeNull();
-    mesh.geometry.dispose();
-  });
-
-  it("keeps history unchanged for zero, nonfinite and degenerate moves, and blocks hidden parents", () => {
-    const { store, topology } = setup();
-    const epoch = store.getProjectEpoch();
-    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
-    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
-    const vertices = store.selectedMeshVertices()!;
-    const before = store.getSnapshot();
-    const command = (id: string, delta: [number, number, number]) => ({ commandId: id, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta } });
-    const zero = store.executeCommand(command("zero", [0, 0, 0]), 1);
-    expect(zero.ok && !zero.changed).toBe(true);
-    expect(store.executeCommand(command("bad", [NaN, 0, 0]), 1).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(before);
-    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", visible: false } }, 1).ok).toBe(true);
-    expect(store.getSnapshot().meshEdit.mode).toBe("object");
-    expect(store.enterMeshEditMode("face", 2, epoch)).toBeTruthy();
   });
 });
 </file>
@@ -10196,6 +9791,145 @@ export interface Keyframe {
 }
 </file>
 
+<file path="src/geometry/mesh-edit.ts">
+import * as T from "three";
+import type { MeshSource, Vec3 } from "../domain/types";
+import { primitiveGeometry } from "./primitive-geometry";
+import { MAX_CSG_INPUT_BYTES, validateMesh, type MeshData } from "./csg/core";
+
+export type EditableMeshSource = Extract<MeshSource, { kind: "editable" }>;
+type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
+type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
+
+/** Absolute coordinate quantization at 1e-6 local units. Keys are never written to the Project. */
+export const SEAM_TOLERANCE = 1e-6;
+const key = (positions: readonly number[], i: number): string =>
+  [0, 1, 2].map(axis => Math.round(positions[3 * i + axis]! / SEAM_TOLERANCE)).join(":");
+
+type Checked = { error: string; mesh?: never } | { error: null; mesh: MeshData };
+const invalid = (error: string): Checked => ({ error });
+
+function checkedEditableData(value: unknown): Checked {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return invalid("Редактируемая сетка должна быть объектом.");
+  const source = value as Partial<EditableMeshSource>;
+  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv"].includes(k)) || source.kind !== "editable")
+    return invalid("Некорректный тип или поле редактируемой сетки.");
+  if (!Array.isArray(source.positions) || !Array.isArray(source.indices) || source.positions.length % 3 || source.indices.length % 3 || !source.indices.length)
+    return invalid("Позиции и индексы должны задавать треугольники.");
+  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
+  if (source.positions.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))) return invalid("Координаты должны быть конечными Float32 числами.");
+  if (source.indices.some(n => !Number.isSafeInteger(n) || n < 0 || n >= source.positions!.length / 3 || n > 0xffffffff)) return invalid("Индекс вершины вне диапазона.");
+  if (source.uv !== undefined && (!Array.isArray(source.uv) || source.uv.length !== source.positions.length / 3 * 2 || source.uv.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))))
+    return invalid("UV должны содержать две конечные координаты на render vertex.");
+  const mesh = { positions: Float32Array.from(source.positions), indices: Uint32Array.from(source.indices) };
+  try { validateMesh(mesh); }
+  catch (error) { return invalid(error instanceof Error ? error.message : "Некорректная геометрия."); }
+  return { error: null, mesh };
+}
+
+export function validateEditableSource(value: unknown): string | null {
+  return checkedEditableData(value).error;
+}
+
+export function editableMeshData(source: EditableInput) {
+  const checked = checkedEditableData(source);
+  if (checked.error !== null) throw new Error(checked.error);
+  return checked.mesh;
+}
+
+export function editableGeometry(source: EditableInput): T.BufferGeometry {
+  const data = editableMeshData(source);
+  const geometry = new T.BufferGeometry();
+  geometry.setAttribute("position", new T.BufferAttribute(data.positions, 3));
+  geometry.setIndex(new T.BufferAttribute(data.indices, 1));
+  if (source.uv) geometry.setAttribute("uv", new T.Float32BufferAttribute(source.uv, 2));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+export function convertPrimitiveToEditable(source: PrimitiveSource): EditableMeshSource {
+  if (source.primitive === "plane") throw new Error("Плоскость не является замкнутой сеткой для преобразования.");
+  const geometry = primitiveGeometry(source);
+  try {
+    const position = geometry.getAttribute("position");
+    const uvAttribute = geometry.getAttribute("uv");
+    const index = geometry.getIndex();
+    if (!position || position.itemSize !== 3) throw new Error("Примитив не содержит XYZ координат.");
+    const result: EditableMeshSource = {
+      kind: "editable",
+      positions: Array.from({ length: position.count * 3 }, (_, i) => position.getComponent(Math.floor(i / 3), i % 3)),
+      indices: index ? Array.from(index.array) : Array.from({ length: position.count }, (_, i) => i),
+      ...(uvAttribute ? { uv: Array.from({ length: uvAttribute.count * 2 }, (_, i) => uvAttribute.getComponent(Math.floor(i / 2), i % 2)) } : {}),
+    };
+    const error = validateEditableSource(result);
+    if (error) throw new Error(`Примитив нельзя преобразовать без потерь: ${error}`);
+    return result;
+  } finally { geometry.dispose(); }
+}
+
+/** Selection uses render vertex indices; all vertices with the same quantized local XYZ move together. */
+export function translateEditableVertices(source: EditableMeshSource, selected: readonly number[], delta: Vec3): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
+    throw new Error("Выбор содержит несуществующую вершину.");
+  if (!Array.isArray(delta) || delta.length !== 3 || delta.some(n => !Number.isFinite(n))) throw new Error("Delta должна содержать три конечных числа.");
+  if (delta.every(n => n === 0)) return source;
+  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
+  const positions = source.positions.slice();
+  for (let i = 0; i < positions.length / 3; i++) {
+    if (!selectedKeys.has(key(source.positions, i))) continue;
+    for (let axis = 0; axis < 3; axis++) positions[3 * i + axis] = Math.fround(source.positions[3 * i + axis]! + delta[axis]!);
+  }
+  const result: EditableMeshSource = { ...source, positions };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  return result;
+}
+
+/** Scale geometric vertices around their shared local centroid; UV seam copies stay coincident. */
+export function scaleEditableVertices(source: EditableMeshSource, selected: readonly number[], factors: Vec3): EditableMeshSource {
+  const error = validateEditableSource(source);
+  if (error) throw new Error(error);
+  if (!Array.isArray(selected) || !selected.length || selected.some(i => !Number.isSafeInteger(i) || i < 0 || i >= source.positions.length / 3))
+    throw new Error("Выбор содержит несуществующую вершину.");
+  if (!Array.isArray(factors) || factors.length !== 3 || factors.some(n => typeof n !== "number" || !Number.isFinite(n)))
+    throw new Error("Масштаб должен содержать три конечных числа.");
+  if (factors.some(n => n <= 0)) throw new Error("Коэффициенты масштаба должны быть строго положительными.");
+  if (factors.every(n => n === 1)) return source;
+
+  const selectedKeys = new Set(selected.map(i => key(source.positions, i)));
+  const representatives = new Map<string, number>();
+  for (let i = 0; i < source.positions.length / 3; i++) {
+    const positionKey = key(source.positions, i);
+    if (selectedKeys.has(positionKey) && !representatives.has(positionKey)) representatives.set(positionKey, i);
+  }
+  if (representatives.size === 1) return source;
+  const mean = (axis: number) => {
+    let mean = 0;
+    for (const i of representatives.values()) mean += source.positions[3 * i + axis]! / representatives.size;
+    return mean;
+  };
+  const center: Vec3 = [mean(0), mean(1), mean(2)];
+  const positions = source.positions.slice();
+  let changed = false;
+  for (let i = 0; i < positions.length / 3; i++) {
+    if (!selectedKeys.has(key(source.positions, i))) continue;
+    for (let axis = 0; axis < 3; axis++) {
+      const before = source.positions[3 * i + axis]!;
+      const after = Math.fround(center[axis]! + (before - center[axis]!) * factors[axis]!);
+      positions[3 * i + axis] = after;
+      if (after !== before) changed = true;
+    }
+  }
+  if (!changed) return source;
+  const result: EditableMeshSource = { ...source, positions };
+  const resultError = validateEditableSource(result);
+  if (resultError) throw new Error(resultError);
+  return result;
+}
+</file>
+
 <file path="src/importers/gltf/import-glb.ts">
 import { disposeObject } from "../../assets/three-resources";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -11193,6 +10927,374 @@ export function createMissingReferenceProject(): Project {
 }
 </file>
 
+<file path="tests/geometry/mesh-edit.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { createCommandBus } from "../../src/domain/command-bus";
+import { createProject } from "../../src/domain/create-project";
+import { deserializeProjectDocument, serializeProjectDocument } from "../../src/domain/project-serialization";
+import type { MeshNode, Project } from "../../src/domain/types";
+import { ModifierEvaluator } from "../../src/geometry/modifiers";
+import { convertPrimitiveToEditable, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../../src/geometry/mesh-edit";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { vertexRepresentatives } from "../../src/geometry/vertex-selection";
+import { createPrimitiveNode } from "../../src/geometry/primitives";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { generateSpikeTsx, SpikeExportError } from "../../src/spikes/export/generate-tsx";
+
+function fixture(): { project: Project; mesh: MeshNode } {
+  let id = 0;
+  const project = createProject(() => `id-${++id}`);
+  const root = project.nodes[0]!;
+  const mesh = createPrimitiveNode("cube", root.id, "cube");
+  root.children.push(mesh.id); project.nodes.push(mesh);
+  return { project, mesh };
+}
+const convert = () => ({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube" } });
+const translate = (vertexIndices: number[], delta: [number, number, number], commandId = "move") =>
+  ({ commandId, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube", vertexIndices, delta } });
+const scale = (vertexIndices: number[], factors: [number, number, number], commandId = "scale") =>
+  ({ commandId, type: "SCALE_EDITABLE_VERTICES" as const, targetIds: ["cube"] as [string], payload: { nodeId: "cube", vertexIndices, factors } });
+
+describe("editable mesh scaling", () => {
+  const cube = () => convertPrimitiveToEditable(createPrimitiveNode("cube", "root", "cube").meshSource as Extract<MeshNode["meshSource"], { kind: "primitive" }>);
+
+  it("scales two unique vertices around one center, preserves seams, UV, indices and input", () => {
+    const source = cube();
+    const original = structuredClone(source);
+    const [a, b] = vertexRepresentatives(source);
+    const center = [0, 1, 2].map(axis => (source.positions[3 * a! + axis]! + source.positions[3 * b! + axis]!) / 2);
+    const result = scaleEditableVertices(source, [b!, a!, a!], [1.25, 1.5, 1.75]);
+    for (const index of [a!, b!]) {
+      const before = source.positions.slice(3 * index, 3 * index + 3);
+      const duplicates = Array.from({ length: source.positions.length / 3 }, (_, i) => i)
+        .filter(i => source.positions.slice(3 * i, 3 * i + 3).every((value, axis) => value === before[axis]));
+      for (const duplicate of duplicates) for (let axis = 0; axis < 3; axis++)
+        expect(result.positions[3 * duplicate + axis]).toBeCloseTo(Math.fround(center[axis]! + (before[axis]! - center[axis]!) * [1.25, 1.5, 1.75][axis]!));
+    }
+    expect(result.indices).toEqual(source.indices);
+    expect(result.uv).toEqual(source.uv);
+    expect(source).toEqual(original);
+    expect(validateEditableSource(result)).toBeNull();
+  });
+
+  it("scales edge and connected face vertices with one shared center", () => {
+    const source = cube();
+    const topology = buildMeshTopology(source)!;
+    for (const selected of [topology.edges[0]!.vertices, topology.faces[0]!.vertices,
+      [...topology.faces[0]!.vertices, ...topology.edges[1]!.vertices]]) {
+      const unique = [...new Set(selected)];
+      const center = [0, 1, 2].map(axis => unique.reduce((sum, index) => sum + source.positions[3 * index + axis]!, 0) / unique.length);
+      const result = scaleEditableVertices(source, selected, [1.1, 1.2, 1.3]);
+      for (const index of unique) for (let axis = 0; axis < 3; axis++)
+        expect(result.positions[3 * index + axis]).toBeCloseTo(Math.fround(center[axis]! + (source.positions[3 * index + axis]! - center[axis]!) * [1.1, 1.2, 1.3][axis]!));
+      expect(validateEditableSource(result)).toBeNull();
+    }
+  });
+
+  it("returns the same source for semantic and effective no-ops", () => {
+    const source = cube();
+    const [a, b] = vertexRepresentatives(source);
+    expect(scaleEditableVertices(source, [a!, b!], [1, 1, 1])).toBe(source);
+    expect(scaleEditableVertices(source, [a!], [2, 2, 2])).toBe(source);
+    const axis = [0, 1, 2].find(i => source.positions[3 * a! + i] === source.positions[3 * b! + i])!;
+    const factors: [number, number, number] = [1, 1, 1]; factors[axis] = 2;
+    expect(scaleEditableVertices(source, [a!, b!], factors)).toBe(source);
+  });
+
+  it("rejects malformed factors, selections, overflow and degenerate results atomically", () => {
+    const source = cube();
+    const before = structuredClone(source);
+    for (const selection of [[], [999], [-1], [0.5]]) expect(() => scaleEditableVertices(source, selection, [2, 1, 1])).toThrow();
+    for (const factors of [[NaN, 1, 1], [Infinity, 1, 1], [0, 1, 1], [-1, 1, 1], [1e300, 1, 1], [1, 1]] as [number, number, number][])
+      expect(() => scaleEditableVertices(source, vertexRepresentatives(source), factors)).toThrow();
+    expect(() => scaleEditableVertices(source, vertexRepresentatives(source), [1e-20, 1, 1])).toThrow(/вырожденный/i);
+    expect(source).toEqual(before);
+  });
+
+  it("commits one reversible patch and keeps invalid edits out of history", async () => {
+    const store = createEditorStore(fixture().project);
+    const converted = store.executeCommand(convert(), 0);
+    expect(converted.ok).toBe(true);
+    if (!converted.ok) return;
+    const initial = store.getSnapshot();
+    const source = (initial.document.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (source.kind !== "editable") throw new Error("fixture");
+    const vertices = vertexRepresentatives(source);
+    for (const command of [scale(vertices, [0, 1, 1]), scale([999], [2, 1, 1]), scale(vertices, [NaN, 1, 1])])
+      expect(store.executeCommand(command, 1).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(initial);
+    const noOp = store.executeCommand(scale(vertices, [1, 1, 1]), 1);
+    expect(noOp.ok && !noOp.changed).toBe(true);
+    expect(store.getSnapshot()).toBe(initial);
+    expect(store.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    const sync = new SceneSync(() => {});
+    const epoch = {};
+    sync.sync(converted.project, () => undefined, epoch);
+    const oldGeometry = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    const result = store.executeCommand(scale(vertices, [1.2, 1, 1]), 1);
+    expect(result.ok && result.changed).toBe(true);
+    if (!result.ok) return;
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    const changed = result.project;
+    sync.sync(changed, () => undefined, epoch);
+    expect(disposed).toHaveBeenCalledOnce();
+    const rendered = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    const changedSource = (changed.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (changedSource.kind !== "editable") throw new Error("fixture");
+    expect((rendered.getAttribute("position") as T.BufferAttribute).getX(vertices[0]!)).toBe(changedSource.positions[3 * vertices[0]!]!);
+    expect(store.undo(2).ok).toBe(true);
+    expect((store.getSnapshot().document.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource).toEqual(source);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project).toEqual(changed);
+    const archive = await createNativeProjectArchive(changed, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok && opened.value.project).toEqual(changed);
+    }
+    sync.dispose();
+  });
+
+  it("rejects malformed commands, hidden or locked ancestors and active modifiers", () => {
+    const converted = createCommandBus(fixture().project).executeCommand(convert(), 0);
+    if (!converted.ok) throw new Error(converted.message);
+    const source = (converted.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource;
+    if (source.kind !== "editable") throw new Error("fixture");
+    const vertices = vertexRepresentatives(source);
+    const bus = createCommandBus(converted.project);
+    const before = bus.getSnapshot();
+    for (const invalid of [
+      { ...scale(vertices, [2, 1, 1]), targetIds: ["other"] },
+      { ...scale(vertices, [2, 1, 1]), payload: { nodeId: "cube", vertexIndices: vertices, factors: [2, 1] } },
+      { ...scale(vertices, [2, 1, 1]), payload: { nodeId: "cube", vertexIndices: vertices, factors: [2, 1, 1], extra: true } },
+    ]) expect(bus.executeCommand(invalid as unknown as Parameters<typeof bus.executeCommand>[0], 0).ok).toBe(false);
+    expect(bus.getSnapshot()).toEqual(before);
+    for (const field of ["locked", "visible"] as const) {
+      const project = structuredClone(converted.project);
+      project.nodes[0]![field] = field === "locked";
+      const restricted = createCommandBus(project);
+      expect(restricted.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    }
+    const withModifier = structuredClone(converted.project);
+    (withModifier.nodes.find(n => n.id === "cube") as MeshNode).modifierIds.push("mirror");
+    withModifier.modifiers.push({ id: "mirror", nodeId: "cube", kind: "mirror", order: 0, enabled: true, version: 0,
+      parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
+    const restricted = createCommandBus(withModifier);
+    expect(restricted.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    expect(restricted.getSnapshot()).toEqual(withModifier);
+    const withDependent = structuredClone(converted.project);
+    const root = withDependent.nodes[0]!;
+    const target = createPrimitiveNode("cube", root.id, "target");
+    target.modifierIds.push("boolean");
+    root.children.push(target.id);
+    withDependent.nodes.push(target);
+    withDependent.modifiers.push({ id: "boolean", nodeId: target.id, kind: "boolean", order: 0, enabled: true, version: 0,
+      parameters: { operation: "subtract", cutterNodeId: "cube" } });
+    const dependent = createCommandBus(withDependent);
+    expect(dependent.executeCommand(scale(vertices, [1.2, 1, 1]), 0).ok).toBe(false);
+    expect(dependent.getSnapshot()).toEqual(withDependent);
+  });
+});
+
+describe("editable mesh foundation", () => {
+  it.each(["cube", "sphere", "torus", "cylinder", "cone"] as const)("converts valid closed %s primitive", kind => {
+    const source = createPrimitiveNode(kind, "root", "mesh").meshSource;
+    if (source.kind !== "primitive") throw new Error("fixture");
+    expect(validateEditableSource(convertPrimitiveToEditable(source))).toBeNull();
+  });
+  it("diagnoses open primitive conversion", () => {
+    const source = createPrimitiveNode("plane", "root", "mesh").meshSource;
+    if (source.kind !== "primitive") throw new Error("fixture");
+    expect(() => convertPrimitiveToEditable(source)).toThrow(/Плоскость/);
+  });
+  it("converts cube with UV seams and moves every matching render vertex without changing input", () => {
+    const { mesh } = fixture();
+    if (mesh.meshSource.kind !== "primitive") throw new Error("fixture");
+    const original = structuredClone(mesh.meshSource);
+    const source = convertPrimitiveToEditable(mesh.meshSource);
+    expect(mesh.meshSource).toEqual(original);
+    expect(source.positions.length).toBe(72);
+    expect(source.uv?.length).toBe(48);
+    const point = source.positions.slice(0, 3);
+    const duplicates = Array.from({ length: source.positions.length / 3 }, (_, i) => i)
+      .filter(i => source.positions.slice(3 * i, 3 * i + 3).every((v, axis) => v === point[axis]));
+    expect(duplicates.length).toBeGreaterThan(1);
+    const moved = translateEditableVertices(source, [0, 0, duplicates[1]!], [0.1, 0, 0]);
+    expect(validateEditableSource(moved)).toBeNull();
+    expect(moved.indices).toEqual(source.indices);
+    expect(moved.uv).toEqual(source.uv);
+    for (const i of duplicates) expect(moved.positions[3 * i]).toBeCloseTo(point[0]! + 0.1);
+    expect(source.positions.slice(0, 3)).toEqual(point);
+    const again = translateEditableVertices(moved, [duplicates[0]!], [0, 0.1, 0]);
+    expect(again.positions[1]).toBeCloseTo(point[1]! + 0.1);
+    expect(translateEditableVertices(again, [0], [0, 0, 0])).toBe(again);
+  });
+
+  it("rejects bad selection, nonfinite values, overflow and degenerate triangles", () => {
+    const { mesh } = fixture();
+    if (mesh.meshSource.kind !== "primitive") throw new Error("fixture");
+    const source = convertPrimitiveToEditable(mesh.meshSource);
+    expect(() => translateEditableVertices(source, [], [1, 0, 0])).toThrow();
+    expect(() => translateEditableVertices(source, [999], [1, 0, 0])).toThrow();
+    expect(() => translateEditableVertices(source, [0], [Infinity, 0, 0])).toThrow();
+    expect(validateEditableSource({ ...source, indices: [0, 1, 999] })).not.toBeNull();
+    expect(validateEditableSource({ ...source, positions: [NaN, ...source.positions.slice(1)] })).not.toBeNull();
+    const a = source.indices[0]!, b = source.indices[1]!;
+    const delta: [number, number, number] = [0, 1, 2].map(axis => source.positions[3 * b + axis]! - source.positions[3 * a + axis]!) as [number, number, number];
+    expect(() => translateEditableVertices(source, [a], delta)).toThrow(/вырожденный/i);
+    expect(validateEditableSource(source)).toBeNull();
+  });
+
+  it("commits semantic commands, rejects stale/invalid edits, and replays patches", () => {
+    const bus = createCommandBus(fixture().project);
+    const first = bus.executeCommand(convert(), 0);
+    expect(first.ok && first.changed).toBe(true);
+    if (!first.ok) return;
+    const mesh = first.project.nodes.find(n => n.id === "cube") as MeshNode;
+    expect(mesh.meshSource.kind).toBe("editable");
+    const unchanged = bus.getSnapshot();
+    expect(bus.executeCommand(translate([999], [1, 0, 0]), 1).ok).toBe(false);
+    expect(bus.executeCommand(translate([0], [NaN, 0, 0]), 1).ok).toBe(false);
+    expect(bus.executeCommand(translate([0], [1, 0, 0]), 0).ok).toBe(false);
+    expect(bus.getSnapshot()).toEqual(unchanged);
+    const noOp = bus.executeCommand(translate([0], [0, 0, 0]), 1);
+    expect(noOp.ok && noOp.changed).toBe(false);
+    const moved = bus.executeCommand(translate([0, 0], [0.1, 0, 0]), 1);
+    expect(moved.ok && moved.changed).toBe(true);
+    if (!moved.ok) return;
+    expect(moved.project.model.revision).toBe(2);
+    const undoMove = bus.applyHistoryPatch(moved.undoPatch, 2);
+    expect(undoMove.ok && undoMove.project).toEqual(unchanged);
+    const redoMove = bus.applyHistoryPatch(moved.patch, 3);
+    expect(redoMove.ok && redoMove.project).toEqual(moved.project);
+    const undoAgain = bus.applyHistoryPatch(moved.undoPatch, 4);
+    expect(undoAgain.ok).toBe(true);
+    const undoConvert = bus.applyHistoryPatch(first.undoPatch, 5);
+    expect(undoConvert.ok && (undoConvert.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource.kind).toBe("primitive");
+    expect(bus.applyHistoryPatch(first.patch, 6).ok).toBe(true);
+  });
+
+  it("respects inherited lock/visibility and active modifier dependencies", () => {
+    const { project, mesh } = fixture();
+    project.nodes[0]!.locked = true;
+    expect(createCommandBus(project).executeCommand(convert(), 0).ok).toBe(false);
+    project.nodes[0]!.locked = false;
+    project.nodes[0]!.visible = false;
+    expect(createCommandBus(project).executeCommand(convert(), 0).ok).toBe(false);
+    project.nodes[0]!.visible = true;
+    mesh.modifierIds.push("mirror");
+    project.modifiers.push({ id: "mirror", nodeId: mesh.id, kind: "mirror", order: 0, enabled: false, version: 0, parameters: { axes: "x", pivot: [0, 0, 0], mergeSeam: false } });
+    const bus = createCommandBus(project);
+    expect(bus.executeCommand(convert(), 0).ok).toBe(true);
+    const after = bus.getSnapshot();
+    after.modifiers[0]!.enabled = true;
+    const active = createCommandBus(after);
+    expect(active.executeCommand(translate([0], [0.1, 0, 0]), 0).ok).toBe(false);
+    expect(active.getSnapshot()).toEqual(after);
+    const noOp = active.executeCommand(translate([0], [0, 0, 0]), 0);
+    expect(noOp.ok && noOp.changed).toBe(false);
+  });
+
+  it("publishes one history step per edit and no state change on rejection", () => {
+    const store = createEditorStore(fixture().project);
+    const start = store.getSnapshot();
+    expect(store.executeCommand(translate([0], [1, 0, 0]), 0).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(start);
+    expect(store.executeCommand(convert(), 0).ok).toBe(true);
+    const converted = store.getSnapshot();
+    expect(converted.history.entries).toHaveLength(1);
+    expect(converted.derived.generation).toBe(1);
+    expect(converted.document.dirty).toBe(true);
+    expect(store.executeCommand(translate([0], [0, 0, 0]), 1).ok).toBe(true);
+    expect(store.getSnapshot()).toBe(converted);
+    expect(store.executeCommand(translate([999], [1, 0, 0]), 1).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(converted);
+    expect(store.executeCommand(translate([0], [0.1, 0, 0]), 1).ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(2);
+    expect(store.getSnapshot().derived.generation).toBe(2);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.undo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(store.redo(4).ok).toBe(true);
+    expect(store.redo(5).ok).toBe(true);
+  });
+
+  it("round trips v1.1 JSON and ZIP, and migrates strict v1 without changing model data", async () => {
+    const { project } = fixture();
+    const old = structuredClone(project);
+    old.schemaVersion = "1.0.0";
+    const migrated = deserializeProjectDocument(JSON.stringify(old));
+    expect(migrated.ok && migrated.value).toEqual(project);
+    const oldWithEditable = structuredClone(old);
+    (oldWithEditable.nodes.find(n => n.id === "cube") as MeshNode).meshSource = convertPrimitiveToEditable(fixture().mesh.meshSource as Extract<MeshNode["meshSource"], { kind: "primitive" }>);
+    expect(deserializeProjectDocument(JSON.stringify(oldWithEditable)).ok).toBe(false);
+    const bus = createCommandBus(project);
+    const first = bus.executeCommand(convert(), 0);
+    if (!first.ok) throw new Error(first.message);
+    const second = bus.executeCommand(translate([0], [0.1, 0, 0]), 1);
+    if (!second.ok) throw new Error(second.message);
+    const json = serializeProjectDocument(second.project);
+    expect(json.ok).toBe(true);
+    if (json.ok) expect(deserializeProjectDocument(json.value)).toEqual({ ok: true, value: second.project });
+    const archive = await createNativeProjectArchive(second.project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok && opened.value.project).toEqual(second.project);
+    }
+    const invalid = structuredClone(second.project);
+    (invalid.nodes.find(n => n.id === "cube") as MeshNode).meshSource = { kind: "editable", positions: [0, 0, 0], indices: [0, 1, 2] };
+    expect(deserializeProjectDocument(JSON.stringify(invalid)).ok).toBe(false);
+  });
+
+  it("refreshes renderer and evaluator from the domain source, and spike export rejects it", async () => {
+    const bus = createCommandBus(fixture().project);
+    const first = bus.executeCommand(convert(), 0);
+    if (!first.ok) throw new Error(first.message);
+    const sync = new SceneSync(() => {});
+    const epoch = {};
+    sync.sync(first.project, () => undefined, epoch);
+    const wrapper = sync.objects.get("cube")!.object;
+    const oldGeometry = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    const disposed = vi.spyOn(oldGeometry, "dispose");
+    const ray = new T.Ray(new T.Vector3(0, 0, 10), new T.Vector3(0, 0, -1));
+    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe(oldGeometry);
+    const evaluator = new ModifierEvaluator();
+    const originalEvaluation = await evaluator.evaluate(first.project, "cube");
+    expect(originalEvaluation.ok).toBe(true);
+    const moved = bus.executeCommand(translate([0], [0.1, 0, 0]), 1);
+    if (!moved.ok) throw new Error(moved.message);
+    sync.sync(moved.project, () => undefined, epoch);
+    expect(disposed).toHaveBeenCalledOnce();
+    expect(sync.objects.get("cube")!.object).toBe(wrapper);
+    const rendered = (sync.objects.get("cube")!.content as T.Mesh).geometry;
+    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe(rendered);
+    expect((rendered.getAttribute("position") as T.BufferAttribute).getX(0)).toBeCloseTo(((moved.project.nodes.find(n => n.id === "cube") as MeshNode).meshSource as Extract<MeshNode["meshSource"], { kind: "editable" }>).positions[0]!);
+    const before = JSON.stringify(moved.project);
+    const evaluated = await evaluator.evaluate(moved.project, "cube");
+    expect(evaluated.ok).toBe(true);
+    if (originalEvaluation.ok && evaluated.ok) expect(evaluated.mesh.positions[0]).not.toBe(originalEvaluation.mesh.positions[0]);
+    if (evaluated.ok) evaluated.mesh.positions[0] = 999;
+    const again = await evaluator.evaluate(moved.project, "cube");
+    expect(again.ok && again.mesh.positions[0]).not.toBe(999);
+    expect(JSON.stringify(moved.project)).toBe(before);
+    expect(() => generateSpikeTsx(moved.project)).toThrow(SpikeExportError);
+    const undo = bus.applyHistoryPatch(moved.undoPatch, 2);
+    if (!undo.ok) throw new Error(undo.message);
+    sync.sync(undo.project, () => undefined, epoch);
+    expect(sync.surfaces.nearest(ray)?.mesh.geometry).toBe((sync.objects.get("cube")!.content as T.Mesh).geometry);
+    const evaluatedUndo = await evaluator.evaluate(undo.project, "cube");
+    if (originalEvaluation.ok && evaluatedUndo.ok) expect(evaluatedUndo.mesh.positions).toEqual(originalEvaluation.mesh.positions);
+    evaluator.dispose(); sync.dispose();
+  });
+});
+</file>
+
 <file path="tests/importers/glb.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import { createProject } from "../../src/domain/create-project";
@@ -11344,6 +11446,116 @@ describe("GLB import", () => {
     expect(store.getSnapshot().document.project).toEqual(captured.project);
     expect(store.getSnapshot().history.entries).toHaveLength(0);
     expect(store.getAssetBytes().ids()).toHaveLength(0);
+  });
+});
+</file>
+
+<file path="tests/renderer/sub-element-edit.test.ts">
+import { describe, expect, it } from "vitest";
+import { createEditorStore } from "../../src/app/editor-store";
+import { buildMeshTopology } from "../../src/geometry/mesh-topology";
+import { editableGeometry } from "../../src/geometry/mesh-edit";
+import { pickEditableEdge } from "../../src/renderer/sub-element-picking";
+import { createNestedMeshProject } from "../fixtures/projects";
+import * as T from "three";
+
+function setup() {
+  const store = createEditorStore(createNestedMeshProject());
+  store.setSelection(["mesh-node"]);
+  expect(store.executeCommand({ commandId: "convert", type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node" } }, 0).ok).toBe(true);
+  const node = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") throw new Error("fixture");
+  return { store, source: node.meshSource, topology: buildMeshTopology(node.meshSource)! };
+}
+
+describe("edge and face editing", () => {
+  it.each(["vertex", "edge", "face"] as const)("scales selected %s vertices and reconciles selection", mode => {
+    const { store, source, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode(mode, 1, epoch)).toBeNull();
+    if (mode === "vertex") expect(store.setVertexSelection(topology.edges[0]!.vertices, 1, epoch)).toBe(true);
+    else expect(store.setSubElementSelection(mode === "edge" ? [topology.edges[0]!.id] : [topology.faces[0]!.id], 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    const result = store.executeCommand({ commandId: "scale", type: "SCALE_EDITABLE_VERTICES", targetIds: ["mesh-node"],
+      payload: { nodeId: "mesh-node", vertexIndices: vertices, factors: [1.25, 1.25, 1.25] } }, 1);
+    expect(result.ok && result.changed).toBe(true);
+    const after = store.getSnapshot();
+    const mesh = after.document.project.nodes.find(item => item.id === "mesh-node");
+    if (mesh?.kind !== "mesh" || mesh.meshSource.kind !== "editable") throw new Error("fixture");
+    expect(mesh.meshSource.positions).not.toEqual(source.positions);
+    expect(mesh.meshSource.indices).toEqual(source.indices);
+    expect(mesh.meshSource.uv).toEqual(source.uv);
+    expect(after.meshEdit.mode).toBe(mode);
+    expect(mode === "vertex" ? after.meshEdit.vertexIndices.length : mode === "edge" ? after.meshEdit.edgeIds.length : after.meshEdit.faceIds.length)
+      .toBe(mode === "vertex" ? vertices.length : 0);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: mesh.meshSource });
+  });
+
+  it.each(["edge", "face"] as const)("translates a selected %s through one command with undo and redo", mode => {
+    const { store, source, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode(mode, 1, epoch)).toBeNull();
+    const ids = mode === "edge" ? [topology.edges[0]!.id] : [topology.faces[0]!.id];
+    expect(store.setSubElementSelection(ids, 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    expect(vertices.length).toBeGreaterThan(0);
+    expect(vertices).toEqual([...new Set(vertices)]);
+    const moved = store.executeCommand({ commandId: "move", type: "TRANSLATE_EDITABLE_VERTICES", targetIds: ["mesh-node"], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta: [0.125, 0, 0] } }, 1);
+    expect(moved.ok && moved.changed).toBe(true);
+    const after = store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node");
+    if (after?.kind !== "mesh" || after.meshSource.kind !== "editable") throw new Error("fixture");
+    expect(after.meshSource.positions).not.toEqual(source.positions);
+    expect(after.meshSource.indices).toEqual(source.indices);
+    expect(after.meshSource.uv).toEqual(source.uv);
+    expect(store.undo(2).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: source });
+    expect(store.redo(3).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(item => item.id === "mesh-node")).toMatchObject({ meshSource: after.meshSource });
+  });
+
+  it("clears incompatible selection and rejects stale and invalid choices", () => {
+    const { store, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
+    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
+    expect(store.enterMeshEditMode("face", 1, epoch)).toBeNull();
+    expect(store.getSnapshot().meshEdit.edgeIds).toHaveLength(0);
+    expect(store.setSubElementSelection([999], 1, epoch)).toBe(false);
+    expect(store.setSubElementSelection([topology.faces[0]!.id], 0, epoch)).toBe(false);
+    store.setTool({ mode: "scene" });
+    expect(store.getSnapshot().meshEdit.mode).toBe("object");
+  });
+
+  it("picks only a near segment of the front hit triangle in screen pixels", () => {
+    const source = { kind: "editable" as const, positions: [0,0,0, 1,0,0, 0,1,0], indices: [0,1,2] };
+    const mesh = new T.Mesh(editableGeometry(source));
+    const camera = new T.PerspectiveCamera(60, 1, 0.1, 100);
+    camera.position.set(0.5, 0.5, 5); camera.lookAt(0.5, 0.5, 0); camera.updateProjectionMatrix();
+    const hit = { nodeId: "mesh", mesh, faceIndex: 0 } as Parameters<typeof pickEditableEdge>[0];
+    const midpoint = new T.Vector3(0.5, 0, 0).project(camera);
+    const rect = { left: 0, top: 0, width: 400, height: 400 };
+    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, (midpoint.x + 1) * 200, (1 - midpoint.y) * 200, rect)).toBe("0:1");
+    expect(pickEditableEdge(hit, source, buildMeshTopology(source)!, camera, 5, 5, rect)).toBeNull();
+    mesh.geometry.dispose();
+  });
+
+  it("keeps history unchanged for zero, nonfinite and degenerate moves, and blocks hidden parents", () => {
+    const { store, topology } = setup();
+    const epoch = store.getProjectEpoch();
+    expect(store.enterMeshEditMode("edge", 1, epoch)).toBeNull();
+    expect(store.setSubElementSelection([topology.edges[0]!.id], 1, epoch)).toBe(true);
+    const vertices = store.selectedMeshVertices()!;
+    const before = store.getSnapshot();
+    const command = (id: string, delta: [number, number, number]) => ({ commandId: id, type: "TRANSLATE_EDITABLE_VERTICES" as const, targetIds: ["mesh-node"] as [string], payload: { nodeId: "mesh-node", vertexIndices: vertices, delta } });
+    const zero = store.executeCommand(command("zero", [0, 0, 0]), 1);
+    expect(zero.ok && !zero.changed).toBe(true);
+    expect(store.executeCommand(command("bad", [NaN, 0, 0]), 1).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", visible: false } }, 1).ok).toBe(true);
+    expect(store.getSnapshot().meshEdit.mode).toBe("object");
+    expect(store.enterMeshEditMode("face", 2, epoch)).toBeTruthy();
   });
 });
 </file>
@@ -12726,247 +12938,6 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
 }
 </file>
 
-<file path="src/ui/Inspector.tsx">
-import { useEffect, useRef, useState } from "react";
-import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
-import type { Node } from "../domain/types";
-import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
-import { BooleanEditor } from "./BooleanEditor";
-import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
-
-const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
-const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
-const format = (value: number) => String(Number(value.toPrecision(12)));
-type TransformSession = EditSession & { groupId: string; applied?: string };
-
-export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const project = state.document.project;
-  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
-  const [draft, setDraft] = useState("");
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState<{ field: string; message: string } | null>(null);
-  const session = useRef<TransformSession | null>(null);
-  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const epoch = store.getProjectEpoch();
-  const selectedIds = selectionKey(state);
-  useEffect(() => {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null; session.current = null; setEditing(null); setError(null);
-    return () => { if (pending.current) clearTimeout(pending.current); };
-  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
-  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
-  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
-  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
-  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
-  const displayReason = displays.find(item => !item.ok);
-  const disabled = !!transformReason || !!displayReason;
-  function begin(key: string, value: number | null) {
-    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
-    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
-  }
-  function cancel(rollback = false) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    const captured = session.current;
-    if (rollback && captured?.applied && validSession(store, captured)) {
-      const current = store.getSnapshot();
-      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
-    }
-    session.current = null; setEditing(null); setError(null);
-  }
-  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
-    const captured = session.current;
-    if (!captured || captured.field !== key) return;
-    if (!validSession(store, captured) || blocked) { cancel(); return; }
-    if (!captured.touched) { if (final) cancel(); return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
-    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
-    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
-    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
-    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
-    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
-    captured.revision = result.revision;
-    captured.applied = raw;
-    if (final) cancel();
-  }
-  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    applyValue(field, axis, key, draft, true, currentValue);
-  }
-  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
-  }
-  function reset(field: TransformField) {
-    if (disabled) return;
-    const current = store.getSnapshot();
-    const prepared = prepareTransformCommands(current, { field, reset: true });
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else cancel();
-  }
-  function changeFlag(field: "visible" | "locked", value: boolean) {
-    if (flagReason) return;
-    const current = store.getSnapshot();
-    const prepared = prepareFlagCommands(current, field, value);
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else setError(null);
-  }
-  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
-  const axisLabels = ["X", "Y", "Z"] as const;
-  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
-  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
-  return <div className="inspector">
-    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
-    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
-      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
-      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
-      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
-        {transformReason && <p className="panel-hint">{transformReason}</p>}
-        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
-        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
-          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
-          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
-            const key = `${field}-${axis}`;
-            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
-            const value = values.length === nodes.length ? mixedValue(values) : null;
-            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
-          })}</div>
-          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
-        </div>)}
-      </section>
-      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
-        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
-          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
-          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
-          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
-        })}
-        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
-      </section>
-      <section aria-label="Геометрия"><h4>Геометрия</h4>
-        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
-          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
-        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
-      </section>
-      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
-      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
-    </>}
-    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
-    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
-  </div>;
-}
-
-function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
-  if (blocked) return "Дождитесь завершения операции.";
-  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
-  const access = accessReason(state.document.project, node);
-  if (access) return access;
-  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
-    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
-    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
-  return "";
-}
-
-function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
-  const [error, setError] = useState("");
-  const reason = meshRestriction(state, node, blocked);
-  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
-  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
-  function convert() {
-    const current = store.getSnapshot();
-    const selected = current.document.project.nodes.find(item => item.id === node.id);
-    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
-      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  const epoch = store.getProjectEpoch();
-  function enter() {
-    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
-    setError(message ?? "");
-  }
-  return <div className="mesh-edit-actions">
-    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
-    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
-      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
-      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
-    {restriction && <p className="panel-hint">{restriction}</p>}
-    {error && <p className="primitive-error" role="alert">{error}</p>}
-  </div>;
-}
-
-function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
-  const [error, setError] = useState("");
-  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
-  const epoch = store.getProjectEpoch();
-  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
-  const nodeId = node.id;
-  const reason = meshRestriction(state, node, blocked);
-  function apply() {
-    const current = store.getSnapshot();
-    const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
-      setError("Проект или выделение изменилось. Повторите действие."); return;
-    }
-    const parsed = delta.map(parseNumber);
-    const failure = parsed.find(item => !item.ok);
-    if (failure && !failure.ok) { setError(failure.message); return; }
-    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
-    if (values.every(value => value === 0)) { setError(""); return; }
-    const vertices = store.selectedMeshVertices();
-    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId],
-      payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
-  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
-  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
-    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
-    <p className="panel-hint">Локальные координаты объекта</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count} onClick={apply}>Применить смещение</button>
-    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
-  </section>;
-}
-
-function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
-  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
-  const specs = primitiveDefinitions[source.primitive].parameters;
-  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
-    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
-  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
-  const [draft, setDraft] = useState<Record<string, string>>({});
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const session = useRef<EditSession | null>(null);
-  const epoch = store.getProjectEpoch();
-  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
-  function apply(key: string, raw: string) {
-    const captured = session.current;
-    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
-    if (!captured.touched) { setEditing(null); session.current = null; return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { setError(parsed.message); return; }
-    const next = updatedPrimitiveSource(source, key, parsed.value);
-    if (!next.ok) { setError(next.message); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
-    if (!result.ok) { setError(result.message); return; }
-    setEditing(null); setDraft({}); setError(""); session.current = null;
-  }
-  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
-    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
-    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
-    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
-  </div>;
-}
-</file>
-
 <file path="tests/app/editor-store.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import { applyProjectPatch, createProject } from "../../src/domain";
@@ -13507,6 +13478,257 @@ export class SceneSync {
   private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
   private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
   dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+}
+</file>
+
+<file path="src/ui/Inspector.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
+import type { Node } from "../domain/types";
+import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
+import { BooleanEditor } from "./BooleanEditor";
+import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
+
+const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
+const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
+const format = (value: number) => String(Number(value.toPrecision(12)));
+type TransformSession = EditSession & { groupId: string; applied?: string };
+
+export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const project = state.document.project;
+  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
+  const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState<{ field: string; message: string } | null>(null);
+  const session = useRef<TransformSession | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const epoch = store.getProjectEpoch();
+  const selectedIds = selectionKey(state);
+  useEffect(() => {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null; session.current = null; setEditing(null); setError(null);
+    return () => { if (pending.current) clearTimeout(pending.current); };
+  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
+  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
+  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
+  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
+  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
+  const displayReason = displays.find(item => !item.ok);
+  const disabled = !!transformReason || !!displayReason;
+  function begin(key: string, value: number | null) {
+    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
+    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
+  }
+  function cancel(rollback = false) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    const captured = session.current;
+    if (rollback && captured?.applied && validSession(store, captured)) {
+      const current = store.getSnapshot();
+      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
+    }
+    session.current = null; setEditing(null); setError(null);
+  }
+  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
+    const captured = session.current;
+    if (!captured || captured.field !== key) return;
+    if (!validSession(store, captured) || blocked) { cancel(); return; }
+    if (!captured.touched) { if (final) cancel(); return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
+    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
+    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
+    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
+    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
+    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
+    captured.revision = result.revision;
+    captured.applied = raw;
+    if (final) cancel();
+  }
+  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    applyValue(field, axis, key, draft, true, currentValue);
+  }
+  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
+  }
+  function reset(field: TransformField) {
+    if (disabled) return;
+    const current = store.getSnapshot();
+    const prepared = prepareTransformCommands(current, { field, reset: true });
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else cancel();
+  }
+  function changeFlag(field: "visible" | "locked", value: boolean) {
+    if (flagReason) return;
+    const current = store.getSnapshot();
+    const prepared = prepareFlagCommands(current, field, value);
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else setError(null);
+  }
+  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
+  const axisLabels = ["X", "Y", "Z"] as const;
+  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
+  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
+  return <div className="inspector">
+    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
+    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
+      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
+      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
+      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
+        {transformReason && <p className="panel-hint">{transformReason}</p>}
+        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
+        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
+          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
+          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
+            const key = `${field}-${axis}`;
+            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
+            const value = values.length === nodes.length ? mixedValue(values) : null;
+            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
+          })}</div>
+          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
+        </div>)}
+      </section>
+      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
+        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
+          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
+          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
+          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
+        })}
+        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
+      </section>
+      <section aria-label="Геометрия"><h4>Геометрия</h4>
+        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
+          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
+        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
+      </section>
+      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
+      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
+    </>}
+    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
+    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
+  </div>;
+}
+
+function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
+  if (blocked) return "Дождитесь завершения операции.";
+  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
+  const access = accessReason(state.document.project, node);
+  if (access) return access;
+  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
+    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
+    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
+  return "";
+}
+
+function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
+  const [error, setError] = useState("");
+  const reason = meshRestriction(state, node, blocked);
+  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
+  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
+  function convert() {
+    const current = store.getSnapshot();
+    const selected = current.document.project.nodes.find(item => item.id === node.id);
+    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
+      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  const epoch = store.getProjectEpoch();
+  function enter() {
+    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
+    setError(message ?? "");
+  }
+  return <div className="mesh-edit-actions">
+    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
+      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
+      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
+    {restriction && <p className="panel-hint">{restriction}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </div>;
+}
+
+function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
+  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
+  const [moveError, setMoveError] = useState("");
+  const [scaleError, setScaleError] = useState("");
+  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+  const epoch = store.getProjectEpoch();
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
+  const nodeId = node.id;
+  const reason = meshRestriction(state, node, blocked);
+  function apply(kind: "move" | "scale") {
+    const setError = kind === "move" ? setMoveError : setScaleError;
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
+      setError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
+    const failure = parsed.find(item => !item.ok);
+    if (failure && !failure.ok) { setError(failure.message); return; }
+    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
+    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
+    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
+    const vertices = store.selectedMeshVertices();
+    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
+    const result = kind === "move"
+      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
+      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
+  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
+  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
+    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
+    <p className="panel-hint">Локальные координаты объекта</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
+    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
+    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
+    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
+  </section>;
+}
+
+function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
+  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
+  const specs = primitiveDefinitions[source.primitive].parameters;
+  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
+    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
+  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const session = useRef<EditSession | null>(null);
+  const epoch = store.getProjectEpoch();
+  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
+  function apply(key: string, raw: string) {
+    const captured = session.current;
+    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
+    if (!captured.touched) { setEditing(null); session.current = null; return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { setError(parsed.message); return; }
+    const next = updatedPrimitiveSource(source, key, parsed.value);
+    if (!next.ok) { setError(next.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
+    if (!result.ok) { setError(result.message); return; }
+    setEditing(null); setDraft({}); setError(""); session.current = null;
+  }
+  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
+    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
+    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
+    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
+  </div>;
 }
 </file>
 
@@ -14216,7 +14438,7 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
-import { convertPrimitiveToEditable, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
+import { convertPrimitiveToEditable, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
 export type ProjectCommand =
@@ -14228,6 +14450,7 @@ export type ProjectCommand =
   | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
+  | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
   | { commandId: string; type: "GROUP_NODES"; targetIds: EntityId[]; payload: { nodeIds: EntityId[]; group: Node } }
   | { commandId: string; type: "UNGROUP_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
@@ -14379,6 +14602,10 @@ function validCommand(value: unknown): value is ProjectCommand {
       && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
       && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
       && numbers(payload.delta, 3);
+    case "SCALE_EDITABLE_VERTICES": return ownKeys(payload, ["nodeId", "vertexIndices", "factors"])
+      && Array.isArray(payload.vertexIndices) && payload.vertexIndices.length > 0
+      && payload.vertexIndices.every((index: unknown) => Number.isSafeInteger(index) && (index as number) >= 0)
+      && numbers(payload.factors, 3);
     case "RENAME_NODE": return ownKeys(payload, ["nodeId", "name"]) && typeof payload.name === "string" && !!payload.name.trim();
     case "SET_NODE_TRANSFORM": return ownKeys(payload, ["nodeId", "transform"]) && validTransform(payload.transform);
     case "SET_PRIMITIVE_PARAMETERS": return ownKeys(payload, ["nodeId", "source"]) && record(payload.source)
@@ -14666,10 +14893,13 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       catch (error) { return failure(command.commandId, CommandErrorCode.VALIDATION_FAILED, error instanceof Error ? error.message : "Геометрия недопустима."); }
       break;
     case "TRANSLATE_EDITABLE_VERTICES":
+    case "SCALE_EDITABLE_VERTICES":
       if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
-        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перенос требует редактируемую сетку.");
+        return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
-        const source = translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta);
+        const source = command.type === "TRANSLATE_EDITABLE_VERTICES"
+          ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
+          : scaleEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.factors);
         if (source !== current.meshSource && (current.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled) || activeDependents(project, current.id)))
           return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Перед редактированием отключите активные модификаторы и зависимые Boolean.");
         next = source === current.meshSource ? current : { ...current, meshSource: source };
@@ -15466,6 +15696,12 @@ function EditorShell() {
 - Выделение отображается временным overlay, следует трансформациям узла и освобождается при смене режима/геометрии/renderer. После геометрического изменения выбор рёбер и граней очищается, чтобы идентификаторы не относились к прежней сетке. Проект и архив не содержат runtime selection.
 - Численное локальное смещение проходит через `TRANSLATE_EDITABLE_VERTICES`, валидацию и Undo/Redo. Extrude и масштабирование элементов остаются незавершёнными; TASK-024 остаётся PARTIAL.
 - Проверки: typecheck, lint, целевые Vitest и build прошли. Ручной browser smoke для CODEX-024C не выполнен (UNVERIFIED).
+
+## CODEX-024D — Численное масштабирование элементов Editable Mesh (часть TASK-024)
+
+- `scaleEditableVertices` масштабирует выбранные геометрические вершины относительно общего локального центра и обновляет совпадающие render vertices на UV seams. Результат проверяется после Float32; вырожденная или нечисловая геометрия отклоняется целиком. Единичное и фактически неизменное масштабирование не создаёт историю.
+- `SCALE_EDITABLE_VERTICES` проходит через CommandBus с прежними проверками доступа, ревизии, модификаторов и зависимых Boolean. Inspector предоставляет русскоязычные поля X/Y/Z для Vertex/Edge/Face; одна выбранная вершина сопровождается объяснением недоступности. EditorStore сохраняет допустимый Vertex selection и очищает Edge/Face selection после изменения геометрии.
+- Целевые Vitest: 6 файлов, 64 теста PASS; `npm run typecheck`, `npm run lint`, `npm run build` PASS. Подтверждены Undo/Redo, SceneSync/GPU disposal и round trip `.triad3d` на уровне тестов. Ручной browser smoke не выполнен (UNVERIFIED). Extrude остаётся незавершённым; TASK-024 и FR-013 остаются PARTIAL. Build сохраняет прежнее предупреждение о крупном chunk.
 </file>
 
 </files>
