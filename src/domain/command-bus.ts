@@ -6,12 +6,13 @@ import { parseArrayParameters } from "../geometry/modifiers/array";
 import type { MirrorParameters } from "../geometry/modifiers/types";
 import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
-import type { BendParameters, TwistParameters, TaperParameters } from "../geometry/modifiers/types";
+import { parseBevelParameters } from "../geometry/modifiers/bevel";
+import type { BendParameters, TwistParameters, TaperParameters, BevelParameters } from "../geometry/modifiers/types";
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
 
-type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters };
+type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
   | { commandId: string; type: "ADD_NODE"; targetIds: [EntityId, EntityId]; payload: { parentId: EntityId; node: Node } }
   | { commandId: string; type: "ADD_MESH_ASSET"; targetIds: [EntityId, EntityId, EntityId]; payload: { parentId: EntityId; node: MeshNode; asset: Asset | null } }
@@ -34,7 +35,7 @@ export type ProjectCommand =
   | { commandId: string; type: "ADD_MIRROR_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "UPDATE_MIRROR_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "ADD_DEFORM_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId } & DeformPayload }
-  | { commandId: string; type: "UPDATE_DEFORM_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: BendParameters | TwistParameters | TaperParameters } }
+  | { commandId: string; type: "UPDATE_DEFORM_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters } }
   | { commandId: string; type: "SET_MODIFIER_ENABLED"; targetIds: [EntityId]; payload: { modifierId: EntityId; enabled: boolean } }
   | { commandId: string; type: "MOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; toIndex: number } }
   | { commandId: string; type: "REMOVE_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId } };
@@ -85,10 +86,11 @@ const idList = (value: unknown): value is string[] => Array.isArray(value) && va
 const numbers = (value: unknown, count: number): value is number[] =>
   Array.isArray(value) && value.length === count && value.every((item) => typeof item === "number" && Number.isFinite(item));
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
-function parseDeform(kind: unknown, parameters: unknown): BendParameters | TwistParameters | TaperParameters {
+function parseDeform(kind: unknown, parameters: unknown): BendParameters | TwistParameters | TaperParameters | BevelParameters {
   if (kind === "bend") return parseBendParameters(parameters);
   if (kind === "twist") return parseTwistParameters(parameters);
   if (kind === "taper") return parseTaperParameters(parameters);
+  if (kind === "bevel") return parseBevelParameters(parameters);
   throw new Error("Неизвестный вид деформации.");
 }
 const samePrimitive = (left: PrimitiveSource, right: PrimitiveSource): boolean => left.primitive === right.primitive
@@ -424,12 +426,13 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
         modifier.parameters = structuredClone(parameters);
       }
     } else if (command.type === "UPDATE_DEFORM_MODIFIER") {
-      if (modifier.kind !== "bend" && modifier.kind !== "twist" && modifier.kind !== "taper")
+      if (modifier.kind !== "bend" && modifier.kind !== "twist" && modifier.kind !== "taper" && modifier.kind !== "bevel")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является деформацией.");
-      let parameters: BendParameters | TwistParameters | TaperParameters;
+      let parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters;
       try { parameters = parseDeform(modifier.kind, command.payload.parameters); }
       catch { return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Параметры деформации недопустимы."); }
-      if (!same(parseDeform(modifier.kind, modifier.parameters), parameters)) {
+      const effective = (value: typeof parameters) => modifier.kind === "bevel" ? { ...value, angleDegrees: "angleDegrees" in value ? value.angleDegrees : 30 } : value;
+      if (!same(effective(parseDeform(modifier.kind, modifier.parameters)), effective(parameters))) {
         if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
         modifier.parameters = structuredClone(parameters);
       }

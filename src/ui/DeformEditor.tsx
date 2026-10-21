@@ -3,32 +3,37 @@ import { applyDeformChange, type DeformChange, type DeformKind } from "../app/de
 import type { DeepReadonly, EditorStore } from "../app/editor-store";
 import type { Modifier } from "../domain/types";
 import { parseBendParameters, parseTaperParameters, parseTwistParameters } from "../geometry/modifiers/deform";
-import type { BendParameters, DeformAxis, TaperParameters, TwistParameters } from "../geometry/modifiers/types";
+import { parseBevelParameters } from "../geometry/modifiers/bevel";
+import type { BendParameters, DeformAxis, TaperParameters, TwistParameters, BevelParameters } from "../geometry/modifiers/types";
 import { parseNumber } from "./inspector-logic";
 
-type Parameters = BendParameters | TwistParameters | TaperParameters;
-type Draft = { axis: DeformAxis; direction: DeformAxis; angleDegrees: string; startScale: string; endScale: string; pivot: [string, string, string] };
+type Parameters = BendParameters | TwistParameters | TaperParameters | BevelParameters;
+type Draft = { axis: DeformAxis; direction: DeformAxis; width: string; angleDegrees: string; startScale: string; endScale: string; pivot: [string, string, string] };
 type Session = { epoch: object; revision: number; selection: string; modifierVersion?: number };
-const labels = { bend: "Изгиб", twist: "Скручивание", taper: "Сужение / расширение" } as const;
+const labels = { bend: "Изгиб", twist: "Скручивание", taper: "Сужение / расширение", bevel: "Фаска (Bevel)" } as const;
 const axes: DeformAxis[] = ["x", "y", "z"];
 const defaults: Record<DeformKind, Parameters> = {
   bend: { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] },
   twist: { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] },
   taper: { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] },
+  bevel: { width: 0.1, angleDegrees: 30 },
 };
 function makeDraft(kind: DeformKind, parameters: Parameters): Draft {
-  return { axis: parameters.axis, direction: kind === "bend" && "direction" in parameters ? parameters.direction : "x",
-    angleDegrees: "angleDegrees" in parameters ? String(parameters.angleDegrees) : "0",
+  return { axis: "axis" in parameters ? parameters.axis : "y", direction: kind === "bend" && "direction" in parameters ? parameters.direction : "x",
+    width: "width" in parameters ? String(parameters.width) : "0.1",
+    angleDegrees: "angleDegrees" in parameters && parameters.angleDegrees !== undefined ? String(parameters.angleDegrees) : kind === "bevel" ? "30" : "0",
     startScale: "startScale" in parameters ? String(parameters.startScale) : "1",
     endScale: "endScale" in parameters ? String(parameters.endScale) : "0.8",
-    pivot: parameters.pivot.map(String) as [string, string, string] };
+    pivot: "pivot" in parameters ? parameters.pivot.map(String) as [string, string, string] : ["0", "0", "0"] };
 }
 function parseDraft(kind: "bend", draft: Draft): BendParameters;
 function parseDraft(kind: "twist", draft: Draft): TwistParameters;
 function parseDraft(kind: "taper", draft: Draft): TaperParameters;
+function parseDraft(kind: "bevel", draft: Draft): BevelParameters;
 function parseDraft(kind: DeformKind, draft: Draft): Parameters;
 function parseDraft(kind: DeformKind, draft: Draft): Parameters {
   const numeric = (text: string) => { const result = parseNumber(text); if (!result.ok) throw new Error(result.message); return result.value; };
+  if (kind === "bevel") return parseBevelParameters({ width: numeric(draft.width), angleDegrees: numeric(draft.angleDegrees) });
   const pivot = draft.pivot.map(numeric) as [number, number, number];
   if (kind === "bend") return parseBendParameters({ axis: draft.axis, direction: draft.direction, angleDegrees: numeric(draft.angleDegrees), pivot });
   if (kind === "twist") return parseTwistParameters({ axis: draft.axis, angleDegrees: numeric(draft.angleDegrees), pivot });
@@ -46,8 +51,9 @@ function fresh(store: EditorStore, session: Session, modifierId?: string): boole
 }
 
 function Fields({ kind, draft, setDraft, disabled }: { kind: DeformKind; draft: Draft; setDraft: (value: Draft) => void; disabled: boolean }) {
-  const number = (label: string, key: "angleDegrees" | "startScale" | "endScale") =>
+  const number = (label: string, key: "width" | "angleDegrees" | "startScale" | "endScale") =>
     <label>{label}<input type="text" inputMode="decimal" value={draft[key]} disabled={disabled} onChange={event => setDraft({ ...draft, [key]: event.target.value })} onKeyDown={event => event.stopPropagation()} /></label>;
+  if (kind === "bevel") return <>{number("Ширина фаски", "width")}{number("Порог угла, °", "angleDegrees")}</>;
   return <>
     <label>Ось<select value={draft.axis} disabled={disabled} onChange={event => setDraft({ ...draft, axis: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>
     {kind === "bend" && <label>Направление изгиба<select value={draft.direction} disabled={disabled} onChange={event => setDraft({ ...draft, direction: event.target.value as DeformAxis })}>{axes.map(axis => <option key={axis} value={axis}>{axis.toUpperCase()}</option>)}</select></label>}
@@ -71,10 +77,11 @@ export function DeformAdd({ store, targetId, disabled, reason }: { store: Editor
     try {
       if (kind === "bend") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
       else if (kind === "twist") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
+      else if (kind === "taper") change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
       else change = { type: "add", targetId, kind, parameters: parseDraft(kind, draft) };
     } catch (error) { setMessage(error instanceof Error ? error.message : "Недопустимые параметры."); return; }
     const result = await applyDeformChange(store, change);
-    setMessage(result.ok ? result.committed ? "Деформация добавлена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
+    setMessage(result.ok ? result.committed ? kind === "bevel" ? "Фаска добавлена." : "Деформация добавлена." : "Изменений нет." : `${result.error.code}: ${result.error.message}`);
     session.current = null;
   }
   return <section className="boolean-editor" aria-label="Деформации"><h4>Деформации</h4>
@@ -82,22 +89,23 @@ export function DeformAdd({ store, targetId, disabled, reason }: { store: Editor
     <div onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); event.stopPropagation(); void add(); } else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setDraft(makeDraft(kind, defaults[kind])); session.current = null; setMessage(""); } }}>
       <Fields kind={kind} draft={draft} setDraft={change} disabled={disabled || !!reason} />
     </div>
-    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void add()}>Добавить деформацию</button>
+    <button type="button" disabled={disabled || !!reason} title={reason || undefined} onClick={() => void add()}>{kind === "bevel" ? "Добавить фаску" : "Добавить деформацию"}</button>
     {reason && <p className="panel-hint">{reason}</p>}{message && <p className="primitive-error" role="status">{message}</p>}
     <p className="panel-hint">Деформация пересчитывает нормали. Исходные UV, авторские нормали и группы материалов в MeshData результата не сохраняются.</p>
+    {kind === "bevel" && <p className="panel-hint">Фаска рассчитана на выпуклые замкнутые ориентированные сетки: до 4096 треугольников и 256 срезов. Ширина должна быть меньше половины кратчайшего ребра. Открытые и невыпуклые сетки могут отклоняться; при изменении геометрии UV, авторские нормали и группы материалов не сохраняются.</p>}
   </section>;
 }
 
 export function DeformItem({ store, targetId, modifier, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; index: number; length: number; disabled: boolean; reason: string }) {
   const kind = modifier.kind;
-  if (kind !== "bend" && kind !== "twist" && kind !== "taper") return null;
+  if (kind !== "bend" && kind !== "twist" && kind !== "taper" && kind !== "bevel") return null;
   return <DeformItemForm key={`${modifier.id}:${modifier.version}`} store={store} targetId={targetId} modifier={modifier} kind={kind} index={index} length={length} disabled={disabled} reason={reason} />;
 }
 function DeformItemForm({ store, targetId, modifier, kind, index, length, disabled, reason }: { store: EditorStore; targetId: string; modifier: DeepReadonly<Modifier>; kind: DeformKind; index: number; length: number; disabled: boolean; reason: string }) {
   const [message, setMessage] = useState("");
   const session = useRef<Session | null>(null);
   const renderedEpoch = useRef(store.getProjectEpoch());
-  const parameters = (() => { try { return kind === "bend" ? parseBendParameters(modifier.parameters) : kind === "twist" ? parseTwistParameters(modifier.parameters) : parseTaperParameters(modifier.parameters); } catch { return null; } })();
+  const parameters = (() => { try { return kind === "bend" ? parseBendParameters(modifier.parameters) : kind === "twist" ? parseTwistParameters(modifier.parameters) : kind === "taper" ? parseTaperParameters(modifier.parameters) : parseBevelParameters(modifier.parameters); } catch { return null; } })();
   const [draft, setDraft] = useState(() => makeDraft(kind, parameters ?? defaults[kind]));
   useEffect(() => { session.current = null; }, [modifier.id, modifier.version]);
   if (!parameters) return <p className="primitive-error" role="alert">{index + 1}. Параметры деформации повреждены.</p>;

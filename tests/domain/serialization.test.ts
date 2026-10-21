@@ -47,8 +47,9 @@ describe("project document schema v1", () => {
       { axis: "x", direction: "y", angleDegrees: 20, pivot: [0, 0, 0] },
       { axis: "z", angleDegrees: -30, pivot: [1, 0, 0] },
       { axis: "y", startScale: 0.5, endScale: 2, pivot: [0, 1, 0] },
+      { width: 0.1 },
     ];
-    for (const [order, kind] of (["bend", "twist", "taper"] as const).entries()) {
+    for (const [order, kind] of (["bend", "twist", "taper", "bevel"] as const).entries()) {
       const id = `deform-${order}`;
       project.modifiers.push({ id, nodeId: mesh.id, kind, order, version: order + 1, enabled: order !== 1, parameters: params[order]! });
       mesh.modifierIds.push(id);

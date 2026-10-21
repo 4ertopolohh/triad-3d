@@ -1,16 +1,17 @@
 import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
 import type { Project } from "../domain/types";
 import { ModifierEvaluator } from "../geometry/modifiers";
-import type { BendParameters, TaperParameters, TwistParameters } from "../geometry/modifiers/types";
+import type { BendParameters, TaperParameters, TwistParameters, BevelParameters } from "../geometry/modifiers/types";
 import type { EditorStore } from "./editor-store";
 import { isJobActive, type JobOutcome } from "./job-controller";
 
-export type DeformKind = "bend" | "twist" | "taper";
+export type DeformKind = "bend" | "twist" | "taper" | "bevel";
 export type DeformChange =
   | { type: "add"; targetId: string; kind: "bend"; parameters: BendParameters }
   | { type: "add"; targetId: string; kind: "twist"; parameters: TwistParameters }
   | { type: "add"; targetId: string; kind: "taper"; parameters: TaperParameters }
-  | { type: "update"; targetId: string; modifierId: string; parameters: BendParameters | TwistParameters | TaperParameters }
+  | { type: "add"; targetId: string; kind: "bevel"; parameters: BevelParameters }
+  | { type: "update"; targetId: string; modifierId: string; parameters: BendParameters | TwistParameters | TaperParameters | BevelParameters }
   | { type: "enable"; targetId: string; modifierId: string; enabled: boolean }
   | { type: "move"; targetId: string; modifierId: string; toIndex: number }
   | { type: "remove"; targetId: string; modifierId: string };
@@ -30,7 +31,7 @@ export async function applyDeformChange(store: EditorStore, change: DeformChange
   if (!target || target.kind !== "mesh") return failure(id, "Выберите один mesh.");
   if (target.meshSource.kind === "asset") return failure(id, "Деформации импортированного GLB пока недоступны: нет resolver геометрии.");
   if (change.type !== "add" && (!target.modifierIds.includes(change.modifierId)
-    || !["bend", "twist", "taper"].includes(project.modifiers.find(item => item.id === change.modifierId)?.kind ?? "")))
+    || !["bend", "twist", "taper", "bevel"].includes(project.modifiers.find(item => item.id === change.modifierId)?.kind ?? "")))
     return failure(id, "Деформация не принадлежит выбранному mesh.");
   const commandId = crypto.randomUUID();
   let command: ProjectCommand;
@@ -38,7 +39,8 @@ export async function applyDeformChange(store: EditorStore, change: DeformChange
     const modifierId = crypto.randomUUID();
     if (change.kind === "bend") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "bend", parameters: change.parameters } };
     else if (change.kind === "twist") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "twist", parameters: change.parameters } };
-    else command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "taper", parameters: change.parameters } };
+    else if (change.kind === "taper") command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "taper", parameters: change.parameters } };
+    else command = { commandId, type: "ADD_DEFORM_MODIFIER", targetIds: [target.id, modifierId], payload: { nodeId: target.id, modifierId, kind: "bevel", parameters: change.parameters } };
   } else if (change.type === "update") command = { commandId, type: "UPDATE_DEFORM_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, parameters: change.parameters } };
   else if (change.type === "enable") command = { commandId, type: "SET_MODIFIER_ENABLED", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, enabled: change.enabled } };
   else if (change.type === "move") command = { commandId, type: "MOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, toIndex: change.toIndex } };

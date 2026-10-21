@@ -8,6 +8,7 @@ import type { ModifierEvaluator } from "../../src/geometry/modifiers";
 const bend = { axis: "y", direction: "x", angleDegrees: 30, pivot: [0, 0, 0] } as const;
 const twist = { axis: "y", angleDegrees: 45, pivot: [0, 0, 0] } as const;
 const taper = { axis: "y", startScale: 1, endScale: 0.8, pivot: [0, 0, 0] } as const;
+const bevel = { width: 0.1, angleDegrees: 30 } as const;
 function fixture() {
   const project = createProject(() => crypto.randomUUID());
   const root = project.nodes[0]!;
@@ -19,6 +20,28 @@ function fixture() {
 }
 
 describe("deformation actions", () => {
+  it("commits Bevel through a job and supports update, disable, remove and undo", async () => {
+    const store = fixture();
+    expect(await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel })).toMatchObject({ ok: true, committed: true });
+    const id = store.getSnapshot().document.project.modifiers[0]!.id;
+    expect(await applyDeformChange(store, { type: "update", targetId: "target", modifierId: id, parameters: { width: 0.15 } })).toMatchObject({ ok: true, committed: true });
+    expect(await applyDeformChange(store, { type: "enable", targetId: "target", modifierId: id, enabled: false })).toMatchObject({ ok: true, committed: true });
+    expect(await applyDeformChange(store, { type: "remove", targetId: "target", modifierId: id })).toMatchObject({ ok: true, committed: true });
+    const revision = store.getSnapshot().document.revision;
+    expect(store.undo(revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.modifiers[0]?.id).toBe(id);
+    expect(store.redo(revision + 1).ok).toBe(true);
+    expect(store.getSnapshot().job.status).not.toBe("running");
+  });
+  it("rolls back failed Bevel geometry and invalid width", async () => {
+    const store = fixture();
+    const before = store.getSnapshot();
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: { width: 2 } })).ok).toBe(false);
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: { width: -1 } })).ok).toBe(false);
+    expect(store.getSnapshot().document).toEqual(before.document);
+    expect(store.getSnapshot().history).toEqual(before.history);
+    expect(store.getSnapshot().job.status).not.toBe("running");
+  });
   it("commits ordered Bend, Twist, Taper and supports update, toggle, reorder, remove and undo", async () => {
     const store = fixture();
     for (const change of [{ type: "add" as const, targetId: "target", kind: "bend" as const, parameters: bend },
@@ -45,7 +68,7 @@ describe("deformation actions", () => {
     const before = store.getSnapshot();
     const dispose = vi.fn();
     const factory = () => ({ evaluate: vi.fn(async () => ({ ok: false, error: { code: "GEOMETRY_DEGENERATE", message: "Некорректная сетка." } })), dispose }) as unknown as ModifierEvaluator;
-    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend }, factory)).ok).toBe(false);
+    expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel }, factory)).ok).toBe(false);
     expect(dispose).toHaveBeenCalledOnce();
     expect(store.getSnapshot().document).toEqual(before.document);
     expect(store.getSnapshot().history).toEqual(before.history);
@@ -77,7 +100,7 @@ describe("deformation actions", () => {
     const pending = new Promise<void>(resolve => { release = resolve; });
     const dispose = vi.fn();
     const factory = () => ({ evaluate: async () => { await pending; return { ok: true }; }, dispose }) as unknown as ModifierEvaluator;
-    const operation = applyDeformChange(store, { type: "add", targetId: "target", kind: "bend", parameters: bend }, factory);
+    const operation = applyDeformChange(store, { type: "add", targetId: "target", kind: "bevel", parameters: bevel }, factory);
     await vi.waitFor(() => expect(store.getSnapshot().job.status).toBe("running"));
     expect((await applyDeformChange(store, { type: "add", targetId: "target", kind: "twist", parameters: twist })).ok).toBe(false);
     expect(store.jobs.cancelJob()).toBe(true);
