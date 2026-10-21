@@ -6,8 +6,10 @@ import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
 import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
+import { applyMaterialPresetToNode, materialNodeReason } from "../app/material-actions";
+import { endMaterialDrag, materialDragActive, MATERIAL_PRESET_MIME, resolveMaterialDrop } from "../app/material-drag";
 
-export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean }) {
+export function Viewport({ store, mode, blocked, notice }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean; notice: (kind: "info" | "success" | "error", text: string) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const interactions = useRef<ViewportInteractions | null>(null);
   const state = useEditorStore(store);
@@ -22,6 +24,14 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   blockedRef.current = blocked;
   snapRef.current = snap;
   const [interactionError, setInteractionError] = useState<string | null>(null);
+  const [materialHover, setMaterialHover] = useState<"allowed" | "denied" | null>(null);
+  const [materialHoverReason, setMaterialHoverReason] = useState<string | null>(null);
+  useEffect(() => () => endMaterialDrag(), []);
+  useEffect(() => {
+    const clear = () => { setMaterialHover(null); setMaterialHoverReason(null); };
+    window.addEventListener("dragend", clear);
+    return () => window.removeEventListener("dragend", clear);
+  }, []);
   const [backendMode, setBackendMode] = useState<BackendMode>("auto");
   const [attempt, setAttempt] = useState(0);
   const [status, setStatus] = useState<RendererStatus>({ phase: "initializing", backend: "не определён", message: "Инициализация 3D…" });
@@ -65,7 +75,32 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
   const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
   const brushReason = brushUnavailable(state, blocked);
-  return <section className="renderer-viewport" aria-label="3D-предпросмотр модели">
+  return <section className={`renderer-viewport ${materialHover ? `material-drop-${materialHover}` : ""}`} aria-label="3D-предпросмотр модели"
+    onDragOver={event => {
+      const types = Array.from(event.dataTransfer.types);
+      const internal = materialDragActive(store, types);
+      const nodeId = internal ? interactions.current?.pickMaterialTarget(event.clientX, event.clientY) : null;
+      const reason = !internal ? null : !nodeId ? "Наведите материал на видимую поверхность Mesh."
+        : blocked ? "Дождитесь завершения операции." : materialNodeReason(store, nodeId);
+      const allowed = internal && !reason;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = allowed ? "copy" : "none";
+      setMaterialHover(internal ? allowed ? "allowed" : "denied" : null);
+      setMaterialHoverReason(reason);
+    }}
+    onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { setMaterialHover(null); setMaterialHoverReason(null); } }}
+    onDrop={event => {
+      event.preventDefault();
+      setMaterialHover(null);
+      setMaterialHoverReason(null);
+      const resolved = resolveMaterialDrop(store, Array.from(event.dataTransfer.types), event.dataTransfer.getData(MATERIAL_PRESET_MIME));
+      endMaterialDrag();
+      if (!resolved) { notice("error", "Неподдерживаемый или неизвестный материал."); return; }
+      const nodeId = interactions.current?.pickMaterialTarget(event.clientX, event.clientY);
+      if (!nodeId) { notice("error", "Перетащите материал на видимую поверхность Mesh."); return; }
+      const result = applyMaterialPresetToNode(store, resolved.preset, resolved.revision, nodeId, resolved.epoch);
+      notice(result.ok ? "success" : "error", result.message);
+    }}>
     <div className="renderer-toolbar">
       <div className="viewport-tools" role="group" aria-label="Режим выбора">
         <button type="button" aria-pressed={!subMode} onClick={() => store.exitMeshEditMode()}>Объект</button>
@@ -115,6 +150,7 @@ export function Viewport({ store, mode, blocked }: { store: EditorStore; mode: "
       {!subMode && state.tool.active !== "select" && state.tool.active !== "displace" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
       {subMode && <span>Выбор элементов: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
       {interactionError && <span role="alert">{interactionError}</span>}
+      {materialHoverReason && <span role="status">{materialHoverReason}</span>}
       {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
       {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
     </div>

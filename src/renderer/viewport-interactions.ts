@@ -250,6 +250,15 @@ export class ViewportInteractions {
     for (let i = 1; i <= steps; i++) samples.push(previous.clone().lerp(next, i / steps).toArray() as [number, number, number]);
   };
   private onPointerLeave = () => { if (!this.stroke) this.clearBrushPreview(); };
+
+  pickMaterialTarget(clientX: number, clientY: number): string | null {
+    if (this.disposed) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
+    this.raycaster.setFromCamera(new T.Vector2((clientX - rect.left) / rect.width * 2 - 1,
+      -(clientY - rect.top) / rect.height * 2 + 1), this.graph.camera);
+    return this.graph.surfaces.nearest(this.raycaster.ray, this.raycaster.near, this.raycaster.far)?.nodeId ?? null;
+  }
   private onLostCapture = () => { if (this.stroke) this.cancel("Мазок отменён: потерян захват указателя."); };
   private onPointerUp = (event: PointerEvent) => {
     if (this.store.getSnapshot().tool.active === "displace" || this.stroke) {

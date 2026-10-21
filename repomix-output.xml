@@ -79,6 +79,7 @@ src/
     deform-actions.ts
     editor-store.ts
     job-controller.ts
+    material-actions.ts
     mirror-actions.ts
     use-editor-store.ts
   assets/
@@ -124,9 +125,13 @@ src/
   importers/
     gltf/
       import-glb.ts
+  materials/
+    presets.ts
   renderer/
     adapter.ts
+    material-preview.ts
     modifier-preview.ts
+    pbr-material.ts
     primitive.ts
     scene-sync.ts
     sub-element-picking.ts
@@ -157,6 +162,7 @@ src/
     inspector-logic.ts
     Inspector.tsx
     JobOverlay.tsx
+    MaterialLibrary.tsx
     MirrorEditor.tsx
     ObjectTree.tsx
   main.tsx
@@ -168,6 +174,7 @@ tests/
     deform-actions.test.ts
     editor-store.test.ts
     job-controller.test.ts
+    material-actions.test.ts
     mirror-actions.test.ts
   assets/
     native-project-archive.test.ts
@@ -799,70 +806,6 @@ Complete dependencies in order. Estimates are planning targets, not commitments.
 - Artifact: release docs
 - Check: fresh-clone run
 - Estimate: 2–4 ч
-</file>
-
-<file path="docs/renderer-decision.md">
-# TASK-002 — WebGPU/WebGL2 и PBR
-
-Дата проверки: 19 октября 2026. Статус spike: **COMPLETED** для двух доступных backend в одном браузерном окружении. **ADR-004 остаётся PROPOSED** до межбраузерной и аппаратной проверки.
-
-## Воспроизведение
-
-```text
-npm ci
-npm run dev
-http://127.0.0.1:5173/?spike=renderer
-```
-
-Если порт занят, используйте адрес, напечатанный Vite. Режим доступен только в dev-сборке; обычный экран редактора открывается без query-параметра. Выберите оба режима по очереди, дождитесь статуса «Готово» и «HDRI: Загружен», затем нажмите «Сбросить вид». Сравнивайте при одинаковом размере окна. Контрольные снимки 1280×800: [WebGPU](renderer-snapshots/webgpu.jpg) и [WebGL2](renderer-snapshots/webgl2.jpg). На каждом снимке виден фактический backend.
-
-## Среда и версии
-
-| Параметр | Наблюдение |
-| --- | --- |
-| Three.js / `@types/three` | 0.186.1 / 0.186.0, зафиксированы в lockfile |
-| TypeScript | 5.9.3 |
-| ОС | Windows 11 Home, build 26300 |
-| Установленные GPU | NVIDIA GeForce GTX 1050 with Max-Q Design, Intel UHD Graphics 620; какой адаптер выбрал браузер, не определено |
-| Браузер испытания | Встроенный Chromium браузер Codex; точная версия не предоставлена инструментом |
-| Chrome / Edge | В этом испытании не использовались; версии и результаты `UNVERIFIED` |
-| Размер | viewport 1280×800 CSS px, canvas 1215×534 CSS px; устройство с DPR браузера |
-
-## Матрица совместимости
-
-`PASS` означает наблюдаемый результат в указанной среде; `UNVERIFIED` — отсутствие испытания, а не положительный результат.
-
-| Проверка | Auto / WebGPU preferred | Forced WebGL2 |
-| --- | --- | --- |
-| `renderer.init()` и кадр | PASS — фактически WebGPU | PASS — фактически WebGL2 |
-| Хром, отражения | PASS — яркие отражения HDRI видны на сфере | PASS — отражения видны |
-| Стекло, transmission / IOR | PASS — полосы позади сферы видны сквозь неё, отражения сохранены | PASS — тот же эффект виден |
-| Normal map | PASS — периодический рельеф заметен при направленном свете | PASS — рельеф заметен |
-| Локальный HDRI | PASS — загружен и виден в фоне и отражениях | PASS — загружен и виден |
-| Повторное переключение, один canvas | PASS | PASS |
-| Reset View | PASS — после вращения восстановлена фиксированная камера | NOT_APPLICABLE — отдельно не повторялось в этой ветке, код общий |
-| Автоматический fallback при отсутствии WebGPU | UNVERIFIED — WebGPU здесь доступен | NOT_APPLICABLE |
-| Отсутствие WebGL2 / ошибка GPU-инициализации | UNVERIFIED | UNVERIFIED |
-| Ошибка загрузки HDRI | UNVERIFIED — обработчик реализован, ресурс не повреждался для испытания | UNVERIFIED |
-| Другие браузеры и GPU | UNVERIFIED | UNVERIFIED |
-
-После перехода по ссылке «Вернуться в редактор» обычная страница показана без canvas. В консоли при первичной проверке обнаружено предупреждение об устаревшем `RGBELoader`; прототип переведён на `HDRLoader` и повторно проверен. Других ошибок и явных различий между снимками не выявлено. Снимки демонстрируют базовую работоспособность, но не являются пиксельным или колориметрическим сравнением. Для Studio Small 03 характерен большой перепад яркости: фон, подставка и стекло местами очень светлые; для будущих пресетов следует отдельно калибровать экспозицию.
-
-## Эталонная сцена и pipeline
-
-Оба режима создают сцену одной фабрикой. Сферы имеют одинаковую геометрию с UV и нормалями. Хром: `MeshPhysicalMaterial`, metalness 1, roughness 0.08. Стекло: transmission 1, IOR 1.5, thickness 1.4, opacity 1. Normal map детерминированно генерируется в canvas, помечена `NoColorSpace` и накладывается на UV-сферу. Общие камера, свет, HDRI, ACES Filmic tone mapping, exposure 1.25 и выходной `SRGBColorSpace` заданы независимо от backend. HDRI загружается как radiance data через `HDRLoader` и используется с `EquirectangularReflectionMapping`; Three.js выполняет необходимую обработку environment для PBR. При ошибке HDRI сцена остаётся с нейтральным освещением, а статус становится `FAILED`.
-
-HDRI: [Poly Haven — Studio Small 03](https://polyhaven.com/a/studio_small_03), автор Greg Zaal, 1K `.hdr`, 1 686 299 байт, SHA-256 `30933D55E45F0795DAF49F3CBEFBE0E5EBCB821EE04FB0A2818C02FFC3938817`. [Лицензия CC0](https://polyhaven.com/license). Файл хранится локально в `src/spikes/renderer/assets/` и включается только в dev-режим; сетевое соединение при запуске сцены не требуется.
-
-## Решение и ограничения
-
-Для TASK-014 рекомендован единый `WebGPURenderer` с предпочтением WebGPU и его WebGL2 fallback, а также явный `forceWebGL` для диагностики и тестов. Показывать backend следует по `renderer.backend` **после** `await renderer.init()`, не по `navigator.gpu` и не по `isWebGPURenderer`, который обозначает класс renderer. При невозможности инициализации — ошибка и ручной повторный запуск, без бесконечных попыток. Владение canvas, loop, controls, textures, materials и geometries должно быть ограничено жизненным циклом adapter; TASK-014 отдельно реализует context-loss recovery и синхронизацию из утверждённого доменного состояния.
-
-Для TASK-029 следует зафиксировать поддерживаемую PBR-схему и цветовые пространства: normal map — данные, цветовые текстуры — sRGB, HDR environment — линейный радианс. Перед production нужны visual golden для металла и стекла на разных устройствах. Для TASK-036 профили качества должны иметь измеренную матрицу возможностей каждого backend и явные предупреждения о деградации. FPS и бюджет памяти в этом spike не измерялись.
-
-По [руководству Three.js](https://threejs.org/manual/pages/webgpurenderer) `WebGPURenderer` остаётся экспериментальным; классические `ShaderMaterial`, `RawShaderMaterial`, `onBeforeCompile()` и старый `EffectComposer` не поддерживаются этим renderer. Пользовательские эффекты для него потребуют node materials / TSL и отдельной проверки обеих веток. Это ограничение документации, **не результат запуска таких эффектов в данном spike**. [API `WebGPURenderer`](https://threejs.org/docs/pages/WebGPURenderer.html) подтверждает `forceWebGL`; [API `MeshPhysicalMaterial`](https://threejs.org/docs/pages/MeshPhysicalMaterial.html) подтверждает требование `opacity: 1` при ненулевом transmission.
-
-Двух успешных запусков в одном браузере недостаточно для окончательного выбора production backend. До принятия ADR-004 нужны Chrome и Edge с зафиксированными версиями и фактически выбранным GPU, испытание отсутствия WebGPU/WebGL2, HDRI decode failure, context loss, серия переключений под профилировщиком, сравнение качества/производительности и тест будущих материалов и postprocessing. Пока стратегия — предпочтение WebGPU с наблюдаемым WebGL2 fallback, без заявления о полной эквивалентности.
 </file>
 
 <file path="docs/requirements.json">
@@ -3611,6 +3554,51 @@ export function createJobController(host: Host): JobController {
 }
 </file>
 
+<file path="src/app/material-actions.ts">
+import type { EditorStore } from "./editor-store";
+import type { ProjectCommand } from "../domain/command-bus";
+import { matchesPreset, type MaterialPreset } from "../materials/presets";
+import { isJobActive } from "./job-controller";
+
+export function materialTargetReason(store: EditorStore): string | null {
+  const state = store.getSnapshot();
+  if (state.tool.mode !== "model") return "Переключитесь в режим «Модель».";
+  if (state.selection.ids.length !== 1 || !state.selection.activeId) return "Выберите один Mesh-объект.";
+  const project = state.document.project;
+  const node = project.nodes.find(item => item.id === state.selection.activeId);
+  if (node?.kind !== "mesh") return "Выберите Mesh, а не группу.";
+  if (node.meshSource.kind === "asset") return "Назначение материала импортированному GLB будет доступно при управлении слотами.";
+  if (node.materialSlots.length > 1) return "У объекта несколько слотов материала.";
+  let current: typeof project.nodes[number] | undefined = node;
+  while (current) {
+    if (current.locked) return "Объект или его родитель заблокирован.";
+    if (!current.visible) return "Объект или его родитель скрыт.";
+    current = project.nodes.find(item => item.id === current!.parentId);
+  }
+  if (isJobActive(state.job.status)) return "Дождитесь завершения операции.";
+  return null;
+}
+
+export function applyMaterialPreset(store: EditorStore, preset: MaterialPreset, expectedRevision: number, expectedNodeId: string, expectedEpoch = store.getProjectEpoch()): { ok: boolean; message: string } {
+  const state = store.getSnapshot();
+  if (state.document.revision !== expectedRevision || state.selection.activeId !== expectedNodeId || store.getProjectEpoch() !== expectedEpoch) return { ok: false, message: "Проект или выбор изменился. Повторите действие." };
+  const reason = materialTargetReason(store);
+  if (reason) return { ok: false, message: reason };
+  const project = state.document.project;
+  const node = project.nodes.find(item => item.id === expectedNodeId)!;
+  const assigned = project.materials.find(item => item.id === node.materialSlots[0]?.materialId);
+  if (assigned && matchesPreset(assigned, preset)) return { ok: true, message: "Материал уже назначен." };
+  const existing = project.materials.find(item => matchesPreset(item, preset));
+  const materialId = existing?.id ?? crypto.randomUUID();
+  if (node.materialSlots[0]?.materialId === materialId) return { ok: true, message: "Материал уже назначен." };
+  const commands: ProjectCommand[] = [];
+  if (!existing) commands.push({ commandId: crypto.randomUUID(), type: "ADD_MATERIAL", targetIds: [materialId], payload: { material: { ...structuredClone(preset.material), id: materialId } } });
+  commands.push({ commandId: crypto.randomUUID(), type: "SET_MATERIAL_SLOT", targetIds: [expectedNodeId, materialId], payload: { nodeId: expectedNodeId, slotName: node.materialSlots[0]?.name ?? "Основной", materialId } });
+  const result = store.executeTransaction(commands, expectedRevision, crypto.randomUUID());
+  return result.ok ? { ok: true, message: `${preset.name} назначен.` } : { ok: false, message: result.message };
+}
+</file>
+
 <file path="src/app/mirror-actions.ts">
 import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
 import type { Project } from "../domain/types";
@@ -5957,6 +5945,118 @@ export function normalizeVertexIndices(source: { readonly positions: readonly nu
 }
 </file>
 
+<file path="src/materials/presets.ts">
+import type { Material } from "../domain/types";
+import type { DeepReadonly } from "../app/editor-store";
+
+export type MaterialCategory = "metal" | "glass" | "plastic" | "stone" | "abstract";
+export interface MaterialPreset { id: string; name: string; category: MaterialCategory; description: string; keywords: string; material: Omit<Material, "id"> }
+export const categories: readonly { id: MaterialCategory; label: string }[] = [
+  { id: "metal", label: "Металлы" }, { id: "glass", label: "Стекло" }, { id: "plastic", label: "Пластик" },
+  { id: "stone", label: "Камень" }, { id: "abstract", label: "Абстрактные" },
+];
+// UI colors are specified in sRGB; the document and Three.Color use Linear-sRGB.
+export function srgbChannelToLinear(value: number): number { const c = value / 255; return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }
+export function hexToLinear(hex: string): readonly [number, number, number] {
+  const value = hex.replace(/^#/, "");
+  if (!/^[0-9a-fA-F]{6}$/.test(value)) throw new Error("Некорректный цвет пресета.");
+  return [0, 2, 4].map(index => srgbChannelToLinear(parseInt(value.slice(index, index + 2), 16))) as [number, number, number];
+}
+const make = (id: string, name: string, category: MaterialCategory, description: string, color: string,
+  params: Partial<Pick<Material, "metalness" | "roughness" | "transmission" | "ior" | "clearcoat" | "envIntensity" | "emissive">>, keywords = ""): MaterialPreset => ({
+  id, name, category, description, keywords,
+  material: { name, baseColor: hexToLinear(color), metalness: 0, roughness: .5, emissive: [0, 0, 0], opacity: 1,
+    transmission: 0, ior: 1.5, clearcoat: 0, envIntensity: 1, textureAssetIds: [], ...params },
+});
+export const materialPresets: readonly MaterialPreset[] = [
+  make("polished-chrome", "Полированный хром", "metal", "Зеркальный холодный металл", "#d8dce2", { metalness: 1, roughness: .07, envIntensity: 1.5 }, "хром зеркальный"),
+  make("brushed-steel", "Сталь", "metal", "Сталь с мягкими отражениями", "#aeb6be", { metalness: 1, roughness: .34, envIntensity: 1.25 }, "металл"),
+  make("clear-glass", "Прозрачное стекло", "glass", "Чистое стекло · IOR 1,5", "#edf7fa", { roughness: .025, transmission: 1, ior: 1.5, envIntensity: 1.2 }, "прозрачный"),
+  make("matte-plastic", "Матовый пластик", "plastic", "Нейтральный пластик без бликов", "#6887a6", { roughness: .8, ior: 1.46 }, "полимер"),
+  make("basic-stone", "Базовый камень", "stone", "Минеральная поверхность без текстуры", "#88867f", { roughness: .93, ior: 1.5 }, "матовый минерал"),
+  make("emissive-violet", "Светящийся фиолетовый", "abstract", "Цветная эмиссия", "#321a63", { roughness: .38, emissive: hexToLinear("#b64aff") }, "свечение эмиссия"),
+];
+export function filterPresets(query: string, category: MaterialCategory | "all"): MaterialPreset[] {
+  const normalized = query.trim().toLocaleLowerCase("ru");
+  return materialPresets.filter(preset => (category === "all" || preset.category === category)
+    && (!normalized || `${preset.name} ${preset.description} ${preset.keywords}`.toLocaleLowerCase("ru").includes(normalized)));
+}
+export function matchesPreset(material: DeepReadonly<Material>, preset: MaterialPreset): boolean {
+  const { id: _id, name: _name, ...values } = material;
+  void _id; void _name;
+  const { name: _presetName, ...presetValues } = preset.material;
+  void _presetName;
+  return JSON.stringify(values) === JSON.stringify(presetValues);
+}
+</file>
+
+<file path="src/renderer/material-preview.ts">
+import * as T from "three";
+import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
+import hdriUrl from "../spikes/renderer/assets/studio_small_03_1k.hdr?url";
+import { materialPresets } from "../materials/presets";
+import { createPhysicalMaterial } from "./pbr-material";
+
+export type PreviewResult = { images: Map<string, string>; warning: string | null };
+let cache: Promise<PreviewResult> | undefined;
+export function getMaterialPreviews(): Promise<PreviewResult> { return cache ??= renderPreviews(); }
+
+async function renderPreviews(): Promise<PreviewResult> {
+  const images = new Map<string, string>();
+  let renderer: T.WebGLRenderer | undefined;
+  let environment: T.DataTexture | undefined;
+  const geometry = new T.SphereGeometry(.9, 48, 32);
+  const scene = new T.Scene();
+  const camera = new T.PerspectiveCamera(35, 1, .1, 10);
+  camera.position.set(0, .15, 3.6); camera.lookAt(0, 0, 0);
+  const sphere = new T.Mesh(geometry, new T.MeshPhysicalMaterial());
+  scene.add(sphere);
+  scene.add(new T.HemisphereLight(0xffffff, 0x60646d, 1.5));
+  const key = new T.DirectionalLight(0xffffff, 2.2); key.position.set(2, 3, 4); scene.add(key);
+  const rim = new T.DirectionalLight(0xddeaff, 1.3); rim.position.set(-3, 1, -2); scene.add(rim);
+  let warning: string | null = null;
+  try {
+    renderer = new T.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true, powerPreference: "low-power" });
+    renderer.setSize(180, 180, false);
+    renderer.outputColorSpace = T.SRGBColorSpace;
+    renderer.toneMapping = T.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.25;
+    try {
+      environment = await new RGBELoader().loadAsync(hdriUrl);
+      environment.mapping = T.EquirectangularReflectionMapping;
+      scene.environment = environment;
+    } catch { warning = "HDRI недоступен. Превью показаны при нейтральном освещении."; }
+    for (const preset of materialPresets) {
+      const previous = sphere.material;
+      sphere.material = createPhysicalMaterial({ ...preset.material, id: preset.id });
+      previous.dispose();
+      scene.background = new T.Color(preset.category === "glass" ? 0x57616d : 0x353b43);
+      renderer.render(scene, camera);
+      images.set(preset.id, renderer.domElement.toDataURL("image/png"));
+    }
+  } catch {
+    warning = "3D-превью недоступны в этом браузере. Назначение материалов остаётся доступным.";
+    images.clear();
+  } finally {
+    sphere.material.dispose(); geometry.dispose(); environment?.dispose(); renderer?.dispose(); renderer?.forceContextLoss();
+  }
+  return { images, warning };
+}
+</file>
+
+<file path="src/renderer/pbr-material.ts">
+import * as T from "three";
+import type { Material } from "../domain/types";
+import type { DeepReadonly } from "../app/editor-store";
+
+export function createPhysicalMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
+  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
+    emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
+    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+}
+</file>
+
 <file path="src/renderer/sub-element-picking.ts">
 import * as T from "three";
 import type { SurfaceHit } from "../geometry/surface-query";
@@ -6904,6 +7004,49 @@ export function JobOverlay({ job, cancel }: { job: JobState; cancel: () => void 
 }
 </file>
 
+<file path="src/ui/MaterialLibrary.tsx">
+import { useEffect, useState } from "react";
+import type { EditorStore, EditorState } from "../app/editor-store";
+import { applyMaterialPreset, materialTargetReason } from "../app/material-actions";
+import { categories, filterPresets, matchesPreset, type MaterialCategory } from "../materials/presets";
+import { getMaterialPreviews, type PreviewResult } from "../renderer/material-preview";
+
+export function MaterialLibrary({ store, state, blocked, notice }: { store: EditorStore; state: EditorState; blocked: boolean; notice: (kind: "info" | "success" | "error", text: string) => void }) {
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState<MaterialCategory | "all">("all");
+  const [previews, setPreviews] = useState<PreviewResult | null>(null);
+  useEffect(() => { let active = true; void getMaterialPreviews().then(result => { if (active) setPreviews(result); }); return () => { active = false; }; }, []);
+  const reason = blocked ? "Дождитесь завершения текущей операции." : materialTargetReason(store);
+  const projectEpoch = store.getProjectEpoch();
+  const selected = state.document.project.nodes.find(node => node.id === state.selection.activeId);
+  const currentId = selected?.materialSlots[0]?.materialId;
+  const current = currentId && state.document.project.materials.find(item => item.id === currentId);
+  const results = filterPresets(query, category);
+  return <div className="material-library">
+    <label className="material-search">Поиск материала<input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Название или свойство" /></label>
+    <label className="material-category">Категория<select value={category} onChange={event => setCategory(event.target.value as MaterialCategory | "all")}><option value="all">Все</option>{categories.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+    {(query || category !== "all") && <button type="button" className="material-reset" onClick={() => { setQuery(""); setCategory("all"); }}>Сбросить фильтр</button>}
+    <p className="panel-hint" role="status">{reason ?? "Выберите пресет, чтобы назначить его выделенному объекту."}</p>
+    {previews?.warning && <p className="material-warning" role="status">{previews.warning}</p>}
+    {!results.length && <p role="status">Материалы не найдены.</p>}
+    <div className="material-cards">{results.map(preset => {
+      const applied = !!current && matchesPreset(current, preset);
+      const image = previews?.images.get(preset.id);
+      return <div className={`material-card ${applied ? "is-applied" : ""}`} key={preset.id}>
+        <div className="material-preview">{image ? <img src={image} alt={`3D-превью: ${preset.name}`} /> : <span>{previews ? "3D-превью недоступно" : "Загрузка 3D-превью…"}</span>}</div>
+        <div className="material-card-body"><strong>{preset.name}</strong>{applied && <span className="material-applied">Назначен</span>}<p>{preset.description}</p>
+          <details><summary>О материале</summary><p>Металличность: {preset.material.metalness}; шероховатость: {preset.material.roughness}; прозрачность: {preset.material.transmission}; IOR: {preset.material.ior}.</p></details>
+          <button type="button" disabled={!!reason || applied} title={reason ?? (applied ? "Уже назначен" : "")} aria-label={`Назначить материал ${preset.name}`} onClick={() => {
+            const result = applyMaterialPreset(store, preset, state.document.revision, state.selection.activeId ?? "", projectEpoch);
+            notice(result.ok ? "success" : "error", result.message);
+          }}>{applied ? "Назначен" : "Назначить"}</button>
+        </div>
+      </div>;
+    })}</div>
+  </div>;
+}
+</file>
+
 <file path="src/ui/MirrorEditor.tsx">
 import { useRef, useState } from "react";
 import { applyMirrorChange, type MirrorChange } from "../app/mirror-actions";
@@ -7423,6 +7566,60 @@ describe("transactional heavy jobs", () => {
     expect(await pending).toMatchObject({ status: "cancelled" });
     expect(store.getSnapshot().document.revision).toBe(0);
     expect(await store.jobs.run(spec("after", async () => ({ ok: true, value: undefined })))).toMatchObject({ error: { code: "JOB_DISPOSED" } });
+  });
+});
+</file>
+
+<file path="tests/app/material-actions.test.ts">
+import { describe, expect, it } from "vitest";
+import { createEditorStore } from "../../src/app/editor-store";
+import { applyMaterialPreset, materialTargetReason } from "../../src/app/material-actions";
+import { categories, filterPresets, hexToLinear, materialPresets, matchesPreset } from "../../src/materials/presets";
+import { validateMaterial } from "../../src/domain/validate-material";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+describe("material presets", () => {
+  it("has unique valid definitions in every category and filters them", () => {
+    expect(new Set(materialPresets.map(item => item.id)).size).toBe(materialPresets.length);
+    for (const category of categories) expect(filterPresets("", category.id).length).toBeGreaterThan(0);
+    for (const preset of materialPresets) expect(validateMaterial({ ...preset.material, id: preset.id })).toEqual([]);
+    expect(filterPresets("ХРОМ", "all").map(item => item.id)).toEqual(["polished-chrome"]);
+    expect(filterPresets("хром", "glass")).toEqual([]);
+    expect(hexToLinear("#808080")[0]).toBeCloseTo(.21586, 4);
+  });
+
+  it("assigns atomically, reuses materials and supports undo, redo and round-trip", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.setSelection(["mesh-node"], "mesh-node");
+    const chrome = materialPresets[0]!;
+    expect(applyMaterialPreset(store, chrome, 0, "mesh-node").ok).toBe(true);
+    let state = store.getSnapshot();
+    expect(state.history.entries).toHaveLength(1);
+    expect(state.document.project.materials).toHaveLength(1);
+    expect(matchesPreset(state.document.project.materials[0]!, chrome)).toBe(true);
+    expect(applyMaterialPreset(store, chrome, 1, "mesh-node").ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.undo(1).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(0);
+    expect(store.redo(2).ok).toBe(true);
+    state = store.getSnapshot();
+    const saved = serializeProjectDocument(store.captureDocument().project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: store.captureDocument().project });
+    expect(state.document.project.nodes.find(item => item.id === "mesh-node")?.materialSlots[0]?.materialId).toBe(state.document.project.materials[0]?.id);
+  });
+
+  it("rejects hidden and stale targets without changing history", () => {
+    const store = createEditorStore(createNestedMeshProject());
+    store.setSelection(["mesh-node"], "mesh-node");
+    expect(applyMaterialPreset(store, materialPresets[0]!, 1, "mesh-node").ok).toBe(false);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", visible: false } }, 0).ok).toBe(true);
+    expect(materialTargetReason(store)).toMatch(/скрыт/);
+    expect(applyMaterialPreset(store, materialPresets[0]!, 1, "mesh-node").ok).toBe(false);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(0);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
   });
 });
 </file>
@@ -10070,6 +10267,70 @@ Manifold 3.5.4 пригоден как основа будущего CSG Worker 
 ## TASK-020 update
 
 Production API теперь находится в `src/geometry/csg/`; spike делегирует ему вычисление. Отмена и повторный запуск проверены в браузере, а принадлежность выходных граней определяется через Manifold `runOriginalID`/`runFlags`. UV, авторские нормали и material groups по-прежнему не переносятся; результат явно сообщает о потере. Исходные измерения выше относятся только к TASK-003 и не являются бюджетом production service.
+</file>
+
+<file path="docs/renderer-decision.md">
+# TASK-002 — WebGPU/WebGL2 и PBR
+
+Дата проверки: 19 октября 2026. Статус spike: **COMPLETED** для двух доступных backend в одном браузерном окружении. **ADR-004 остаётся PROPOSED** до межбраузерной и аппаратной проверки.
+
+## Воспроизведение
+
+```text
+npm ci
+npm run dev
+http://127.0.0.1:5173/?spike=renderer
+```
+
+Если порт занят, используйте адрес, напечатанный Vite. Режим доступен только в dev-сборке; обычный экран редактора открывается без query-параметра. Выберите оба режима по очереди, дождитесь статуса «Готово» и «HDRI: Загружен», затем нажмите «Сбросить вид». Сравнивайте при одинаковом размере окна. Контрольные снимки 1280×800: [WebGPU](renderer-snapshots/webgpu.jpg) и [WebGL2](renderer-snapshots/webgl2.jpg). На каждом снимке виден фактический backend.
+
+## Среда и версии
+
+| Параметр | Наблюдение |
+| --- | --- |
+| Three.js / `@types/three` | 0.186.1 / 0.186.0, зафиксированы в lockfile |
+| TypeScript | 5.9.3 |
+| ОС | Windows 11 Home, build 26300 |
+| Установленные GPU | NVIDIA GeForce GTX 1050 with Max-Q Design, Intel UHD Graphics 620; какой адаптер выбрал браузер, не определено |
+| Браузер испытания | Встроенный Chromium браузер Codex; точная версия не предоставлена инструментом |
+| Chrome / Edge | В этом испытании не использовались; версии и результаты `UNVERIFIED` |
+| Размер | viewport 1280×800 CSS px, canvas 1215×534 CSS px; устройство с DPR браузера |
+
+## Матрица совместимости
+
+`PASS` означает наблюдаемый результат в указанной среде; `UNVERIFIED` — отсутствие испытания, а не положительный результат.
+
+| Проверка | Auto / WebGPU preferred | Forced WebGL2 |
+| --- | --- | --- |
+| `renderer.init()` и кадр | PASS — фактически WebGPU | PASS — фактически WebGL2 |
+| Хром, отражения | PASS — яркие отражения HDRI видны на сфере | PASS — отражения видны |
+| Стекло, transmission / IOR | PASS — полосы позади сферы видны сквозь неё, отражения сохранены | PASS — тот же эффект виден |
+| Normal map | PASS — периодический рельеф заметен при направленном свете | PASS — рельеф заметен |
+| Локальный HDRI | PASS — загружен и виден в фоне и отражениях | PASS — загружен и виден |
+| Повторное переключение, один canvas | PASS | PASS |
+| Reset View | PASS — после вращения восстановлена фиксированная камера | NOT_APPLICABLE — отдельно не повторялось в этой ветке, код общий |
+| Автоматический fallback при отсутствии WebGPU | UNVERIFIED — WebGPU здесь доступен | NOT_APPLICABLE |
+| Отсутствие WebGL2 / ошибка GPU-инициализации | UNVERIFIED | UNVERIFIED |
+| Ошибка загрузки HDRI | UNVERIFIED — обработчик реализован, ресурс не повреждался для испытания | UNVERIFIED |
+| Другие браузеры и GPU | UNVERIFIED | UNVERIFIED |
+
+После перехода по ссылке «Вернуться в редактор» обычная страница показана без canvas. В консоли при первичной проверке обнаружено предупреждение об устаревшем `RGBELoader`; прототип переведён на `HDRLoader` и повторно проверен. Других ошибок и явных различий между снимками не выявлено. Снимки демонстрируют базовую работоспособность, но не являются пиксельным или колориметрическим сравнением. Для Studio Small 03 характерен большой перепад яркости: фон, подставка и стекло местами очень светлые; для будущих пресетов следует отдельно калибровать экспозицию.
+
+## Эталонная сцена и pipeline
+
+Оба режима создают сцену одной фабрикой. Сферы имеют одинаковую геометрию с UV и нормалями. Хром: `MeshPhysicalMaterial`, metalness 1, roughness 0.08. Стекло: transmission 1, IOR 1.5, thickness 1.4, opacity 1. Normal map детерминированно генерируется в canvas, помечена `NoColorSpace` и накладывается на UV-сферу. Общие камера, свет, HDRI, ACES Filmic tone mapping, exposure 1.25 и выходной `SRGBColorSpace` заданы независимо от backend. HDRI загружается как radiance data через `HDRLoader` и используется с `EquirectangularReflectionMapping`; Three.js выполняет необходимую обработку environment для PBR. При ошибке HDRI сцена остаётся с нейтральным освещением, а статус становится `FAILED`.
+
+HDRI: [Poly Haven — Studio Small 03](https://polyhaven.com/a/studio_small_03), автор Greg Zaal, 1K `.hdr`, 1 686 299 байт, SHA-256 `30933D55E45F0795DAF49F3CBEFBE0E5EBCB821EE04FB0A2818C02FFC3938817`. [Лицензия CC0](https://polyhaven.com/license). Файл хранится локально в `src/spikes/renderer/assets/`; с CODEX-030A он также включён в production build для ленивой генерации превью материалов. Внешнее сетевое соединение не требуется.
+
+## Решение и ограничения
+
+Для TASK-014 рекомендован единый `WebGPURenderer` с предпочтением WebGPU и его WebGL2 fallback, а также явный `forceWebGL` для диагностики и тестов. Показывать backend следует по `renderer.backend` **после** `await renderer.init()`, не по `navigator.gpu` и не по `isWebGPURenderer`, который обозначает класс renderer. При невозможности инициализации — ошибка и ручной повторный запуск, без бесконечных попыток. Владение canvas, loop, controls, textures, materials и geometries должно быть ограничено жизненным циклом adapter; TASK-014 отдельно реализует context-loss recovery и синхронизацию из утверждённого доменного состояния.
+
+Для TASK-029 следует зафиксировать поддерживаемую PBR-схему и цветовые пространства: normal map — данные, цветовые текстуры — sRGB, HDR environment — линейный радианс. Перед production нужны visual golden для металла и стекла на разных устройствах. Для TASK-036 профили качества должны иметь измеренную матрицу возможностей каждого backend и явные предупреждения о деградации. FPS и бюджет памяти в этом spike не измерялись.
+
+По [руководству Three.js](https://threejs.org/manual/pages/webgpurenderer) `WebGPURenderer` остаётся экспериментальным; классические `ShaderMaterial`, `RawShaderMaterial`, `onBeforeCompile()` и старый `EffectComposer` не поддерживаются этим renderer. Пользовательские эффекты для него потребуют node materials / TSL и отдельной проверки обеих веток. Это ограничение документации, **не результат запуска таких эффектов в данном spike**. [API `WebGPURenderer`](https://threejs.org/docs/pages/WebGPURenderer.html) подтверждает `forceWebGL`; [API `MeshPhysicalMaterial`](https://threejs.org/docs/pages/MeshPhysicalMaterial.html) подтверждает требование `opacity: 1` при ненулевом transmission.
+
+Двух успешных запусков в одном браузере недостаточно для окончательного выбора production backend. До принятия ADR-004 нужны Chrome и Edge с зафиксированными версиями и фактически выбранным GPU, испытание отсутствия WebGPU/WebGL2, HDRI decode failure, context loss, серия переключений под профилировщиком, сравнение качества/производительности и тест будущих материалов и postprocessing. Пока стратегия — предпочтение WebGPU с наблюдаемым WebGL2 fallback, без заявления о полной эквивалентности.
 </file>
 
 <file path="src/app/boolean-actions.ts">
@@ -14737,214 +14998,6 @@ export class ModifierEvaluator {
 }
 </file>
 
-<file path="src/renderer/scene-sync.ts">
-import * as T from "three";
-import type { DeepReadonly } from "../app/editor-store";
-import type { Project, Transform, Material } from "../domain/types";
-import { decodeStaticGlb } from "../importers/gltf/import-glb";
-import { disposeObject } from "../assets/three-resources";
-import { primitiveGeometry } from "./primitive";
-import { editableGeometry } from "../geometry/mesh-edit";
-import { SurfaceQuery } from "../geometry/surface-query";
-import { validateMesh, type MeshData } from "../geometry/csg";
-
-export type RenderProject = DeepReadonly<Project>;
-export type AssetReader = (id: string) => Uint8Array | undefined;
-export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
-type Entry = { object: T.Group; key: string; sourceKey: string; content?: T.Object3D; loading: boolean; error?: string };
-export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
-const decode: AssetDecoder = async bytes => {
-  const result = await decodeStaticGlb(bytes);
-  if (!result.ok) throw new Error(result.error.message);
-  return result.value.root;
-};
-
-export function applyTransform(object: T.Object3D, transform: Transform): void {
-  const { position, rotationQuat, scale } = transform;
-  const length = Math.hypot(...rotationQuat);
-  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
-  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
-  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
-  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
-  object.updateMatrix();
-}
-function material(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  if (!value) return new T.MeshPhysicalMaterial({ color: 0xaaaaaa, roughness: .65 });
-  return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
-    emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
-    transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
-}
-const editorMaterials = new WeakSet<T.Material>();
-function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  const created = material(value); editorMaterials.add(created); return created;
-}
-function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
-  const oldMaterials = new Set<T.Material>();
-  content.traverse(object => { if (!(object instanceof T.Mesh)) return;
-    for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
-      if (editorMaterials.has(old)) oldMaterials.add(old);
-      else if (!object.userData.originalMaterials) object.userData.originalMaterials = Array.isArray(object.material) ? [...object.material] : [object.material];
-    }
-    object.material = values.length > 1 && object.geometry.groups.length > 0
-      ? values.map(value => ownedMaterial(value)) : ownedMaterial(values[0]);
-  });
-  for (const old of oldMaterials) old.dispose();
-}
-
-export class SceneSync {
-  readonly surfaces = new SurfaceQuery(undefined, undefined, () => this.emit());
-  readonly scene = new T.Scene();
-  readonly camera = new T.PerspectiveCamera();
-  readonly cameraTarget = new T.Vector3();
-  cameraVersion = 0;
-  readonly objects = new Map<string, Entry>();
-  private lights = new T.Group();
-  private projectId = "";
-  private epoch: object | undefined;
-  private lightKey = "";
-  private cameraKey = "";
-  private diagnostics: string[] = [];
-  private modifierDiagnostics = new Map<string, string[]>();
-  private derived = new Set<string>();
-  private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
-  private closed = false;
-  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
-    if (this.closed) return;
-    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
-    this.diagnostics = [];
-    const camera = project.scene.camera;
-    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
-      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
-    const cameraKey = JSON.stringify(camera);
-    if (cameraKey !== this.cameraKey) {
-      this.cameraKey = cameraKey;
-      this.cameraTarget.fromArray(camera.target);
-      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
-      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
-      this.cameraVersion += 1;
-    }
-    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
-    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
-    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
-    const lightKey = JSON.stringify(project.scene.lights);
-    if (lightKey !== this.lightKey) {
-      this.lights.clear(); this.lightKey = lightKey;
-      for (const light of project.scene.lights) {
-        const color = new T.Color(...light.color);
-        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
-          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
-        object.position.fromArray(light.position);
-        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
-        this.lights.add(object);
-      }
-    }
-    const ids = new Set(project.nodes.map(n => n.id));
-    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); this.derived.delete(id); this.modifierDiagnostics.delete(id); this.nodeMaterials.delete(id); }
-    for (const node of project.nodes) {
-      let entry = this.objects.get(node.id);
-      if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
-      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
-      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
-      this.nodeMaterials.set(node.id, materials[0]);
-      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
-      const source = node.kind === "mesh" ? node.meshSource : null;
-      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
-      const key = JSON.stringify([source, asset, materials]);
-      if (key === entry.key) continue;
-      const sourceKey = JSON.stringify([source, asset]);
-      if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
-        replaceMaterials(entry.content, materials);
-        entry.key = key;
-        continue;
-      }
-      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
-      // Replacement token prevents late assets from attaching after delete, undo, or another source.
-      const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
-      if (!source) continue;
-      const assign = (content: T.Object3D) => {
-        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
-        next.content = content; next.loading = false; next.object.add(content);
-        this.surfaces.register(node.id, next.object, content); this.emit();
-      };
-      try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), ownedMaterial(materials[0])));
-        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), ownedMaterial(materials[0])));
-        else {
-          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
-          const bytes = readAsset(source.assetId);
-          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
-          next.loading = true;
-          void this.decoder(bytes).then(content => {
-            // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
-            assign(content);
-          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
-        }
-      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
-    }
-    for (const node of project.nodes) {
-      const object = this.objects.get(node.id)!.object;
-      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
-      if (parent && object.parent !== parent) parent.add(object);
-    }
-    for (const node of project.nodes) {
-      const parent = this.objects.get(node.id)?.object;
-      if (!parent) continue;
-      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
-      if (ordered.some((item, i) => parent.children[i] !== item)) {
-        for (const item of ordered) parent.remove(item);
-        for (const item of ordered) parent.add(item);
-      }
-    }
-    this.scene.updateMatrixWorld(true);
-    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
-    this.emit();
-  }
-  /** Derived buffers belong to the renderer and are never attached to the domain document. */
-  setDerived(nodeId: string, mesh: MeshData, empty: boolean, diagnostics: string[] = []): void {
-    if (this.closed) return;
-    const entry = this.objects.get(nodeId);
-    if (!entry) return;
-    validateMesh(mesh, empty);
-    if (empty !== (mesh.indices.length === 0)) throw new Error("Некорректный пустой результат Boolean.");
-    const geometry = new T.BufferGeometry();
-    let content: T.Mesh | undefined;
-    try {
-      if (!empty) {
-        geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
-        geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
-        geometry.computeVertexNormals();
-        content = new T.Mesh(geometry, ownedMaterial(this.nodeMaterials.get(nodeId)));
-      }
-      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
-      if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
-      else geometry.dispose();
-      this.derived.add(nodeId);
-      this.setModifierDiagnostics(nodeId, diagnostics);
-    } catch (error) { if (content) disposeObject(content); else geometry.dispose(); throw error; }
-  }
-  setModifierDiagnostics(nodeId: string, diagnostics: string[]): void {
-    if (this.closed || !this.objects.has(nodeId)) return;
-    if (diagnostics.length) this.modifierDiagnostics.set(nodeId, diagnostics.map(message => `${nodeId}: ${message}`));
-    else this.modifierDiagnostics.delete(nodeId);
-    this.emit();
-  }
-  resetDerived(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
-    if (this.closed) return;
-    for (const id of this.derived) { const entry = this.objects.get(id); if (entry) { entry.key = ""; entry.sourceKey = ""; } }
-    this.derived.clear(); this.modifierDiagnostics.clear();
-    this.sync(project, readAsset, epoch);
-  }
-  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
-    errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
-  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
-}
-</file>
-
 <file path="src/renderer/viewport-interactions.ts">
 import * as T from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -15885,6 +15938,209 @@ function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore
 }
 </file>
 
+<file path="src/renderer/scene-sync.ts">
+import * as T from "three";
+import type { DeepReadonly } from "../app/editor-store";
+import type { Project, Transform, Material } from "../domain/types";
+import { decodeStaticGlb } from "../importers/gltf/import-glb";
+import { disposeObject } from "../assets/three-resources";
+import { primitiveGeometry } from "./primitive";
+import { editableGeometry } from "../geometry/mesh-edit";
+import { SurfaceQuery } from "../geometry/surface-query";
+import { validateMesh, type MeshData } from "../geometry/csg";
+import { createPhysicalMaterial } from "./pbr-material";
+
+export type RenderProject = DeepReadonly<Project>;
+export type AssetReader = (id: string) => Uint8Array | undefined;
+export type SceneStatus = { loading: number; diagnostics: string[]; errors: number; empty: boolean };
+type Entry = { object: T.Group; key: string; sourceKey: string; content?: T.Object3D; loading: boolean; error?: string };
+export type AssetDecoder = (bytes: Uint8Array) => Promise<T.Object3D>;
+const decode: AssetDecoder = async bytes => {
+  const result = await decodeStaticGlb(bytes);
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value.root;
+};
+
+export function applyTransform(object: T.Object3D, transform: Transform): void {
+  const { position, rotationQuat, scale } = transform;
+  const length = Math.hypot(...rotationQuat);
+  if (![...position, ...rotationQuat, ...scale].every(Number.isFinite) || length < 1e-10) throw new Error("Некорректная матрица объекта.");
+  const matrix = new T.Matrix4().compose(new T.Vector3(...position), new T.Quaternion(...rotationQuat).normalize(), new T.Vector3(...scale));
+  if (!matrix.elements.every(Number.isFinite)) throw new Error("Некорректная матрица объекта.");
+  object.position.fromArray(position); object.quaternion.fromArray(rotationQuat).normalize(); object.scale.fromArray(scale);
+  object.updateMatrix();
+}
+const editorMaterials = new WeakSet<T.Material>();
+function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
+  const created = createPhysicalMaterial(value); editorMaterials.add(created); return created;
+}
+function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
+  const oldMaterials = new Set<T.Material>();
+  content.traverse(object => { if (!(object instanceof T.Mesh)) return;
+    for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
+      if (editorMaterials.has(old)) oldMaterials.add(old);
+      else if (!object.userData.originalMaterials) object.userData.originalMaterials = Array.isArray(object.material) ? [...object.material] : [object.material];
+    }
+    object.material = values.length > 1 && object.geometry.groups.length > 0
+      ? values.map(value => ownedMaterial(value)) : ownedMaterial(values[0]);
+  });
+  for (const old of oldMaterials) old.dispose();
+}
+
+export class SceneSync {
+  readonly surfaces = new SurfaceQuery(undefined, undefined, () => this.emit());
+  readonly scene = new T.Scene();
+  readonly camera = new T.PerspectiveCamera();
+  readonly cameraTarget = new T.Vector3();
+  cameraVersion = 0;
+  readonly objects = new Map<string, Entry>();
+  private lights = new T.Group();
+  private projectId = "";
+  private epoch: object | undefined;
+  private lightKey = "";
+  private cameraKey = "";
+  private diagnostics: string[] = [];
+  private modifierDiagnostics = new Map<string, string[]>();
+  private derived = new Set<string>();
+  private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
+  private closed = false;
+  constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
+    this.diagnostics = [];
+    const camera = project.scene.camera;
+    if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
+      || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
+    const cameraKey = JSON.stringify(camera);
+    if (cameraKey !== this.cameraKey) {
+      this.cameraKey = cameraKey;
+      this.cameraTarget.fromArray(camera.target);
+      this.camera.position.fromArray(camera.position); this.camera.lookAt(this.cameraTarget);
+      this.camera.near = camera.near; this.camera.far = camera.far; this.camera.fov = camera.fovDegrees; this.camera.updateProjectionMatrix();
+      this.cameraVersion += 1;
+    }
+    this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
+    if (project.scene.background.environmentAssetId) this.diagnostics.push("HDRI-окружение пока не отображается.");
+    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
+    const lightKey = JSON.stringify(project.scene.lights);
+    if (lightKey !== this.lightKey) {
+      this.lights.clear(); this.lightKey = lightKey;
+      for (const light of project.scene.lights) {
+        const color = new T.Color(...light.color);
+        const object = light.kind === "ambient" ? new T.AmbientLight(color, light.intensity) : light.kind === "directional" ? new T.DirectionalLight(color, light.intensity)
+          : light.kind === "point" ? new T.PointLight(color, light.intensity) : new T.SpotLight(color, light.intensity);
+        object.position.fromArray(light.position);
+        if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); this.lights.add(object.target); }
+        this.lights.add(object);
+      }
+    }
+    const ids = new Set(project.nodes.map(n => n.id));
+    for (const [id, entry] of this.objects) if (!ids.has(id)) { this.remove(entry); this.objects.delete(id); this.derived.delete(id); this.modifierDiagnostics.delete(id); this.nodeMaterials.delete(id); }
+    for (const node of project.nodes) {
+      let entry = this.objects.get(node.id);
+      if (!entry) { entry = { object: new T.Group(), key: "", sourceKey: "", loading: false }; entry.object.userData.nodeId = node.id; this.objects.set(node.id, entry); }
+      entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
+      const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
+      this.nodeMaterials.set(node.id, materials[0]);
+      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
+      const source = node.kind === "mesh" ? node.meshSource : null;
+      const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
+      const key = JSON.stringify([source, asset, materials]);
+      if (key === entry.key) continue;
+      const sourceKey = JSON.stringify([source, asset]);
+      if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
+        replaceMaterials(entry.content, materials);
+        entry.key = key;
+        continue;
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      // Replacement token prevents late assets from attaching after delete, undo, or another source.
+      const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
+      if (!source) continue;
+      const assign = (content: T.Object3D) => {
+        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
+        next.content = content; next.loading = false; next.object.add(content);
+        this.surfaces.register(node.id, next.object, content); this.emit();
+      };
+      try {
+        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), ownedMaterial(materials[0])));
+        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), ownedMaterial(materials[0])));
+        else {
+          if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
+          const bytes = readAsset(source.assetId);
+          if (!bytes) throw new Error("Байты GLB отсутствуют в памяти.");
+          next.loading = true;
+          void this.decoder(bytes).then(content => {
+            // Keep imported materials when there is no explicit domain slot assignment.
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
+            assign(content);
+          }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
+        }
+      } catch (error) { next.error = error instanceof Error ? error.message : "Ошибка геометрии."; }
+    }
+    for (const node of project.nodes) {
+      const object = this.objects.get(node.id)!.object;
+      const parent = node.id === project.model.rootNodeId ? this.scene : node.parentId ? this.objects.get(node.parentId)?.object : undefined;
+      if (parent && object.parent !== parent) parent.add(object);
+    }
+    for (const node of project.nodes) {
+      const parent = this.objects.get(node.id)?.object;
+      if (!parent) continue;
+      const ordered = node.children.map(id => this.objects.get(id)?.object).filter((item): item is T.Group => !!item);
+      if (ordered.some((item, i) => parent.children[i] !== item)) {
+        for (const item of ordered) parent.remove(item);
+        for (const item of ordered) parent.add(item);
+      }
+    }
+    this.scene.updateMatrixWorld(true);
+    for (const entry of this.objects.values()) if (!entry.object.matrixWorld.elements.every(Number.isFinite)) throw new Error("Некорректная мировая матрица объекта.");
+    this.emit();
+  }
+  /** Derived buffers belong to the renderer and are never attached to the domain document. */
+  setDerived(nodeId: string, mesh: MeshData, empty: boolean, diagnostics: string[] = []): void {
+    if (this.closed) return;
+    const entry = this.objects.get(nodeId);
+    if (!entry) return;
+    validateMesh(mesh, empty);
+    if (empty !== (mesh.indices.length === 0)) throw new Error("Некорректный пустой результат Boolean.");
+    const geometry = new T.BufferGeometry();
+    let content: T.Mesh | undefined;
+    try {
+      if (!empty) {
+        geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
+        geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
+        geometry.computeVertexNormals();
+        content = new T.Mesh(geometry, ownedMaterial(this.nodeMaterials.get(nodeId)));
+      }
+      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
+      else geometry.dispose();
+      this.derived.add(nodeId);
+      this.setModifierDiagnostics(nodeId, diagnostics);
+    } catch (error) { if (content) disposeObject(content); else geometry.dispose(); throw error; }
+  }
+  setModifierDiagnostics(nodeId: string, diagnostics: string[]): void {
+    if (this.closed || !this.objects.has(nodeId)) return;
+    if (diagnostics.length) this.modifierDiagnostics.set(nodeId, diagnostics.map(message => `${nodeId}: ${message}`));
+    else this.modifierDiagnostics.delete(nodeId);
+    this.emit();
+  }
+  resetDerived(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
+    if (this.closed) return;
+    for (const id of this.derived) { const entry = this.objects.get(id); if (entry) { entry.key = ""; entry.sourceKey = ""; } }
+    this.derived.clear(); this.modifierDiagnostics.clear();
+    this.sync(project, readAsset, epoch);
+  }
+  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
+    errors: [...this.objects.values()].filter(e => e.error).length,
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
+  private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+}
+</file>
+
 <file path="package.json">
 {
   "name": "triad-3d",
@@ -16711,6 +16967,25 @@ body { margin: 0; }
 .renderer-toolbar button:focus-visible, .renderer-toolbar select:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
 .renderer-status [role="alert"] { color: var(--color-state-danger); }
 .primitive-library { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.library-sections { display: flex; gap: var(--space-1); margin-bottom: var(--space-4); }
+.library-sections button { flex: 1; min-width: 0; min-height: var(--control-height-md); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
+.library-sections button[aria-pressed="true"] { border-color: var(--color-primary-accent-strong); background: var(--color-state-info-surface); }
+.material-library { min-width: 0; }
+.material-search, .material-category { display: grid; gap: var(--space-1); margin-bottom: var(--space-2); font-size: var(--font-size-sm); color: var(--color-text-secondary); }
+.material-search input, .material-category select { width: 100%; min-width: 0; min-height: var(--control-height-md); padding: var(--space-1) var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); }
+.material-reset { margin-bottom: var(--space-2); border: 0; background: none; color: var(--color-state-info); text-decoration: underline; cursor: pointer; }
+.material-warning { padding: var(--space-2); border-radius: var(--radius-sm); background: var(--color-state-warning-surface); color: var(--color-state-warning); font-size: var(--font-size-sm); }
+.material-cards { display: grid; gap: var(--space-3); }
+.material-card { overflow: hidden; min-width: 0; border: var(--border-default); border-radius: var(--radius-md); background: var(--color-surface-raised); }
+.material-card.is-applied { border-color: var(--color-primary-accent-strong); }
+.material-preview { display: grid; place-items: center; height: 156px; background: var(--color-surface-sunken); color: var(--color-text-secondary); text-align: center; font-size: var(--font-size-sm); }
+.material-preview img { width: 156px; height: 156px; object-fit: contain; }
+.material-card-body { padding: var(--space-3); }
+.material-card-body p { margin: var(--space-1) 0 var(--space-2); font-size: var(--font-size-sm); color: var(--color-text-secondary); }
+.material-card-body details { margin-bottom: var(--space-2); font-size: var(--font-size-sm); }
+.material-card-body button { width: 100%; min-height: var(--control-height-md); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-state-info-surface); cursor: pointer; }
+.material-card-body button:disabled { opacity: .6; cursor: not-allowed; }
+.material-applied { float: right; color: var(--color-state-success); font-size: var(--font-size-xs); }
 .primitive-editor { display: grid; gap: 10px; margin-bottom: 18px; }
 .primitive-editor h3 { margin: 0; font-size: 14px; }
 .primitive-editor label { display: grid; gap: 4px; font-size: 12px; }
@@ -16773,6 +17048,7 @@ import { createPrimitiveNode, primitiveDefinitions, type PrimitiveKind } from ".
 import { ObjectTree } from "./ObjectTree";
 import { Inspector } from "./Inspector";
 import { JobOverlay } from "./JobOverlay";
+import { MaterialLibrary } from "./MaterialLibrary";
 import { isJobActive } from "../app/job-controller";
 
 const RendererSpike = import.meta.env.DEV
@@ -16819,6 +17095,7 @@ function EditorShell() {
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
   const [dragging, setDragging] = useState(false);
+  const [librarySection, setLibrarySection] = useState<"geometry" | "materials">("geometry");
   const dragCleanup = useRef<(() => void) | null>(null);
   const project = selectProject(state);
   const dirty = selectDirty(state);
@@ -17033,7 +17310,7 @@ function EditorShell() {
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
             <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
-          </div> : <div className="panel-content"><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></div>}
+          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} />}</div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
@@ -18033,6 +18310,7 @@ export function createCommandBus(initialProject: Project): CommandBus {
 - `typecheck`, `lint`, `build`, целевые и полные Vitest прошли (41 файл, 298 тестов). Ручной browser smoke: UNVERIFIED. Ограничения геометрического ядра и прерывания WASM из CODEX-025C сохраняются. TASK-025 реализован.
 - **CODEX-026A / TASK-026 / FR-021 / UI-08 (PARTIAL):** Добавлена «Кисть: рельеф» для одного выбранного Editable Mesh в режиме «Модель»: локальные радиус/сила, BVH hit, подсветка затрагиваемых вершин, непрерывный мазок с интерполяцией, одна команда и один Undo/Redo. Отмена не меняет документ; архив `.triad3d` сохраняет результат. Лимиты: замкнутая согласованно ориентированная сетка до 20 000 render vertices, 512 точек мазка, радиус 0,01–10, сила −0,5…0,5, смещение за мазок не более 10% минимального ребра. Активные модификаторы/Boolean запрещены. Проверка вырождения и переворота треугольников не доказывает отсутствие всех самопересечений; Paint, Material Brush, fill и symmetry остаются в TASK-026. Typecheck, lint, целевые Vitest и build: результаты указаны в отчёте задания. Ручная браузерная проверка: UNVERIFIED — доступное окно встроенного браузера показывает только desktop-only экран.
 - **CODEX-026B / TASK-026 / FR-021 / UI-08 / TST-011 (PARTIAL):** Displace Brush поддерживает выключенную симметрию и отражение по X/Y/Z относительно локальных плоскостей YZ/XZ/XY через начало mesh. Обе области показаны в предпросмотре и применяются одной транзакцией; пересечение и повторы samples объединяются по максимальному falloff. Параметры мазка фиксируются при pointerdown, смена параметров отменяет активный мазок. Старый payload команды сохраняет семантику `off`, невалидные значения отклоняются. Подтверждены typecheck, lint, 49 целевых тестов и production build; ручная браузерная проверка: UNVERIFIED. Существующие ограничения сетки и отсутствие полной гарантии против самопересечений сохраняются. Paint Brush, Material Brush и fill остаются в TASK-026.
+- **CODEX-030A / TASK-030 (реализовано):** В левом dock добавлены разделы «Геометрия» и «Материалы», поиск и пять категорий. Шесть валидных PBR-пресетов показываются на статически отрендеренной сфере через один временный WebGL renderer с локальным HDRI Poly Haven Studio Small 03 (Greg Zaal, CC0; источник и SHA-256 в `docs/renderer-decision.md`). Общий PBR-адаптер используется SceneSync и превью. При сбое HDRI применяется нейтральное освещение, при недоступном WebGL показывается явное сообщение; назначение остаётся доступным. Один выбранный primitive/editable Mesh получает материал через атомарную транзакцию ADD_MATERIAL + SET_MATERIAL_SLOT и один Undo-шаг; идентичный пресет повторно не создаётся. GLB с внутренними материалами не назначается до TASK-031, чтобы не заменять несколько слотов молча. Текстур и процедурного рельефа у камня пока нет (TASK-032–034); Drag & Drop и Material Inspector остаются TASK-031. Typecheck, lint, 15 целевых тестов и production build: PASS. Ручной browser smoke: UNVERIFIED — встроенный браузер не открыл локальный Vite URL (timeout). Существующее предупреждение о размере Vite chunk сохраняется.
 </file>
 
 </files>
