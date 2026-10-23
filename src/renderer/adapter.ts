@@ -66,7 +66,11 @@ export class ThreeRendererAdapter implements RendererAdapter {
       const draw = () => {
         if (this.closed || this.stopped) return;
         try { this.frameHook?.(); renderer.render(this.graph.scene, this.graph.camera); }
-        catch { this.fail("error", "Ошибка отрисовки. Повторите запуск 3D; документ остаётся в памяти."); return; }
+        catch (error) {
+          const detail = error instanceof Error ? error.message.slice(0, 240) : "неизвестная ошибка";
+          this.fail("error", `Ошибка материала или отрисовки (${this.backend}): ${detail}. Документ остаётся в памяти; выберите другую проекцию или повторите запуск 3D.`);
+          return;
+        }
         this.frame = requestAnimationFrame(draw);
       };
       this.frame = requestAnimationFrame(draw);

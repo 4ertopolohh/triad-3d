@@ -127,7 +127,7 @@ export interface Material {
 }
 
 export interface MaterialTextureSlots { baseColor?: EntityId }
-export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "box"; tiling: readonly [number, number]; offset: readonly [number, number] };
+export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "box"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "triplanar"; tiling: readonly [number, number]; offset: readonly [number, number] };
 
 export interface Asset {
   id: EntityId;

@@ -28,6 +28,27 @@ function setup() {
 }
 
 describe("material editing", () => {
+  it("edits Triplanar through shared command history and native archive", async () => {
+    const store = setup();
+    const triplanar = { mode: "triplanar" as const, tiling: [2, 3] as const, offset: [4, -5] as const };
+    const before = store.getSnapshot();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store, "shared")!, { ...triplanar, offset: [Infinity, 0] }).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store, "shared")!, triplanar)).toMatchObject({ ok: true, changed: true });
+    expect(editBaseColorProjection(store, captureMaterialEdit(store, "shared")!, triplanar)).toMatchObject({ ok: true, changed: false });
+    const archive = await createNativeProjectArchive(store.captureDocument().project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) expect(opened.value.project.materials[0]!.textureMappings?.baseColor).toEqual(triplanar);
+    }
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials[0]!.textureMappings).toBeUndefined();
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials[0]!.textureMappings?.baseColor).toEqual(triplanar);
+  });
   it("edits Box through the existing transaction, rejects invalid input and restores it through undo", () => {
     const store = setup();
     const box = { mode: "box" as const, tiling: [2, 3] as const, offset: [4, -5] as const };

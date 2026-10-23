@@ -1,15 +1,19 @@
 import * as T from "three";
 import type { Asset } from "../domain/types";
+import type { BaseColorProjection } from "../domain/types";
+import { MeshPhysicalNodeMaterial } from "three/webgpu";
+import { bindTriplanarTexture } from "./triplanar-material";
 
-type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Set<T.MeshPhysicalMaterial>; error?: string; pending?: Promise<void> | undefined };
+type Owner = T.MeshPhysicalMaterial | MeshPhysicalNodeMaterial;
+type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Set<Owner>; error?: string; pending?: Promise<void> | undefined };
 
 /** Owned by one SceneSync. Materials borrow textures; the cache alone disposes them. */
 export class BaseColorTextures {
   private entries = new Map<string, Entry>();
-  private owners = new Map<T.MeshPhysicalMaterial, string>();
+  private owners = new Map<Owner, { key: string; projection?: Extract<BaseColorProjection, { mode: "triplanar" }> }>();
   constructor(private changed: () => void) {}
 
-  bind(material: T.MeshPhysicalMaterial, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined, repeat = false): void {
+  bind(material: Owner, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined, repeat = false, projection?: Extract<BaseColorProjection, { mode: "triplanar" }>): void {
     const key = `${asset.id}:${asset.hash}:${repeat ? "repeat" : "default"}`;
     let entry = this.entries.get(key);
     if (!entry) {
@@ -29,25 +33,34 @@ export class BaseColorTextures {
           texture.needsUpdate = true;
           texture.userData.triadSharedTexture = true;
           current.bitmap = bitmap; current.texture = texture;
-          for (const user of current.users) { user.map = texture; user.needsUpdate = true; }
+          for (const user of current.users) this.assign(user, texture);
         } catch { bitmap?.close(); current.error = `Ресурс ${asset.id}: не удалось декодировать изображение.`; }
         finally { current.pending = undefined; this.changed(); }
       })();
     }
     entry.users.add(material);
-    this.owners.set(material, key);
-    if (entry.texture) { material.map = entry.texture; material.needsUpdate = true; }
+    this.owners.set(material, projection ? { key, projection } : { key });
+    if (entry.texture) this.assign(material, entry.texture);
+  }
+
+  private assign(material: Owner, image: T.Texture): void {
+    const owner = this.owners.get(material);
+    if (!owner) return;
+    if (material instanceof MeshPhysicalNodeMaterial && owner.projection) bindTriplanarTexture(material, image, owner.projection);
+    else if (material instanceof T.MeshPhysicalMaterial) { material.map = image; material.needsUpdate = true; }
   }
 
   release(material: T.Material): void {
-    if (!(material instanceof T.MeshPhysicalMaterial)) return;
-    const key = this.owners.get(material);
-    if (!key) return;
+    if (!(material instanceof T.MeshPhysicalMaterial) && !(material instanceof MeshPhysicalNodeMaterial)) return;
+    const owner = this.owners.get(material);
+    if (!owner) return;
+    const { key } = owner;
     this.owners.delete(material);
     const entry = this.entries.get(key);
     if (!entry) return;
     entry.users.delete(material);
-    material.map = null;
+    if (material instanceof MeshPhysicalNodeMaterial) material.colorNode = null;
+    else material.map = null;
     if (!entry.users.size) {
       this.entries.delete(key);
       entry.texture?.dispose(); entry.bitmap?.close();

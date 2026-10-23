@@ -8,6 +8,8 @@ import { editableGeometry } from "../geometry/mesh-edit";
 import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
 import { createPhysicalMaterial } from "./pbr-material";
+import { createTriplanarMaterial } from "./triplanar-material";
+import { MeshPhysicalNodeMaterial } from "three/webgpu";
 import { BaseColorTextures } from "./base-color-textures";
 import { ProjectionGeometry } from "./planar-projection";
 
@@ -32,10 +34,12 @@ export function applyTransform(object: T.Object3D, transform: Transform): void {
   object.updateMatrix();
 }
 const editorMaterials = new WeakSet<T.Material>();
-function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
-  const created = createPhysicalMaterial(value); editorMaterials.add(created); return created;
+type EditorMaterial = T.MeshPhysicalMaterial | MeshPhysicalNodeMaterial;
+function ownedMaterial(value?: DeepReadonly<Material>): EditorMaterial {
+  const created = value?.textureMappings?.baseColor?.mode === "triplanar" ? createTriplanarMaterial(value) : createPhysicalMaterial(value);
+  editorMaterials.add(created); return created;
 }
-function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[], make: (value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry) => T.MeshPhysicalMaterial, release: (material: T.Material) => void): void {
+function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[], make: (value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry) => EditorMaterial, release: (material: T.Material) => void): void {
   const oldMaterials = new Set<T.Material>();
   content.traverse(object => { if (!(object instanceof T.Mesh)) return;
     for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
@@ -70,15 +74,16 @@ export class SceneSync {
   private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
   private readAsset: AssetReader = () => undefined;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): T.MeshPhysicalMaterial {
-    const material = ownedMaterial(value);
+  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): EditorMaterial {
+    const material = imported && value?.textureMappings?.baseColor?.mode === "triplanar" ? createPhysicalMaterial(value) : ownedMaterial(value);
+    editorMaterials.add(material);
     const id = value?.textureSlots?.baseColor;
     if (!id) return material;
     if (imported && value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv") { this.diagnostics.push(`${name}: проекция для импортированного GLB недоступна.`); return material; }
-    if (!geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
+    if (value?.textureMappings?.baseColor?.mode !== "triplanar" && !geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
     const asset = this.assets.get(id);
     if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) { this.diagnostics.push(`${name}: ресурс основного цвета недоступен или имеет неподдерживаемый формат.`); return material; }
-    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv");
+    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv", value?.textureMappings?.baseColor?.mode === "triplanar" ? value.textureMappings.baseColor : undefined);
     return material;
   }
   private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); content.traverse(object => { if (object instanceof T.Mesh) this.projection.releaseMesh(object); }); disposeObject(content); }
@@ -142,7 +147,7 @@ export class SceneSync {
         }
         if (this.derived.has(node.id)) {
           const warnings = (this.modifierDiagnostics.get(node.id) ?? []).filter(message => !message.includes("у результата модификатора нет UV"));
-          if (materials[0]?.textureSlots?.baseColor && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
+          if (materials[0]?.textureSlots?.baseColor && materials[0]?.textureMappings?.baseColor?.mode !== "triplanar" && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
           if (warnings.length) this.modifierDiagnostics.set(node.id, warnings); else this.modifierDiagnostics.delete(node.id);
         }
         replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, source?.kind === "asset"), material => this.textures.release(material));
@@ -220,7 +225,7 @@ export class SceneSync {
       if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
       else geometry.dispose();
       this.derived.add(nodeId);
-      this.setModifierDiagnostics(nodeId, this.nodeMaterials.get(nodeId)?.textureSlots?.baseColor && !content?.geometry.getAttribute("uv")
+      this.setModifierDiagnostics(nodeId, this.nodeMaterials.get(nodeId)?.textureSlots?.baseColor && this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor?.mode !== "triplanar" && !content?.geometry.getAttribute("uv")
         ? [...diagnostics, "у результата модификатора нет UV; текстура основного цвета не отображается."] : diagnostics);
     } catch (error) { if (content) this.disposeContent(content); else geometry.dispose(); throw error; }
   }
