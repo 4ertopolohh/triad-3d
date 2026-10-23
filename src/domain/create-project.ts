@@ -10,7 +10,7 @@ export function createProject(idFactory: IdFactory = () => crypto.randomUUID()):
   const lightId = idFactory();
 
   return {
-    schemaVersion: "1.5.0",
+    schemaVersion: "1.6.0",
     id: projectId,
     name: "Новый проект",
     model: { id: modelId, rootNodeId: rootId, revision: 0 },

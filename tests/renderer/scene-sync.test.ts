@@ -5,6 +5,40 @@ import { createNestedMeshProject, createMaterialAnimationProject, emptyProject }
 
 const noAssets = () => undefined;
 describe("domain scene synchronization", () => {
+  it("updates and releases procedural roughness without changing geometry", () => {
+    const project = createMaterialAnimationProject();
+    const config = { kind: "grain" as const, seed: 1, scale: 4, intensity: .5, resolution: 128 as const };
+    project.materials[0]!.proceduralMaps = { roughness: config };
+    const sync = new SceneSync(() => {});
+    sync.sync(project, noAssets);
+    const mesh = sync.objects.get("mesh-node")!.content as T.Mesh;
+    const geometry = mesh.geometry;
+    const first = (mesh.material as T.MeshPhysicalMaterial).roughnessMap!;
+    const disposed = vi.spyOn(first, "dispose");
+    project.materials[0]!.proceduralMaps = { roughness: { ...config, seed: 2 } };
+    sync.sync(project, noAssets);
+    expect(mesh.geometry).toBe(geometry);
+    expect((mesh.material as T.MeshPhysicalMaterial).roughnessMap).not.toBe(first);
+    expect(disposed).toHaveBeenCalledOnce();
+    delete project.materials[0]!.proceduralMaps;
+    sync.sync(project, noAssets);
+    expect((mesh.material as T.MeshPhysicalMaterial).roughnessMap).toBeNull();
+    sync.dispose();
+  });
+  it("reports missing UV while retaining procedural settings", () => {
+    const project = createMaterialAnimationProject();
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    if (node.kind !== "mesh") throw new Error("fixture");
+    node.meshSource = { kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] };
+    project.materials[0]!.proceduralMaps = { roughness: { kind: "grain", seed: 1, scale: 4, intensity: .5, resolution: 128 } };
+    const statuses: string[][] = [];
+    const sync = new SceneSync(status => statuses.push(status.diagnostics));
+    sync.sync(project, noAssets);
+    expect(statuses.at(-1)?.some(message => message.includes("процедурная шероховатость не отображается"))).toBe(true);
+    expect(((sync.objects.get("mesh-node")!.content as T.Mesh).material as T.MeshPhysicalMaterial).roughnessMap).toBeNull();
+    expect(project.materials[0]!.proceduralMaps?.roughness).toBeDefined();
+    sync.dispose();
+  });
   it("shares a decoded baseColor map until its last mesh is removed", async () => {
     const project = createMaterialAnimationProject();
     const original = project.nodes.find(node => node.id === "mesh-node")!;

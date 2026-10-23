@@ -49,6 +49,11 @@ describe("TASK-004 TSX export spike", () => {
     project.materials[0]!.textureSlots = { baseColor: "image" };
     expect(generateSpikeTsx(project).diagnostics).toContainEqual(expect.objectContaining({ code: "TEXTURES_OMITTED", path: "materials.material-1.textureSlots.baseColor" }));
   });
+  it("reports omitted procedural roughness", () => {
+    const project = createMaterialAnimationProject();
+    project.materials[0]!.proceduralMaps = { roughness: { kind: "grain", seed: 1, scale: 4, intensity: .5, resolution: 128 } };
+    expect(generateSpikeTsx(project).diagnostics).toContainEqual(expect.objectContaining({ code: "PROCEDURAL_ROUGHNESS_OMITTED", path: "materials.material-1.proceduralMaps.roughness" }));
+  });
 
   it("rejects invalid numbers and hierarchy without mutation", () => {
     for (const project of [createInvalidNumberProject(), createInvalidHierarchyProject()]) {

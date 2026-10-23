@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createEditorStore } from "../../src/app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection } from "../../src/app/material-edit";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, editProceduralRoughness } from "../../src/app/material-edit";
 import { materialPresets } from "../../src/materials/presets";
 import { linearToHex, parseHexColor } from "../../src/materials/color";
 import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
@@ -28,6 +28,32 @@ function setup() {
 }
 
 describe("material editing", () => {
+  it("edits procedural roughness atomically with unique/shared, undo and native archive", async () => {
+    const store = setup();
+    const grain = { kind: "grain" as const, seed: 12, scale: 3, intensity: .7, resolution: 128 as const };
+    const before = store.getSnapshot();
+    expect(editProceduralRoughness(store, captureMaterialEdit(store)!, { ...grain, seed: -1 }).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    const stale = captureMaterialEdit(store)!;
+    expect(editProceduralRoughness(store, captureMaterialEdit(store)!, grain)).toMatchObject({ ok: true, changed: true });
+    expect(editProceduralRoughness(store, stale, grain).ok).toBe(false);
+    expect(editProceduralRoughness(store, captureMaterialEdit(store)!, grain)).toMatchObject({ ok: true, changed: false });
+    const project = store.captureDocument().project;
+    const selectedId = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(selectedId).not.toBe("shared-material");
+    expect(project.materials.find(material => material.id === "shared-material")?.proceduralMaps).toBeUndefined();
+    const archive = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const opened = await openNativeProjectArchive(archive.value);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) expect(opened.value.project.materials.find(material => material.id === selectedId)?.proceduralMaps?.roughness).toEqual(grain);
+    }
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials.find(material => material.id === "shared-material")?.proceduralMaps).toBeUndefined();
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(editProceduralRoughness(store, captureMaterialEdit(store, "shared")!, undefined)).toMatchObject({ ok: true, changed: true });
+  });
   it("edits Triplanar through shared command history and native archive", async () => {
     const store = setup();
     const triplanar = { mode: "triplanar" as const, tiling: [2, 3] as const, offset: [4, -5] as const };

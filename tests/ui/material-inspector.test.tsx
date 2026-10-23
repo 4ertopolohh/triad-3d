@@ -7,6 +7,17 @@ import { materialPresets } from "../../src/materials/presets";
 import { createNestedMeshProject } from "../fixtures/projects";
 
 describe("MaterialInspector", () => {
+  it("shows procedural controls and missing UV warning", () => {
+    const project = createNestedMeshProject();
+    project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", proceduralMaps: { roughness: { kind: "scratches", seed: 3, scale: 4, intensity: .5, resolution: 256, directionRadians: 1 } } });
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    if (node.kind !== "mesh") throw new Error("fixture");
+    node.meshSource = { kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] };
+    node.materialSlots = [{ name: "Основной", materialId: "m" }];
+    const store = createEditorStore(project); store.setSelection([node.id], node.id);
+    const html = renderToStaticMarkup(createElement(MaterialInspector, { store, state: store.getSnapshot() }));
+    for (const label of ["Процедурная шероховатость", "Зерно", "Царапины", "Seed", "Масштаб", "Интенсивность", "Разрешение карты", "Направление царапин", "геометрии нет UV"]) expect(html).toContain(label);
+  });
   it("shows current PBR values without modifying the project on render", () => {
     const project = createNestedMeshProject();
     project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", roughness: .123456789, baseColor: [2, .2, .3] });

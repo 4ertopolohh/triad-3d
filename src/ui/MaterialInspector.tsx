@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { EditorState, EditorStore } from "../app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
-import type { BaseColorProjection } from "../domain/types";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, editProceduralRoughness, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import type { BaseColorProjection, ProceduralRoughnessConfig } from "../domain/types";
 import { materialNodeReason } from "../app/material-actions";
 import { isJobActive } from "../app/job-controller";
 import { materialPresets } from "../materials/presets";
@@ -25,6 +25,7 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   const [error, setError] = useState("");
   const session = useRef<{ context: MaterialEditContext; groupId: string; changed: boolean; field: string } | null>(null);
   const skipBlur = useRef(false);
+  const proceduralContext = useRef<MaterialEditContext | null>(null);
   const epoch = store.getProjectEpoch();
   const selection = state.selection.ids.join("\0");
   useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
@@ -49,6 +50,27 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   const selectedAsset = state.document.project.assets.find(asset => asset.id === selectedTexture);
   const missingUv = node?.kind === "mesh" && node.meshSource.kind === "editable" && !node.meshSource.uv;
   const projection: BaseColorProjection = material?.textureMappings?.baseColor ?? { mode: "uv" };
+  const procedural = material?.proceduralMaps?.roughness;
+  function setProcedural(config?: ProceduralRoughnessConfig, captured?: MaterialEditContext | null) {
+    if (!canEdit) return;
+    const context = captured === undefined ? captureMaterialEdit(store, mode) : captured;
+    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
+    const result = editProceduralRoughness(store, context, config);
+    setError(result.ok ? "" : result.message);
+  }
+  function proceduralNumber(field: "seed" | "scale" | "intensity" | "directionRadians", label: string) {
+    if (!procedural) return null;
+    const value = field === "directionRadians" ? procedural.kind === "scratches" ? procedural.directionRadians : 0 : procedural[field];
+    const key = `procedural-${field}`;
+    return <label key={key}>{label}<input type="text" inputMode="decimal" aria-label={label} value={editing === key ? draft : format(value)} disabled={!canEdit}
+      onFocus={() => { proceduralContext.current = captureMaterialEdit(store, mode); setEditing(key); setDraft(format(value)); setError(""); }}
+      onChange={event => setDraft(event.target.value)}
+      onBlur={() => { if (shouldSkipBlur() || editing !== key) return; const raw = draft.trim(); const number = Number(raw); if (raw && Number.isFinite(number)) {
+        if (field === "directionRadians" && procedural.kind === "scratches") setProcedural({ ...procedural, directionRadians: number }, proceduralContext.current);
+        else if (field !== "directionRadians") setProcedural({ ...procedural, [field]: number }, proceduralContext.current);
+      } else setError("Введите конечное число."); proceduralContext.current = null; setEditing(null); }}
+      onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+  }
   function setProjection(value: BaseColorProjection) {
     if (!canEdit) return;
     const context = captureMaterialEdit(store, mode);
@@ -157,6 +179,17 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
           <div className="inspector-vector">{projectionNumber("Повторение U", projection.tiling[0], number => ({ ...projection, tiling: [number, projection.tiling[1]] }))}{projectionNumber("Повторение V", projection.tiling[1], number => ({ ...projection, tiling: [projection.tiling[0], number] }))}{projectionNumber("Смещение U", projection.offset[0], number => ({ ...projection, offset: [number, projection.offset[1]] }))}{projectionNumber("Смещение V", projection.offset[1], number => ({ ...projection, offset: [projection.offset[0], number] }))}</div></>}
         {missingUv && selectedTexture && projection.mode === "uv" && <p className="material-warning">У геометрии нет UV; текстура не отображается. Выберите «Плоскость», «Коробка (Box)» или «Трипланарная (Triplanar)» для проекции.</p>}
         {selectedTexture && !store.readAssetBytes(selectedTexture) && <p className="material-warning">Байты текстуры недоступны в памяти.</p>}
+        <div className="material-field"><h4>Процедурная шероховатость</h4>
+          <label>Режим<select aria-label="Режим процедурной шероховатости" value={procedural?.kind ?? "none"} disabled={!canEdit} onChange={event => {
+            const kind = event.target.value;
+            setProcedural(kind === "none" ? undefined : kind === "scratches" ? { kind: "scratches", seed: 1, scale: 4, intensity: .5, resolution: 256, directionRadians: 0 } : { kind: "grain", seed: 1, scale: 4, intensity: .5, resolution: 256 });
+          }}><option value="none">Нет</option><option value="grain">Зерно</option><option value="scratches">Царапины</option></select></label>
+          {procedural && <><div className="inspector-vector">{proceduralNumber("seed", "Seed")}{proceduralNumber("scale", "Масштаб")}{proceduralNumber("intensity", "Интенсивность")}{procedural.kind === "scratches" && proceduralNumber("directionRadians", "Направление царапин (радианы)")}</div>
+            <label>Разрешение карты<select aria-label="Разрешение карты" value={procedural.resolution} disabled={!canEdit} onChange={event => setProcedural({ ...procedural, resolution: Number(event.target.value) as 128 | 256 | 512 })}><option value="128">128</option><option value="256">256</option><option value="512">512</option></select></label></>}
+          <p className="panel-hint">Визуальная шероховатость; геометрия не изменяется.</p>
+          {procedural && missingUv && projection.mode === "uv" && <p className="material-warning">У геометрии нет UV; процедурная шероховатость не отображается.</p>}
+          {procedural && projection.mode === "triplanar" && missingUv && <p className="material-warning">Трипланарная проекция основного цвета не создаёт UV для шероховатости.</p>}
+        </div>
       </div>
       <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
       {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}

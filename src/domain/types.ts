@@ -124,7 +124,18 @@ export interface Material {
   textureAssetIds: EntityId[];
   textureSlots?: MaterialTextureSlots;
   textureMappings?: { baseColor?: BaseColorProjection };
+  proceduralMaps?: { roughness?: ProceduralRoughnessConfig };
 }
+
+interface ProceduralRoughnessBase {
+  seed: number;
+  scale: number;
+  intensity: number;
+  resolution: 128 | 256 | 512;
+}
+export type ProceduralRoughnessConfig =
+  | (ProceduralRoughnessBase & { kind: "grain" })
+  | (ProceduralRoughnessBase & { kind: "scratches"; directionRadians: number });
 
 export interface MaterialTextureSlots { baseColor?: EntityId }
 export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "box"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "triplanar"; tiling: readonly [number, number]; offset: readonly [number, number] };

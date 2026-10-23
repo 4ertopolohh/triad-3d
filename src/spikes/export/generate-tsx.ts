@@ -85,6 +85,7 @@ export function generateSpikeTsx(project: Project): SpikeExport {
       } : DEFAULT_MATERIAL;
       if (assigned?.textureAssetIds.length) diagnostics.push({ code: "TEXTURES_OMITTED", path: `materials.${assigned.id}.textureAssetIds`, message: "Текстуры не включены." });
       if (assigned?.textureSlots?.baseColor) diagnostics.push({ code: "TEXTURES_OMITTED", path: `materials.${assigned.id}.textureSlots.baseColor`, message: "Текстура основного цвета не включена в прототип экспорта." });
+      if (assigned?.proceduralMaps?.roughness) diagnostics.push({ code: "PROCEDURAL_ROUGHNESS_OMITTED", path: `materials.${assigned.id}.proceduralMaps.roughness`, message: "Процедурная шероховатость не включена в прототип экспорта; внешний вид отличается от редактора." });
       if (assigned && assigned.envIntensity !== 1) diagnostics.push({ code: "ENV_INTENSITY_OMITTED", path: `materials.${assigned.id}.envIntensity`, message: "Интенсивность окружения не включена." });
     }
     return {

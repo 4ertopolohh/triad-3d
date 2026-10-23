@@ -1,10 +1,10 @@
 import type { EditorStore } from "./editor-store";
-import type { BaseColorProjection, Material } from "../domain/types";
+import type { BaseColorProjection, Material, ProceduralRoughnessConfig } from "../domain/types";
 import type { ProjectCommand } from "../domain/command-bus";
 import { validateMaterial } from "../domain/validate-material";
 import { materialNodeReason } from "./material-actions";
 
-export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings">;
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings" | "proceduralMaps">;
 export type MaterialEditMode = "unique" | "shared";
 export interface MaterialEditContext {
   epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
@@ -34,8 +34,11 @@ export function editBaseColorTexture(store: EditorStore, context: MaterialEditCo
 export function editBaseColorProjection(store: EditorStore, context: MaterialEditContext, projection: BaseColorProjection): MaterialEditResult {
   return applyMaterialEdit(store, context, { kind: "projection", projection });
 }
+export function editProceduralRoughness(store: EditorStore, context: MaterialEditContext, config?: ProceduralRoughnessConfig): MaterialEditResult {
+  return applyMaterialEdit(store, context, config ? { kind: "roughness", config } : { kind: "roughness" });
+}
 
-function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection }, groupId?: string): MaterialEditResult {
+function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection } | { kind: "roughness"; config?: ProceduralRoughnessConfig }, groupId?: string): MaterialEditResult {
   const state = store.getSnapshot();
   if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
     || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
@@ -60,7 +63,13 @@ function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, cha
   if (change.kind === "projection" && change.projection.mode === "uv" && (!source.textureMappings?.baseColor || source.textureMappings.baseColor.mode === "uv"))
     return { ok: true, revision: context.revision, changed: false };
   const next = structuredClone(source) as Material;
-  if (change.kind === "projection") {
+  if (change.kind === "roughness") {
+    if (change.config) next.proceduralMaps = { ...next.proceduralMaps, roughness: structuredClone(change.config) };
+    else if (next.proceduralMaps) {
+      delete next.proceduralMaps.roughness;
+      if (!Object.keys(next.proceduralMaps).length) delete next.proceduralMaps;
+    }
+  } else if (change.kind === "projection") {
     // Historical UV has no stored configuration. Treat explicit UV as the same state.
     if (change.projection.mode === "uv") {
       if (next.textureMappings) {

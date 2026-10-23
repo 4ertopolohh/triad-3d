@@ -11,6 +11,7 @@ import { createPhysicalMaterial } from "./pbr-material";
 import { createTriplanarMaterial } from "./triplanar-material";
 import { MeshPhysicalNodeMaterial } from "three/webgpu";
 import { BaseColorTextures } from "./base-color-textures";
+import { ProceduralRoughnessTextures } from "./procedural-roughness-textures";
 import { ProjectionGeometry } from "./planar-projection";
 
 export type RenderProject = DeepReadonly<Project>;
@@ -70,6 +71,7 @@ export class SceneSync {
   private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
   private closed = false;
   private textures = new BaseColorTextures(() => this.emit());
+  private roughnessTextures = new ProceduralRoughnessTextures();
   private projection = new ProjectionGeometry();
   private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
   private readAsset: AssetReader = () => undefined;
@@ -77,6 +79,14 @@ export class SceneSync {
   private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): EditorMaterial {
     const material = imported && value?.textureMappings?.baseColor?.mode === "triplanar" ? createPhysicalMaterial(value) : ownedMaterial(value);
     editorMaterials.add(material);
+    const roughness = value?.proceduralMaps?.roughness;
+    if (roughness?.intensity) {
+      if (!geometry.getAttribute("uv")) this.diagnostics.push(`${name}: у геометрии нет UV; процедурная шероховатость не отображается.`);
+      else {
+        const failure = this.roughnessTextures.bind(material, roughness, value!.roughness);
+        if (failure) this.diagnostics.push(`${name}: ${failure}`);
+      }
+    }
     const id = value?.textureSlots?.baseColor;
     if (!id) return material;
     if (imported && value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv") { this.diagnostics.push(`${name}: проекция для импортированного GLB недоступна.`); return material; }
@@ -86,7 +96,7 @@ export class SceneSync {
     this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv", value?.textureMappings?.baseColor?.mode === "triplanar" ? value.textureMappings.baseColor : undefined);
     return material;
   }
-  private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); content.traverse(object => { if (object instanceof T.Mesh) this.projection.releaseMesh(object); }); disposeObject(content); }
+  private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); this.roughnessTextures.releaseObject(content); content.traverse(object => { if (object instanceof T.Mesh) this.projection.releaseMesh(object); }); disposeObject(content); }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
     if (this.closed) return;
     if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
@@ -150,7 +160,7 @@ export class SceneSync {
           if (materials[0]?.textureSlots?.baseColor && materials[0]?.textureMappings?.baseColor?.mode !== "triplanar" && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
           if (warnings.length) this.modifierDiagnostics.set(node.id, warnings); else this.modifierDiagnostics.delete(node.id);
         }
-        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, source?.kind === "asset"), material => this.textures.release(material));
+        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, source?.kind === "asset"), material => { this.textures.release(material); this.roughnessTextures.release(material); });
         entry.key = key;
         continue;
       }
@@ -179,7 +189,7 @@ export class SceneSync {
           next.loading = true;
           void this.decoder(bytes).then(content => {
             // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, true), material => this.textures.release(material));
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, true), material => { this.textures.release(material); this.roughnessTextures.release(material); });
             assign(content);
           }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
         }
@@ -246,5 +256,5 @@ export class SceneSync {
     empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.textures.diagnostics(), ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
   private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
   private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.textures.dispose(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.textures.dispose(); this.roughnessTextures.dispose(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
 }
