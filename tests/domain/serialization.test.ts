@@ -75,7 +75,7 @@ describe("project document schema v1", () => {
     if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
   });
 
-  it.each(["2.0.0", "1.2.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+  it.each(["2.0.0", "1.3.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
     const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
@@ -108,6 +108,29 @@ describe("project document schema v1", () => {
     expect(migrateProjectDocument(old, [migration])).toEqual({ ok: true, value: emptyProject });
     expect(old).toEqual(before);
     expect(deserializeProjectDocument(jsonOf(old), [migration])).toEqual({ ok: true, value: emptyProject });
+  });
+  it("keeps legacy links unassigned through both built-in migrations", () => {
+    const old = createMaterialAnimationProject();
+    old.assets.push({ id: "legacy-image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/legacy.png", colorSpace: "srgb" });
+    old.materials[0]!.textureAssetIds.push("legacy-image");
+    old.schemaVersion = "1.0.0";
+    const result = deserializeProjectDocument(jsonOf(old));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.schemaVersion).toBe("1.2.0");
+      expect(result.value.materials[0]!.textureAssetIds).toEqual(["legacy-image"]);
+      expect(result.value.materials[0]!.textureSlots).toBeUndefined();
+    }
+  });
+  it("validates the explicit baseColor channel and asset MIME", () => {
+    const project = createMaterialAnimationProject();
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" };
+    expect(deserializeProjectDocument(jsonOf(project)).ok).toBe(true);
+    project.assets[0]!.mediaType = "image/x-exr";
+    expect(deserializeProjectDocument(jsonOf(project)).ok).toBe(false);
+    project.materials[0]!.textureSlots = { baseColor: "missing" };
+    expect(deserializeProjectDocument(jsonOf(project)).ok).toBe(false);
   });
 });
 

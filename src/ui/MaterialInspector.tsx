@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { EditorState, EditorStore } from "../app/editor-store";
-import { captureMaterialEdit, editMaterial, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
 import { materialNodeReason } from "../app/material-actions";
 import { isJobActive } from "../app/job-controller";
 import { materialPresets } from "../materials/presets";
@@ -43,6 +43,17 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
     : materialNodeReason(store, node.id) || sharedBlock || "";
   const preset = materialPresets.find(item => item.name === material?.name);
   const canEdit = !!material && !reason;
+  const rasterAssets = state.document.project.assets.filter(asset => ["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType));
+  const selectedTexture = material?.textureSlots?.baseColor;
+  const selectedAsset = state.document.project.assets.find(asset => asset.id === selectedTexture);
+  const missingUv = node?.kind === "mesh" && node.meshSource.kind === "editable" && !node.meshSource.uv;
+  function setTexture(assetId?: string) {
+    if (!canEdit) return;
+    const context = captureMaterialEdit(store, mode);
+    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
+    const result = editBaseColorTexture(store, context, assetId);
+    setError(result.ok ? "" : result.message);
+  }
 
   function start(field: string) {
     const context = captureMaterialEdit(store, mode);
@@ -121,9 +132,19 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
     {reason && <p className="panel-hint">{reason}</p>}
     {material && <>
       <div className="material-fields"><h4>Основные</h4>{colorRow("baseColor", "Базовый цвет")}{scalarFields.slice(0, 3).map(scalarRow)}</div>
+      <div className="material-fields"><h4>Текстуры</h4><label>Основной цвет
+        <select aria-label="Текстура основного цвета" value={selectedTexture ?? ""} disabled={!canEdit} title={reason || undefined} onChange={event => setTexture(event.target.value || undefined)}>
+          <option value="">Не назначено</option>
+          {rasterAssets.map(asset => <option key={asset.id} value={asset.id}>{asset.path} · {asset.id}</option>)}
+          {selectedTexture && !selectedAsset && <option value={selectedTexture}>Недоступный ресурс · {selectedTexture}</option>}
+        </select></label>
+        {selectedAsset && <p className="panel-hint">{selectedAsset.path} · {selectedAsset.id}</p>}
+        <button type="button" disabled={!canEdit || !selectedTexture} title={reason || undefined} onClick={() => setTexture()}>Снять текстуру</button>
+        {missingUv && selectedTexture && <p className="material-warning">У геометрии нет UV; текстура не отображается.</p>}
+      </div>
       <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
       {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
-      {material.textureAssetIds.length > 0 && <p className="material-warning">Ссылки на текстуры сохранены, но текущий renderer их не отображает и Inspector не редактирует.</p>}
+      {material.textureAssetIds.length > 0 && <p className="material-warning">У сохранённых legacy-ссылок на текстуры канал не определён.</p>}
       {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}
       {preset && <p className="panel-hint">Сброс использует одноимённый встроенный пресет как ориентир, без подтверждения происхождения материала.</p>}
     </>}

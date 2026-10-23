@@ -87,6 +87,7 @@ src/
   assets/
     asset-bytes.ts
     native-project-archive.ts
+    prepare-image-asset.ts
     three-resources.ts
   domain/
     schemas/
@@ -169,6 +170,7 @@ src/
     MaterialLibrary.tsx
     MirrorEditor.tsx
     ObjectTree.tsx
+    ResourceLibrary.tsx
   main.tsx
   vite-env.d.ts
 tests/
@@ -183,6 +185,11 @@ tests/
     mirror-actions.test.ts
   assets/
     native-project-archive.test.ts
+    prepare-image-asset.test.ts
+    sample.exr
+    sample.jpg
+    sample.png
+    sample.webp
   csg/
     benchmark.test.ts
     client.test.ts
@@ -3902,6 +3909,133 @@ export async function openNativeProjectArchive(input: Blob | ArrayBuffer): Promi
 }
 </file>
 
+<file path="src/assets/prepare-image-asset.ts">
+import { EXRLoader } from "three/examples/jsm/loaders/EXRLoader.js";
+import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
+import { ARCHIVE_LIMITS } from "./native-project-archive";
+import type { Asset } from "../domain/types";
+
+export type ImageFormat = "png" | "jpg" | "webp" | "hdr" | "exr";
+export const IMAGE_LIMITS = Object.freeze({
+  // Temporary RAM budget: one RGBA Float32 buffer and equal decoder scratch space.
+  maxDimension: 16384,
+  maxDecodedBytes: 128 * 1024 * 1024,
+});
+export interface PreparedImageAsset { asset: Asset; bytes: Uint8Array; width: number; height: number; format: ImageFormat }
+export type ImageImportErrorCode = "FORMAT" | "MIME" | "SIZE" | "DIMENSIONS" | "DECODE" | "READ" | "HASH" | "CANCELLED";
+export type ImageImportResult = { ok: true; value: PreparedImageAsset } | { ok: false; error: { code: ImageImportErrorCode; message: string } };
+type Decoder = (bytes: Uint8Array, format: ImageFormat) => Promise<{ width: number; height: number }>;
+const fail = (code: ImageImportErrorCode, message: string): ImageImportResult => ({ ok: false, error: { code, message } });
+const mime: Record<ImageFormat, string> = { png: "image/png", jpg: "image/jpeg", webp: "image/webp", hdr: "image/vnd.radiance", exr: "image/x-exr" };
+const aliases: Record<ImageFormat, string[]> = { png: ["image/png"], jpg: ["image/jpeg", "image/jpg"], webp: ["image/webp"], hdr: ["image/vnd.radiance", "image/x-hdr", "application/octet-stream"], exr: ["image/x-exr", "image/exr", "application/octet-stream"] };
+const at = (bytes: Uint8Array, i: number) => bytes[i] ?? 0;
+const u32be = (b: Uint8Array, i: number) => ((at(b, i) * 0x1000000) + (at(b, i + 1) << 16) + (at(b, i + 2) << 8) + at(b, i + 3)) >>> 0;
+const u32le = (b: Uint8Array, i: number) => (at(b, i) + (at(b, i + 1) << 8) + (at(b, i + 2) << 16) + at(b, i + 3) * 0x1000000) >>> 0;
+const i32le = (b: Uint8Array, i: number) => new DataView(b.buffer, b.byteOffset + i, 4).getInt32(0, true);
+const ascii = (b: Uint8Array, i: number, n: number) => new TextDecoder("ascii").decode(b.subarray(i, i + n));
+export function imageDimensions(bytes: Uint8Array, format: ImageFormat): [number, number] | null {
+  if (format === "png") {
+    if (bytes.length < 33 || ascii(bytes, 1, 3) !== "PNG" || at(bytes, 0) !== 137 || at(bytes, 4) !== 13 || at(bytes, 5) !== 10 || at(bytes, 6) !== 26 || at(bytes, 7) !== 10 || u32be(bytes, 8) !== 13 || ascii(bytes, 12, 4) !== "IHDR") return null;
+    return [u32be(bytes, 16), u32be(bytes, 20)];
+  }
+  if (format === "jpg") {
+    if (at(bytes, 0) !== 0xff || at(bytes, 1) !== 0xd8) return null;
+    for (let p = 2; p + 4 < bytes.length;) {
+      if (at(bytes, p++) !== 0xff) return null;
+      while (at(bytes, p) === 0xff) p++;
+      const marker = at(bytes, p++);
+      if (marker === 0xd9 || marker === 0xda) return null;
+      if (marker === 0x01 || marker >= 0xd0 && marker <= 0xd7) continue;
+      const length = at(bytes, p) * 256 + at(bytes, p + 1);
+      if (length < 2 || p + length > bytes.length) return null;
+      if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker))
+        return length >= 7 ? [at(bytes, p + 5) * 256 + at(bytes, p + 6), at(bytes, p + 3) * 256 + at(bytes, p + 4)] : null;
+      p += length;
+    }
+    return null;
+  }
+  if (format === "webp") {
+    if (bytes.length < 30 || ascii(bytes, 0, 4) !== "RIFF" || ascii(bytes, 8, 4) !== "WEBP" || u32le(bytes, 4) + 8 !== bytes.length) return null;
+    const chunk = ascii(bytes, 12, 4);
+    if (chunk === "VP8X" && bytes.length >= 30) return [1 + at(bytes, 24) + (at(bytes, 25) << 8) + (at(bytes, 26) << 16), 1 + at(bytes, 27) + (at(bytes, 28) << 8) + (at(bytes, 29) << 16)];
+    if (chunk === "VP8 " && bytes.length >= 30 && at(bytes, 23) === 0x9d && at(bytes, 24) === 0x01 && at(bytes, 25) === 0x2a)
+      return [(at(bytes, 26) + (at(bytes, 27) << 8)) & 0x3fff, (at(bytes, 28) + (at(bytes, 29) << 8)) & 0x3fff];
+    if (chunk === "VP8L" && bytes.length >= 25 && at(bytes, 20) === 0x2f)
+      return [1 + at(bytes, 21) + ((at(bytes, 22) & 0x3f) << 8), 1 + (at(bytes, 22) >> 6) + (at(bytes, 23) << 2) + ((at(bytes, 24) & 15) << 10)];
+    return null;
+  }
+  if (format === "hdr") {
+    const header = ascii(bytes, 0, Math.min(bytes.length, 4096));
+    if (!/^#\?(?:RADIANCE|RGBE)\r?\n/.test(header) || !/FORMAT=32-bit_rle_rgbe/.test(header)) return null;
+    const match = header.match(/\r?\n\r?\n-Y (\d+) \+X (\d+)\r?\n/);
+    return match ? [Number(match[2]), Number(match[1])] : null;
+  }
+  if (bytes.length < 16 || u32le(bytes, 0) !== 20000630 || (u32le(bytes, 4) & 0xff) !== 2 || (u32le(bytes, 4) & ~0xff) !== 0) return null;
+  let window: [number, number] | null = null;
+  let compression: number | null = null;
+  for (let p = 8; p < Math.min(bytes.length, 65536);) {
+    const endName = bytes.indexOf(0, p);
+    if (endName < 0 || endName >= 65536) return null;
+    if (endName === p) break;
+    const name = ascii(bytes, p, endName - p);
+    p = endName + 1;
+    const endType = bytes.indexOf(0, p);
+    if (endType < 0 || endType + 5 > bytes.length) return null;
+    p = endType + 1;
+    const length = u32le(bytes, p); p += 4;
+    if (length > bytes.length - p) return null;
+    if (name === "dataWindow" && length === 16) window = [i32le(bytes, p + 8) - i32le(bytes, p) + 1, i32le(bytes, p + 12) - i32le(bytes, p + 4) + 1];
+    if (name === "compression" && length === 1) compression = at(bytes, p);
+    p += length;
+  }
+  // Restrict to lossless encodings supported by the installed loader.
+  return window && compression !== null && [0, 1, 2, 3, 4].includes(compression) ? window : null;
+}
+export function withinImageBudget(width: number, height: number): boolean {
+  return Number.isSafeInteger(width) && Number.isSafeInteger(height) && width > 0 && height > 0
+    && width <= IMAGE_LIMITS.maxDimension && height <= IMAGE_LIMITS.maxDimension
+    && width * height * 32 <= IMAGE_LIMITS.maxDecodedBytes;
+}
+export const browserImageDecoder: Decoder = async (bytes, format) => {
+  if (format === "hdr" || format === "exr") {
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    const result = format === "hdr" ? new RGBELoader().parse(buffer) : new EXRLoader().parse(buffer);
+    if (!result || !result.data || result.data.length === 0) throw new Error("decode");
+    return { width: result.width ?? 0, height: result.height ?? 0 };
+  }
+  const bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: mime[format] }));
+  try { return { width: bitmap.width, height: bitmap.height }; }
+  finally { bitmap.close(); }
+};
+export async function prepareImageAsset(file: File, decoder: Decoder = browserImageDecoder, signal?: AbortSignal): Promise<ImageImportResult> {
+  const extension = file.name.match(/\.([^.]+)$/)?.[1]?.toLowerCase();
+  const format = extension === "jpeg" ? "jpg" : extension;
+  if (!format || !(format in mime)) return fail("FORMAT", "Неподдерживаемое расширение ресурса.");
+  const kind = format as ImageFormat;
+  if (file.type && !aliases[kind].includes(file.type.toLowerCase())) return fail("MIME", "MIME-тип файла не соответствует расширению.");
+  if (!file.size || file.size > ARCHIVE_LIMITS.asset) return fail("SIZE", "Файл пуст или превышает лимит 64 МиБ.");
+  if (signal?.aborted) return fail("CANCELLED", "Импорт отменён.");
+  let bytes: Uint8Array;
+  try { bytes = new Uint8Array(await file.arrayBuffer()); } catch { return fail("READ", "Не удалось прочитать файл."); }
+  if (signal?.aborted) return fail("CANCELLED", "Импорт отменён.");
+  const size = imageDimensions(bytes, kind);
+  if (!size) return fail("FORMAT", "Заголовок или формат файла повреждён либо не поддерживается.");
+  if (!withinImageBudget(...size)) return fail("DIMENSIONS", "Размеры изображения превышают защитный лимит декодирования 128 МиБ.");
+  try {
+    const decoded = await decoder(bytes, kind);
+    if (decoded.width !== size[0] || decoded.height !== size[1] || !withinImageBudget(decoded.width, decoded.height))
+      return fail("DIMENSIONS", "Размеры декодированного изображения не совпадают с заголовком.");
+  } catch { return fail("DECODE", "Не удалось декодировать изображение; файл повреждён или использует неподдерживаемое кодирование."); }
+  if (signal?.aborted) return fail("CANCELLED", "Импорт отменён.");
+  let hash: string;
+  try { hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource))].map(n => n.toString(16).padStart(2, "0")).join(""); }
+  catch { return fail("HASH", "Не удалось вычислить SHA-256 ресурса."); }
+  if (signal?.aborted) return fail("CANCELLED", "Импорт отменён.");
+  return { ok: true, value: { bytes, width: size[0], height: size[1], format: kind,
+    asset: { id: crypto.randomUUID(), hash, path: `assets/${hash}.${kind}`, mediaType: mime[kind], colorSpace: kind === "hdr" || kind === "exr" ? "linear" : "srgb" } } };
+}
+</file>
+
 <file path="src/domain/schemas/document-v1.1.schema.json">
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7425,6 +7559,50 @@ export function ObjectTree({ store, project, selection, blocked, mode, notice }:
 }
 </file>
 
+<file path="src/ui/ResourceLibrary.tsx">
+import { useEffect, useState } from "react";
+import type { EditorStore, EditorState } from "../app/editor-store";
+import { imageDimensions, type ImageFormat } from "../assets/prepare-image-asset";
+
+type Entry = { id: string; format: string; size: number; dimensions: string; url: string | undefined };
+const formatOf = (path: string): ImageFormat | null => {
+  const extension = path.split(".").at(-1);
+  return extension === "png" || extension === "jpg" || extension === "webp" || extension === "hdr" || extension === "exr" ? extension : null;
+};
+export function ResourceLibrary({ store, state, blocked, onImport }: { store: EditorStore; state: EditorState; blocked: boolean; onImport: () => void }) {
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const assets = state.document.project.assets;
+  const signature = assets.map(asset => `${asset.id}:${asset.hash}`).join("|");
+  useEffect(() => {
+    const urls: string[] = [];
+    const next = assets.map(asset => {
+      const bytes = store.readAssetBytes(asset.id);
+      const format = formatOf(asset.path);
+      const dimensions = bytes && format ? imageDimensions(bytes, format) : null;
+      let url: string | undefined;
+      if (bytes && format && ["png", "jpg", "webp"].includes(format)) {
+        url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: asset.mediaType }));
+        urls.push(url);
+      }
+      return { id: asset.id, format: format?.toUpperCase() ?? asset.mediaType, size: bytes?.byteLength ?? 0,
+        dimensions: dimensions ? `${dimensions[0]} × ${dimensions[1]}` : "Размеры недоступны", url };
+    });
+    setEntries(next);
+    return () => { for (const url of urls) URL.revokeObjectURL(url); };
+    // signature tracks the Project.assets list; history and project replacement invalidate all previews.
+  }, [store, signature, state.document.project]);
+  return <div className="resource-library">
+    <button type="button" disabled={blocked} onClick={onImport}>Импортировать ресурс</button>
+    <p className="panel-hint">Назначение текстуры на PBR-каналы будет добавлено отдельно.</p>
+    {!entries.length && <p className="panel-hint">Ресурсов пока нет.</p>}
+    {entries.map(entry => <div className="resource-card" key={entry.id}>
+      {entry.url ? <img src={entry.url} alt={`Превью ресурса ${entry.format}`} /> : <div className="resource-placeholder">{entry.format === "HDR" || entry.format === "EXR" ? "HDR-превью недоступно" : "Превью недоступно"}</div>}
+      <div><strong>{entry.format}</strong><p>{entry.size.toLocaleString("ru-RU")} байт · {entry.dimensions}</p></div>
+    </div>)}
+  </div>;
+}
+</file>
+
 <file path="src/main.tsx">
 import React from "react";
 import { createRoot } from "react-dom/client";
@@ -8007,6 +8185,131 @@ describe("Mirror user actions", () => {
     release();
     await Promise.resolve();
     expect(store.getSnapshot().history.entries).toHaveLength(0);
+  });
+});
+</file>
+
+<file path="tests/assets/prepare-image-asset.test.ts">
+import { readFile } from "node:fs/promises";
+import { describe, expect, it } from "vitest";
+import { createProject } from "../../src/domain";
+import { createEditorStore } from "../../src/app/editor-store";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { browserImageDecoder, imageDimensions, prepareImageAsset, withinImageBudget, type ImageFormat } from "../../src/assets/prepare-image-asset";
+
+const fromDisk = async (format: string) => new Uint8Array(await readFile(new URL(`./sample.${format}`, import.meta.url)));
+const file = (bytes: Uint8Array, format: string, type = "") => new File([bytes as BlobPart], `sample.${format}`, { type });
+const rasterDecode = async (bytes: Uint8Array, format: ImageFormat) => {
+  const size = imageDimensions(bytes, format);
+  if (!size) throw new Error("invalid");
+  return { width: size[0], height: size[1] };
+};
+
+describe("image asset ingestion", () => {
+  it.each(["png", "jpg", "webp", "exr"])("prepares %s and keeps original bytes", async format => {
+    const bytes = await fromDisk(format);
+    const result = await prepareImageAsset(file(bytes, format), format === "exr" ? browserImageDecoder : rasterDecode);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.bytes).toEqual(bytes);
+      expect(result.value.asset.path).toBe(`assets/${result.value.asset.hash}.${format}`);
+      expect([result.value.width, result.value.height]).toEqual([2, 2]);
+    }
+  });
+  it("decodes the repository Radiance HDR with Three.js", async () => {
+    const bytes = new Uint8Array(await readFile(new URL("../../src/spikes/renderer/assets/studio_small_03_1k.hdr", import.meta.url)));
+    const result = await prepareImageAsset(file(bytes, "hdr"), browserImageDecoder);
+    expect(result.ok).toBe(true);
+  });
+  it("rejects MIME mismatch, bad payload, oversized file, dimension bomb and unsupported EXR", async () => {
+    const bytes = await fromDisk("png");
+    expect((await prepareImageAsset(file(bytes, "png", "image/jpeg"), rasterDecode)).ok).toBe(false);
+    expect((await prepareImageAsset(file(bytes, "jpg", "image/jpeg"), rasterDecode)).ok).toBe(false);
+    expect((await prepareImageAsset(file(bytes.subarray(0, 25), "png"), rasterDecode)).ok).toBe(false);
+    expect((await prepareImageAsset(file(new Uint8Array(0), "png"), rasterDecode)).ok).toBe(false);
+    const oversized = { name: "huge.png", type: "image/png", size: 64 * 1024 * 1024 + 1, arrayBuffer: () => { throw new Error("must not read"); } } as unknown as File;
+    expect((await prepareImageAsset(oversized, rasterDecode)).ok).toBe(false);
+    expect(withinImageBudget(16384, 16384)).toBe(false);
+    const bomb = bytes.slice();
+    bomb.set([0, 0, 64, 0], 16); bomb.set([0, 0, 64, 0], 20);
+    expect((await prepareImageAsset(file(bomb, "png"), rasterDecode)).ok).toBe(false);
+    const exr = await fromDisk("exr");
+    const marker = new TextEncoder().encode("compression\0compression\0");
+    const position = exr.findIndex((_, i) => marker.every((n, j) => exr[i + j] === n));
+    expect(position).toBeGreaterThan(0);
+    const unsupported = exr.slice();
+    unsupported[position + marker.length + 4] = 255;
+    expect((await prepareImageAsset(file(unsupported, "exr"), browserImageDecoder)).ok).toBe(false);
+    expect((await prepareImageAsset(file(exr.subarray(0, 20), "exr"), browserImageDecoder)).ok).toBe(false);
+    expect((await prepareImageAsset(file(new TextEncoder().encode("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n"), "hdr"), browserImageDecoder)).ok).toBe(false);
+  });
+  it("commits once, supports undo/redo, save/open and rejects stale revision", async () => {
+    const bytes = await fromDisk("png");
+    const prepared = await prepareImageAsset(file(bytes, "png"), rasterDecode);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    const store = createEditorStore(createProject());
+    const captured = store.captureDocument();
+    const command = { commandId: "import-1", type: "ADD_ASSET" as const, targetIds: [prepared.value.asset.id] as [string], payload: { asset: prepared.value.asset } };
+    expect((await store.addAsset(command, bytes, captured.revision, captured.identity)).ok).toBe(true);
+    const after = store.captureDocument();
+    expect(after.project.assets).toHaveLength(1);
+    expect(await store.addAsset(command, bytes, after.revision, after.identity)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(await store.addAsset(command, bytes, captured.revision, captured.identity)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.undo(after.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.assets).toHaveLength(0);
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.readAssetBytes(prepared.value.asset.id)).toEqual(bytes);
+    const snapshot = store.captureDocument();
+    const archive = await createNativeProjectArchive(snapshot.project, snapshot.assets, "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (!archive.ok) return;
+    const opened = await openNativeProjectArchive(archive.value);
+    expect(opened.ok).toBe(true);
+    if (opened.ok) expect(opened.value.assets.get(prepared.value.asset.id)).toEqual(bytes);
+    const old = store.captureDocument();
+    expect(store.replaceProject({ project: createProject(), assets: opened.ok ? opened.value.assets : snapshot.assets }, old.identity)).toBe(true);
+    expect(await store.addAsset(command, bytes, old.revision, old.identity)).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+  });
+  it("does not publish failed imports and prunes bytes from abandoned redo history", async () => {
+    const bytes = await fromDisk("png");
+    const prepared = await prepareImageAsset(file(bytes, "png"), rasterDecode);
+    if (!prepared.ok) throw new Error("fixture invalid");
+    const store = createEditorStore(createProject());
+    const first = store.captureDocument();
+    const command = { commandId: "add-image", type: "ADD_ASSET" as const, targetIds: [prepared.value.asset.id] as [string], payload: { asset: prepared.value.asset } };
+    const invalid = bytes.slice(); invalid[invalid.length - 1] = (invalid.at(-1) ?? 0) ^ 1;
+    expect(await store.addAsset(command, invalid, first.revision, first.identity)).toMatchObject({ ok: false, code: "INVALID_COMMAND" });
+    expect(store.getSnapshot().document).toMatchObject({ dirty: false, revision: 0 });
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect((await store.addAsset(command, bytes, first.revision, first.identity)).ok).toBe(true);
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.readAssetBytes(prepared.value.asset.id)).toEqual(bytes);
+    const second = await prepareImageAsset(file(await fromDisk("jpg"), "jpg"), rasterDecode);
+    if (!second.ok) throw new Error("fixture invalid");
+    const current = store.captureDocument();
+    expect((await store.addAsset({ commandId: "add-jpg", type: "ADD_ASSET", targetIds: [second.value.asset.id], payload: { asset: second.value.asset } }, second.value.bytes, current.revision, current.identity)).ok).toBe(true);
+    expect(store.readAssetBytes(prepared.value.asset.id)).toBeUndefined();
+  });
+  it("rejects a prepared import after project replacement", async () => {
+    const store = createEditorStore(createProject());
+    const old = store.captureDocument();
+    const prepared = await prepareImageAsset(file(await fromDisk("webp"), "webp"), rasterDecode);
+    if (!prepared.ok) throw new Error("fixture invalid");
+    expect(store.replaceProject({ project: createProject(), assets: old.assets }, old.identity)).toBe(true);
+    const result = await store.addAsset({ commandId: "late", type: "ADD_ASSET", targetIds: [prepared.value.asset.id], payload: { asset: prepared.value.asset } }, prepared.value.bytes, old.revision, old.identity);
+    expect(result).toMatchObject({ ok: false, code: "REVISION_CONFLICT" });
+    expect(store.getSnapshot().document).toMatchObject({ dirty: false, revision: 0 });
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+  });
+  it("honors cancellation after decoding without a prepared resource", async () => {
+    const controller = new AbortController();
+    const result = await prepareImageAsset(file(await fromDisk("png"), "png"), async (bytes, format) => {
+      controller.abort();
+      return rasterDecode(bytes, format);
+    }, controller.signal);
+    expect(result).toMatchObject({ ok: false, error: { code: "CANCELLED" } });
   });
 });
 </file>
@@ -10864,30 +11167,6 @@ export function applyMaterialPreset(store: EditorStore, preset: MaterialPreset, 
 
 export function applyMaterialPresetToNode(store: EditorStore, preset: MaterialPreset, expectedRevision: number, nodeId: string, expectedEpoch: object): { ok: boolean; message: string } {
   return assignPreset(store, preset, expectedRevision, nodeId, expectedEpoch, false);
-}
-</file>
-
-<file path="src/assets/asset-bytes.ts">
-export class AssetBytes {
-  private readonly values = new Map<string, Uint8Array>();
-
-  constructor(entries: Iterable<readonly [string, Uint8Array]> = []) {
-    for (const [id, bytes] of entries) this.set(id, bytes);
-  }
-
-  get(id: string): Uint8Array | undefined {
-    const bytes = this.values.get(id);
-    return bytes?.slice();
-  }
-
-  set(id: string, bytes: Uint8Array): void {
-    this.values.set(id, bytes.slice());
-  }
-
-  ids(): string[] { return [...this.values.keys()]; }
-  delete(id: string): void { this.values.delete(id); }
-  clear(): void { this.values.clear(); }
-  clone(): AssetBytes { return new AssetBytes(this.values); }
 }
 </file>
 
@@ -13776,6 +14055,36 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   { files: ["**/*.{js,mjs,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
 );
+</file>
+
+<file path="src/assets/asset-bytes.ts">
+export class AssetBytes {
+  private readonly values = new Map<string, Uint8Array>();
+
+  constructor(entries: Iterable<readonly [string, Uint8Array]> = []) {
+    for (const [id, bytes] of entries) this.set(id, bytes);
+  }
+
+  get(id: string): Uint8Array | undefined {
+    const bytes = this.values.get(id);
+    return bytes?.slice();
+  }
+
+  set(id: string, bytes: Uint8Array): void {
+    this.values.set(id, bytes.slice());
+  }
+
+  ids(): string[] { return [...this.values.keys()]; }
+  delete(id: string): void { this.values.delete(id); }
+  clear(): void { this.values.clear(); }
+  clone(): AssetBytes { return new AssetBytes(this.values); }
+  /** Shares immutable internal byte arrays; get/set still copy at the public boundary. */
+  fork(): AssetBytes {
+    const next = new AssetBytes();
+    for (const [id, bytes] of this.values) next.values.set(id, bytes);
+    return next;
+  }
+}
 </file>
 
 <file path="src/geometry/mesh-edit.ts">
@@ -17070,7 +17379,7 @@ import { CommandErrorCode } from "../domain/command-bus";
 import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
 import type { EntityId, Project } from "../domain/types";
 import { AssetBytes } from "../assets/asset-bytes";
-import type { LoadedProject } from "../assets/native-project-archive";
+import { ARCHIVE_LIMITS, type LoadedProject } from "../assets/native-project-archive";
 import { createJobController, isJobActive, type JobController, type JobState } from "./job-controller";
 import { MAX_VISIBLE_VERTICES, normalizeVertexIndices } from "../geometry/vertex-selection";
 import { buildMeshTopology, MAX_TOPOLOGY_TRIANGLES, selectedTopologyVertices } from "../geometry/mesh-topology";
@@ -17107,6 +17416,7 @@ export interface EditorStore {
   redo(expectedRevision: number): CommandResult;
   cancelGesture(groupId: string, expectedRevision: number): CommandResult;
   addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
+  addAsset(command: Extract<ProjectCommand, { type: "ADD_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object, signal?: AbortSignal): Promise<CommandResult>;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   enterVertexMode(expectedRevision: number, expectedEpoch: object): string | null;
   exitVertexMode(): void;
@@ -17121,6 +17431,7 @@ export interface EditorStore {
   readAssetBytes(id: string): Uint8Array | undefined;
   getProjectEpoch(): object;
   captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  captureImportContext(): { revision: number; identity: object };
   confirmSaved(revision: number, identity: object): boolean;
   replaceProject(loaded: LoadedProject, identity: object): boolean;
 }
@@ -17323,8 +17634,44 @@ export function createEditorStore(initialProject: Project): EditorStore {
       if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
         return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
       try {
-        const nextAssets = assetBytes.clone();
+        const nextAssets = assetBytes.fork();
         if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
+        const result = bus.executeCommand(command, expectedRevision);
+        if (!result.ok) return result;
+        assetBytes = nextAssets;
+        return commit(result);
+      } catch {
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
+      }
+    },
+    async addAsset(command, bytes, expectedRevision, expectedIdentity, signal) {
+      if (signal?.aborted) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Импорт отменён." };
+      if (jobActive()) return busy(command.commandId);
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      const asset = command.payload.asset;
+      if (!bytes.byteLength || bytes.byteLength > ARCHIVE_LIMITS.asset)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Ресурс пуст или превышает лимит 64 МиБ." };
+      try {
+        const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource))].map(n => n.toString(16).padStart(2, "0")).join("");
+        if (hash !== asset.hash) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "SHA-256 ресурса не совпадает с байтами." };
+      } catch { return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось проверить SHA-256 ресурса." }; }
+      if (signal?.aborted) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Импорт отменён." };
+      if (jobActive()) return busy(command.commandId);
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      const duplicate = state.document.project.assets.find(item => item.hash === asset.hash && item.mediaType === asset.mediaType);
+      if (duplicate) {
+        const existing = assetBytes.get(duplicate.id);
+        if (existing && existing.byteLength === bytes.byteLength && existing.every((value, index) => value === bytes[index]))
+          return { ok: true, id: command.commandId, project: structuredClone(state.document.project) as Project, revision: expectedRevision,
+            patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
+      }
+      if (state.document.project.assets.some(item => item.id === asset.id))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "ID ресурса уже занят." };
+      try {
+        const nextAssets = assetBytes.fork();
+        nextAssets.set(asset.id, bytes);
         const result = bus.executeCommand(command, expectedRevision);
         if (!result.ok) return result;
         assetBytes = nextAssets;
@@ -17337,6 +17684,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
     readAssetBytes: (id) => assetBytes.get(id),
     getProjectEpoch: () => projectEpoch,
     captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    captureImportContext: () => ({ revision: state.document.revision, identity }),
     confirmSaved(revision, expectedIdentity) {
       if (jobActive()) return false;
       if (identity !== expectedIdentity || state.document.revision !== revision) return false;
@@ -17568,6 +17916,13 @@ body { margin: 0; }
 .library-sections { display: flex; gap: var(--space-1); margin-bottom: var(--space-4); }
 .library-sections button { flex: 1; min-width: 0; min-height: var(--control-height-md); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); cursor: pointer; }
 .library-sections button[aria-pressed="true"] { border-color: var(--color-primary-accent-strong); background: var(--color-state-info-surface); }
+.resource-library > button { width: 100%; min-height: var(--control-height-md); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-state-info-surface); cursor: pointer; }
+.resource-library > button:disabled { opacity: .6; cursor: not-allowed; }
+.resource-card { display: flex; align-items: center; gap: var(--space-3); margin: var(--space-2) 0; padding: var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); overflow: hidden; }
+.resource-card img, .resource-placeholder { width: 64px; height: 64px; flex: none; object-fit: contain; border-radius: var(--radius-sm); background: var(--color-surface-base); }
+.resource-placeholder { display: grid; place-items: center; padding: 4px; text-align: center; font-size: var(--font-size-sm); }
+.resource-card div:last-child { min-width: 0; }
+.resource-card p { margin: var(--space-1) 0 0; color: var(--color-text-secondary); font-size: var(--font-size-sm); overflow-wrap: anywhere; }
 .material-library { min-width: 0; }
 .material-search, .material-category { display: grid; gap: var(--space-1); margin-bottom: var(--space-2); font-size: var(--font-size-sm); color: var(--color-text-secondary); }
 .material-search input, .material-category select { width: 100%; min-width: 0; min-height: var(--control-height-md); padding: var(--space-1) var(--space-2); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-raised); color: var(--color-text-primary); }
@@ -17665,6 +18020,7 @@ import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, ty
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
   | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
   | { commandId: string; type: "UPDATE_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
   | { commandId: string; type: "REMOVE_MATERIAL"; targetIds: [EntityId]; payload: { materialId: EntityId } }
@@ -17786,6 +18142,15 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_ASSET") {
+    const asset = payload.asset;
+    return ownKeys(payload, ["asset"]) && record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+      && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
+      && /^(image\/(?:png|jpeg|webp|vnd\.radiance|x-exr))$/.test(String(asset.mediaType))
+      && asset.path === `assets/${asset.hash}.${asset.mediaType === "image/jpeg" ? "jpg" : asset.mediaType === "image/vnd.radiance" ? "hdr" : asset.mediaType === "image/x-exr" ? "exr" : String(asset.mediaType).slice(6)}`
+      && asset.colorSpace === (asset.mediaType === "image/vnd.radiance" || asset.mediaType === "image/x-exr" ? "linear" : "srgb")
+      && same(value.targetIds, [asset.id]);
+  }
   if (value.type === "ADD_MATERIAL" || value.type === "UPDATE_MATERIAL") return ownKeys(payload, ["material"])
     && validateMaterial(payload.material).length === 0 && same(value.targetIds, [(payload.material as Material).id]);
   if (value.type === "REMOVE_MATERIAL") return ownKeys(payload, ["materialId"])
@@ -17967,6 +18332,13 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_ASSET") {
+    const asset = command.payload.asset;
+    if (entityIds(project).has(asset.id) || project.assets.some(item => item.path === asset.path))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
+    project.assets.push(structuredClone(asset));
+    return null;
+  }
   if (command.type === "ADD_MATERIAL") {
     if (entityIds(project).has(command.payload.material.id)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID материала уже занят.");
     project.materials.push(structuredClone(command.payload.material)); return null;
@@ -18439,6 +18811,8 @@ import { ObjectTree } from "./ObjectTree";
 import { Inspector } from "./Inspector";
 import { JobOverlay } from "./JobOverlay";
 import { MaterialLibrary } from "./MaterialLibrary";
+import { ResourceLibrary } from "./ResourceLibrary";
+import { prepareImageAsset } from "../assets/prepare-image-asset";
 import { isJobActive } from "../app/job-controller";
 
 const RendererSpike = import.meta.env.DEV
@@ -18478,6 +18852,8 @@ function EditorShell() {
   const state = useEditorStore(editorStore);
   const fileInput = useRef<HTMLInputElement>(null);
   const glbInput = useRef<HTMLInputElement>(null);
+  const resourceInput = useRef<HTMLInputElement>(null);
+  const importAbort = useRef<AbortController | null>(null);
   const workspace = useRef<HTMLDivElement>(null);
   const fileLock = useRef(false);
   const [fileBusy, setFileBusy] = useState(false);
@@ -18485,7 +18861,7 @@ function EditorShell() {
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
   const [dragging, setDragging] = useState(false);
-  const [librarySection, setLibrarySection] = useState<"geometry" | "materials">("geometry");
+  const [librarySection, setLibrarySection] = useState<"geometry" | "materials" | "resources">("geometry");
   const dragCleanup = useRef<(() => void) | null>(null);
   const project = selectProject(state);
   const dirty = selectDirty(state);
@@ -18495,7 +18871,7 @@ function EditorShell() {
   const blocked = fileBusy || !!pendingGlb || jobBlocked;
   const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
-  useEffect(() => () => { dragCleanup.current?.(); }, []);
+  useEffect(() => () => { dragCleanup.current?.(); importAbort.current?.abort(); }, []);
   useEffect(() => {
     if (!dirty) return;
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -18651,6 +19027,23 @@ function EditorShell() {
     } catch { notice("error", "Не удалось проверить GLB."); }
     finally { fileLock.current = false; setFileBusy(false); }
   }
+  async function importResource(file: File) {
+    if (blocked || fileLock.current) return;
+    const captured = editorStore.captureImportContext();
+    const controller = new AbortController();
+    importAbort.current = controller;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка ресурса…");
+    try {
+      const prepared = await prepareImageAsset(file, undefined, controller.signal);
+      if (!prepared.ok) { notice(prepared.error.code === "CANCELLED" ? "info" : "error", prepared.error.message); return; }
+      const result = await editorStore.addAsset({ commandId: crypto.randomUUID(), type: "ADD_ASSET", targetIds: [prepared.value.asset.id], payload: { asset: prepared.value.asset } },
+        prepared.value.bytes, captured.revision, captured.identity, controller.signal);
+      notice(result.ok ? "success" : controller.signal.aborted ? "info" : "error", result.ok ? result.changed ? "Ресурс добавлен. Сохраните проект для записи в .triad3d." : "Ресурс уже есть в проекте." : result.message);
+    } catch { notice("error", "Не удалось импортировать ресурс."); }
+    finally { if (importAbort.current === controller) importAbort.current = null; fileLock.current = false; setFileBusy(false); }
+  }
   function confirmGlb() {
     if (!pendingGlb) return;
     const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
@@ -18685,9 +19078,10 @@ function EditorShell() {
           <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
           <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
+          <input ref={resourceInput} className="file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.hdr,.exr,image/png,image/jpeg,image/webp" aria-label="Выбрать изображение, HDR или EXR" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importResource(file); }} />
         </div>
       </header>
-      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
+      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span>{fileBusy && importAbort.current && <button type="button" onClick={() => importAbort.current?.abort()}>Отменить импорт</button>}<button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
       {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
         <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются.</span>
         <button type="button" onClick={confirmGlb}>Добавить в модель</button>
@@ -18700,7 +19094,7 @@ function EditorShell() {
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
             <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
-          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} />}</div>}
+          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button><button type="button" aria-pressed={librarySection === "resources"} onClick={() => setLibrarySection("resources")}>Ресурсы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : librarySection === "materials" ? <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} /> : <ResourceLibrary store={editorStore} state={state} blocked={blocked} onImport={() => resourceInput.current?.click()} />}</div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
@@ -18926,6 +19320,7 @@ function EditorShell() {
 - **CODEX-030A / TASK-030 (реализовано):** В левом dock добавлены разделы «Геометрия» и «Материалы», поиск и пять категорий. Шесть валидных PBR-пресетов показываются на статически отрендеренной сфере через один временный WebGL renderer с локальным HDRI Poly Haven Studio Small 03 (Greg Zaal, CC0; источник и SHA-256 в `docs/renderer-decision.md`). Общий PBR-адаптер используется SceneSync и превью. При сбое HDRI применяется нейтральное освещение, при недоступном WebGL показывается явное сообщение; назначение остаётся доступным. Один выбранный primitive/editable Mesh получает материал через атомарную транзакцию ADD_MATERIAL + SET_MATERIAL_SLOT и один Undo-шаг; идентичный пресет повторно не создаётся. GLB с внутренними материалами не назначается до TASK-031, чтобы не заменять несколько слотов молча. Текстур и процедурного рельефа у камня пока нет (TASK-032–034); Drag & Drop и Material Inspector остаются TASK-031. Typecheck, lint, 15 целевых тестов и production build: PASS. Ручной browser smoke: UNVERIFIED — встроенный браузер не открыл локальный Vite URL (timeout). Существующее предупреждение о размере Vite chunk сохраняется.
 - **CODEX-031A / TASK-031 / FR-029 (частично):** Карточки пресетов поддерживают нативный Drag & Drop на фактический Mesh под указателем через SurfaceQuery, без смены selection. Общий action назначает материал через одну атомарную транзакцию; кнопка «Назначить», повторное использование материала, Undo/Redo и no-op сохранены. Внутренний MIME принимает только ID из локального реестра и активную RAM drag-сессию с ревизией/эпохой; недопустимые цели и GLB отклоняются с сообщением. Schema/архив не менялись. Typecheck, lint, build и 28 целевых тестов PASS. Браузер открыл WebGPU и WebGL2, но визуальный drag/drop не удалось подтвердить: захват canvas показывал однородный фон и пробный drag не дал наблюдаемого изменения (UNVERIFIED). Material Inspector остаётся отдельной частью TASK-031.
 - **CODEX-031B / TASK-031 (реализовано, ручная приёмка не подтверждена):** Правый Inspector показывает действующий доменный PBR-материал, Basic/Advanced-поля, Linear-sRGB и HEX, точные числовые поля, слайдеры и сброс отдельных свойств по однозначному совпадению имени встроенного пресета. Первое изменение общего материала в безопасном режиме создаёт копию с новым ID и переназначает один Mesh атомарно; явный общий режим обновляет все ссылки и запрещён при недоступном связанном объекте. Записи проверяют эпоху, ревизию, выбор, слот, права и полную валидацию; слайдер объединяет Undo, Esc откатывает жест. Transmission автоматически устанавливает opacity=1 с пояснением. Текстуры сохраняются без редактирования и пока не отображаются renderer. Схема/архив не менялись. Typecheck, lint, build и 65 целевых тестов PASS. Ручной desktop smoke и аппаратное сравнение WebGPU/WebGL2 в этом задании не выполнены; визуальный критерий остаётся UNVERIFIED. Сборка сохраняет существующее предупреждение о крупном chunk.
+- **CODEX-032A / TASK-032 (частично):** Добавлена проверка и регистрация PNG/JPEG/WebP/HDR/EXR с лимитами 64 МиБ файла и 128 МиБ временного бюджета декодирования. Растры декодируются браузером, HDR/EXR — Three.js; исходные байты и SHA-256 сохраняются в RAM и нативном архиве. ADD_ASSET и EditorStore поддерживают дедупликацию, Undo/Redo, отсечение байтов недоступной ветки истории и проверку актуальности проекта. В библиотеке появились ресурсы и растровые превью с освобождением Blob URL. Typecheck, lint, build и 67 целевых тестов PASS; headless Chrome декодировал PNG/JPEG/WebP, полный ручной UI smoke UNVERIFIED. Назначение PBR-карт и HDRI остаётся следующим этапом. SchemaVersion, formatVersion и manifest не менялись.
 </file>
 
 </files>

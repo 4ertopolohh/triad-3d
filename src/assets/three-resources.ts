@@ -13,6 +13,7 @@ export function disposeObject(root: Object3D): void {
     for (const material of [...(Array.isArray(object.material) ? object.material : [object.material]), ...originals].flat()) {
       resources.add(material);
       for (const value of Object.values(material)) if (value instanceof Texture) {
+        if (value.userData.triadSharedTexture) continue;
         resources.add(value);
         if (typeof ImageBitmap !== "undefined" && value.image instanceof ImageBitmap) images.add(value.image);
       }

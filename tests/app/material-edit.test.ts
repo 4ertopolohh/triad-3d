@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createEditorStore } from "../../src/app/editor-store";
-import { captureMaterialEdit, editMaterial } from "../../src/app/material-edit";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture } from "../../src/app/material-edit";
 import { materialPresets } from "../../src/materials/presets";
 import { linearToHex, parseHexColor } from "../../src/materials/color";
 import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
@@ -28,6 +28,34 @@ function setup() {
 }
 
 describe("material editing", () => {
+  it("assigns, replaces and removes a raster map with copy-on-write and native round-trip", async () => {
+    const store = setup();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
+    const context = store.captureImportContext();
+    const asset = { id: "raster", hash, path: `assets/${hash}.png`, mediaType: "image/png", colorSpace: "srgb" as const };
+    expect((await store.addAsset({ commandId: crypto.randomUUID(), type: "ADD_ASSET", targetIds: [asset.id], payload: { asset } }, bytes, context.revision, context.identity)).ok).toBe(true);
+    const edit = captureMaterialEdit(store)!;
+    expect(editBaseColorTexture(store, edit, asset.id)).toMatchObject({ ok: true, changed: true });
+    const project = store.captureDocument().project;
+    const assignedId = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(assignedId).not.toBe("shared-material");
+    expect(project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id);
+    expect(project.materials.find(item => item.id === "shared-material")?.textureSlots).toBeUndefined();
+    const saved = await createNativeProjectArchive(project, store.getAssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (saved.ok) {
+      const opened = await openNativeProjectArchive(saved.value);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) { expect(opened.value.project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id); expect(opened.value.assets.get(asset.id)).toEqual(bytes); }
+    }
+    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, asset.id)).toMatchObject({ ok: true, changed: false });
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, undefined)).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials.find(item => item.id === assignedId)?.textureSlots).toBeUndefined();
+  });
   it("clones on unique edit, preserves other fields and links, and supports undo/redo and serialization", async () => {
     const store = setup();
     const context = captureMaterialEdit(store)!;

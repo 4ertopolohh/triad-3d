@@ -8,6 +8,7 @@ import { editableGeometry } from "../geometry/mesh-edit";
 import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
 import { createPhysicalMaterial } from "./pbr-material";
+import { BaseColorTextures } from "./base-color-textures";
 
 export type RenderProject = DeepReadonly<Project>;
 export type AssetReader = (id: string) => Uint8Array | undefined;
@@ -33,7 +34,7 @@ const editorMaterials = new WeakSet<T.Material>();
 function ownedMaterial(value?: DeepReadonly<Material>): T.MeshPhysicalMaterial {
   const created = createPhysicalMaterial(value); editorMaterials.add(created); return created;
 }
-function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[]): void {
+function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Material> | undefined)[], make: (value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry) => T.MeshPhysicalMaterial, release: (material: T.Material) => void): void {
   const oldMaterials = new Set<T.Material>();
   content.traverse(object => { if (!(object instanceof T.Mesh)) return;
     for (const old of Array.isArray(object.material) ? object.material : [object.material]) {
@@ -41,9 +42,9 @@ function replaceMaterials(content: T.Object3D, values: readonly (DeepReadonly<Ma
       else if (!object.userData.originalMaterials) object.userData.originalMaterials = Array.isArray(object.material) ? [...object.material] : [object.material];
     }
     object.material = values.length > 1 && object.geometry.groups.length > 0
-      ? values.map(value => ownedMaterial(value)) : ownedMaterial(values[0]);
+      ? values.map(value => make(value, object.geometry)) : make(values[0], object.geometry);
   });
-  for (const old of oldMaterials) old.dispose();
+  for (const old of oldMaterials) { release(old); old.dispose(); }
 }
 
 export class SceneSync {
@@ -63,11 +64,26 @@ export class SceneSync {
   private derived = new Set<string>();
   private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
   private closed = false;
+  private textures = new BaseColorTextures(() => this.emit());
+  private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
+  private readAsset: AssetReader = () => undefined;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string): T.MeshPhysicalMaterial {
+    const material = ownedMaterial(value);
+    const id = value?.textureSlots?.baseColor;
+    if (!id) return material;
+    if (!geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
+    const asset = this.assets.get(id);
+    if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) { this.diagnostics.push(`${name}: ресурс основного цвета недоступен или имеет неподдерживаемый формат.`); return material; }
+    this.textures.bind(material, asset, this.readAsset);
+    return material;
+  }
+  private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); disposeObject(content); }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
     if (this.closed) return;
     if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
     this.diagnostics = [];
+    this.assets = new Map(project.assets.map(asset => [asset.id, asset])); this.readAsset = readAsset;
     const camera = project.scene.camera;
     if (![...camera.position, ...camera.target, camera.near, camera.far, camera.fovDegrees].every(Number.isFinite)
       || camera.near <= 0 || camera.far <= camera.near || camera.fovDegrees <= 0 || camera.fovDegrees >= 180) throw new Error("Некорректная камера сцены.");
@@ -102,29 +118,31 @@ export class SceneSync {
       entry.object.name = node.name; applyTransform(entry.object, node.transform); entry.object.visible = node.visible;
       const materials = node.materialSlots.map(slot => project.materials.find(m => m.id === slot.materialId));
       this.nodeMaterials.set(node.id, materials[0]);
-      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: текстуры доменного материала пока не отображаются.`);
+      if (materials.some(m => m?.textureAssetIds.length)) this.diagnostics.push(`${node.name}: у legacy-ссылок на текстуры канал не определён.`);
       const source = node.kind === "mesh" ? node.meshSource : null;
       const asset = source?.kind === "asset" ? project.assets.find(a => a.id === source.assetId) : undefined;
       const key = JSON.stringify([source, asset, materials]);
       if (key === entry.key) continue;
       const sourceKey = JSON.stringify([source, asset]);
       if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
-        replaceMaterials(entry.content, materials);
+        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
         entry.key = key;
         continue;
       }
-      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); delete entry.content; }
       // Replacement token prevents late assets from attaching after delete, undo, or another source.
       const next: Entry = { object: entry.object, key, sourceKey, loading: false }; this.objects.set(node.id, next);
       if (!source) continue;
       const assign = (content: T.Object3D) => {
-        if (this.closed || this.objects.get(node.id) !== next) { disposeObject(content); return; }
+        if (this.closed || this.objects.get(node.id) !== next) { this.disposeContent(content); return; }
         next.content = content; next.loading = false; next.object.add(content);
         this.surfaces.register(node.id, next.object, content); this.emit();
       };
       try {
-        if (source.kind === "primitive") assign(new T.Mesh(primitiveGeometry(source), ownedMaterial(materials[0])));
-        else if (source.kind === "editable") assign(new T.Mesh(editableGeometry(source), ownedMaterial(materials[0])));
+        if (source.kind === "primitive" || source.kind === "editable") {
+          const geometry = source.kind === "primitive" ? primitiveGeometry(source) : editableGeometry(source);
+          assign(new T.Mesh(geometry, this.makeMaterial(materials[0], geometry, node.name)));
+        }
         else {
           if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
           const bytes = readAsset(source.assetId);
@@ -132,7 +150,7 @@ export class SceneSync {
           next.loading = true;
           void this.decoder(bytes).then(content => {
             // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials);
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
             assign(content);
           }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
         }
@@ -170,14 +188,15 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
-        content = new T.Mesh(geometry, ownedMaterial(this.nodeMaterials.get(nodeId)));
+        content = new T.Mesh(geometry, this.makeMaterial(this.nodeMaterials.get(nodeId), geometry, nodeId));
       }
-      if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); delete entry.content; }
+      if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); delete entry.content; }
       if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
       else geometry.dispose();
       this.derived.add(nodeId);
-      this.setModifierDiagnostics(nodeId, diagnostics);
-    } catch (error) { if (content) disposeObject(content); else geometry.dispose(); throw error; }
+      this.setModifierDiagnostics(nodeId, this.nodeMaterials.get(nodeId)?.textureSlots?.baseColor && !geometry.getAttribute("uv")
+        ? [...diagnostics, "у результата модификатора нет UV; текстура основного цвета не отображается."] : diagnostics);
+    } catch (error) { if (content) this.disposeContent(content); else geometry.dispose(); throw error; }
   }
   setModifierDiagnostics(nodeId: string, diagnostics: string[]): void {
     if (this.closed || !this.objects.has(nodeId)) return;
@@ -191,10 +210,10 @@ export class SceneSync {
     this.derived.clear(); this.modifierDiagnostics.clear();
     this.sync(project, readAsset, epoch);
   }
-  private emit(): void { this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
+  private emit(): void { if (this.closed) return; this.report({ loading: [...this.objects.values()].filter(e => e.loading).length,
     errors: [...this.objects.values()].filter(e => e.error).length,
-    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
-  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); disposeObject(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
+    empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...this.textures.diagnostics(), ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
+  private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
   private clear(): void { for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
-  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
+  dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.textures.dispose(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
 }

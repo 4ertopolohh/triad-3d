@@ -242,6 +242,12 @@ export function validateProject(project: Project): ValidationIssue[] {
   for (const material of project.materials) {
     issues.push(...validateMaterial(material, `materials.${material.id}`));
     if (Array.isArray(material.textureAssetIds)) material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
+    const baseColorId = material.textureSlots?.baseColor;
+    if (baseColorId) {
+      reference(baseColorId, assetIds, `materials.${material.id}.textureSlots.baseColor`);
+      const asset = project.assets.find(item => item.id === baseColorId);
+      if (asset && !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) issues.push({ code: "INVALID_STRUCTURE", path: `materials.${material.id}.textureSlots.baseColor`, message: "Основной цвет поддерживает только PNG, JPEG и WebP." });
+    }
   }
   for (const clip of project.animations) {
     finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);

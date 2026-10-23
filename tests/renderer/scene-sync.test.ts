@@ -5,6 +5,60 @@ import { createNestedMeshProject, createMaterialAnimationProject, emptyProject }
 
 const noAssets = () => undefined;
 describe("domain scene synchronization", () => {
+  it("shares a decoded baseColor map until its last mesh is removed", async () => {
+    const project = createMaterialAnimationProject();
+    const original = project.nodes.find(node => node.id === "mesh-node")!;
+    const second = structuredClone(original);
+    second.id = "second-mesh"; second.parentId = "nested-group";
+    project.nodes.push(second); project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" };
+    const close = vi.fn();
+    const decode = vi.fn().mockResolvedValue({ width: 2, height: 2, close } as unknown as ImageBitmap);
+    vi.stubGlobal("createImageBitmap", decode);
+    try {
+      const sync = new SceneSync(() => {});
+      sync.sync(project, () => new Uint8Array([1]));
+      await Promise.resolve(); await Promise.resolve();
+      expect(decode).toHaveBeenCalledOnce();
+      const firstMap = ((sync.objects.get("mesh-node")!.content as T.Mesh).material as T.MeshPhysicalMaterial).map;
+      const secondMap = ((sync.objects.get("second-mesh")!.content as T.Mesh).material as T.MeshPhysicalMaterial).map;
+      expect(firstMap).toBeInstanceOf(T.Texture);
+      expect(secondMap).toBe(firstMap);
+      const dispose = vi.spyOn(firstMap!, "dispose");
+      project.nodes = project.nodes.filter(node => node.id !== "mesh-node");
+      project.nodes.find(node => node.id === "nested-group")!.children = ["second-mesh"];
+      sync.sync(project, () => new Uint8Array([1]));
+      expect(dispose).not.toHaveBeenCalled();
+      sync.dispose();
+      expect(dispose).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("keeps a missing-UV assignment in the document and closes a late bitmap", async () => {
+    const project = createMaterialAnimationProject();
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" };
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    if (mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] };
+    const statuses: string[][] = [];
+    const sync = new SceneSync(status => statuses.push(status.diagnostics));
+    const decode = vi.fn(); vi.stubGlobal("createImageBitmap", decode);
+    try {
+      sync.sync(project, () => new Uint8Array([1]));
+      expect(statuses.at(-1)?.some(message => message.includes("нет UV"))).toBe(true);
+      expect(decode).not.toHaveBeenCalled();
+      expect(project.materials[0]!.textureSlots?.baseColor).toBe("image");
+      mesh.meshSource = { kind: "primitive", primitive: "cube", parameters: { size: 1 } };
+      let resolve!: (bitmap: ImageBitmap) => void;
+      decode.mockImplementation(() => new Promise<ImageBitmap>(r => { resolve = r; }));
+      sync.sync(project, () => new Uint8Array([1]));
+      sync.dispose();
+      const close = vi.fn(); resolve({ width: 2, height: 2, close } as unknown as ImageBitmap);
+      await Promise.resolve(); await Promise.resolve();
+      expect(close).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("updates a shared PBR material without replacing geometry or mesh", () => {
     const project = createMaterialAnimationProject();
     const sync = new SceneSync(() => {});

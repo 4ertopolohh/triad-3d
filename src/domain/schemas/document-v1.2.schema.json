@@ -1,0 +1,790 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triad-3d.local/schemas/document-v1.2.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "model",
+    "scene",
+    "nodes",
+    "modifiers",
+    "materials",
+    "assets",
+    "animations",
+    "tracks",
+    "keyframes"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.2.0"
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "name": {
+      "type": "string"
+    },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
+    "scene": {
+      "$ref": "#/$defs/scene"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "modifiers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/modifier"
+      }
+    },
+    "materials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/material"
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/asset"
+      }
+    },
+    "animations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/animation"
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/track"
+      }
+    },
+    "keyframes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/keyframe"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "number": {
+      "type": "number"
+    },
+    "vec3": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        }
+      ],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "transform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position",
+        "rotationQuat",
+        "scale"
+      ],
+      "properties": {
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "rotationQuat": {
+          "$ref": "#/$defs/quat"
+        },
+        "scale": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rootNodeId",
+        "revision"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "rootNodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projection",
+        "position",
+        "target",
+        "fovDegrees",
+        "near",
+        "far"
+      ],
+      "properties": {
+        "projection": {
+          "const": "perspective"
+        },
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "target": {
+          "$ref": "#/$defs/vec3"
+        },
+        "fovDegrees": {
+          "$ref": "#/$defs/number"
+        },
+        "near": {
+          "$ref": "#/$defs/number"
+        },
+        "far": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "background": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "color",
+        "intensity"
+      ],
+      "properties": {
+        "color": {
+          "$ref": "#/$defs/vec3"
+        },
+        "environmentAssetId": {
+          "$ref": "#/$defs/id"
+        },
+        "intensity": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "light": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "color",
+        "intensity",
+        "position",
+        "target"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "ambient",
+            "directional",
+            "point",
+            "spot"
+          ]
+        },
+        "color": {
+          "$ref": "#/$defs/vec3"
+        },
+        "intensity": {
+          "$ref": "#/$defs/number"
+        },
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "target": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "modelId",
+        "transform",
+        "visible"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "modelId": {
+          "$ref": "#/$defs/id"
+        },
+        "transform": {
+          "$ref": "#/$defs/transform"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "camera",
+        "background",
+        "lights",
+        "instances"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "camera": {
+          "$ref": "#/$defs/camera"
+        },
+        "background": {
+          "$ref": "#/$defs/background"
+        },
+        "lights": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/light"
+          }
+        },
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/instance"
+          }
+        }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "materialId"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "materialId": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "nodeBase": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "parentId",
+        "children",
+        "transform",
+        "visible",
+        "locked",
+        "materialSlots",
+        "modifierIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "group",
+            "mesh"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parentId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "transform": {
+          "$ref": "#/$defs/transform"
+        },
+        "visible": {
+          "type": "boolean"
+        },
+        "locked": {
+          "type": "boolean"
+        },
+        "materialSlots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/slot"
+          }
+        },
+        "modifierIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "meshSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "primitive",
+            "parameters"
+          ],
+          "properties": {
+            "kind": {
+              "const": "primitive"
+            },
+            "primitive": {
+              "enum": [
+                "cube",
+                "sphere",
+                "torus",
+                "cylinder",
+                "cone",
+                "plane"
+              ]
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/number"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "assetId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "asset"
+            },
+            "assetId": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        },
+        {
+          "required": [
+            "kind",
+            "positions",
+            "indices"
+          ],
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "editable"
+            },
+            "indices": {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "uv": {
+              "items": {
+                "$ref": "#/$defs/number"
+              },
+              "type": "array"
+            },
+            "positions": {
+              "items": {
+                "$ref": "#/$defs/number"
+              },
+              "type": "array"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "node": {
+      "oneOf": [
+        {
+          "type": "object",
+          "allOf": [
+            {
+              "$ref": "#/$defs/nodeBase"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "group"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "allOf": [
+            {
+              "$ref": "#/$defs/nodeBase"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "mesh"
+                },
+                "meshSource": {
+                  "$ref": "#/$defs/meshSource"
+                }
+              },
+              "required": [
+                "kind",
+                "meshSource"
+              ]
+            }
+          ],
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+    "modifierParameter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/number"
+          }
+        }
+      ]
+    },
+    "modifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "nodeId",
+        "kind",
+        "order",
+        "enabled",
+        "version",
+        "parameters"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "nodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "boolean",
+            "mirror",
+            "array",
+            "bend",
+            "twist",
+            "taper",
+            "bevel"
+          ]
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/modifierParameter"
+          }
+        }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "baseColor",
+        "metalness",
+        "roughness",
+        "emissive",
+        "opacity",
+        "transmission",
+        "ior",
+        "clearcoat",
+        "envIntensity",
+        "textureAssetIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "baseColor": {
+          "$ref": "#/$defs/vec3"
+        },
+        "metalness": {
+          "$ref": "#/$defs/number"
+        },
+        "roughness": {
+          "$ref": "#/$defs/number"
+        },
+        "emissive": {
+          "$ref": "#/$defs/vec3"
+        },
+        "opacity": {
+          "$ref": "#/$defs/number"
+        },
+        "transmission": {
+          "$ref": "#/$defs/number"
+        },
+        "ior": {
+          "$ref": "#/$defs/number"
+        },
+        "clearcoat": {
+          "$ref": "#/$defs/number"
+        },
+        "envIntensity": {
+          "$ref": "#/$defs/number"
+        },
+        "textureAssetIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "textureSlots": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseColor": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "hash",
+        "mediaType",
+        "path",
+        "colorSpace"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "hash": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "colorSpace": {
+          "enum": [
+            "srgb",
+            "linear",
+            "none"
+          ]
+        }
+      }
+    },
+    "animation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "durationSeconds",
+        "loop",
+        "trackIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "durationSeconds": {
+          "$ref": "#/$defs/number"
+        },
+        "loop": {
+          "type": "boolean"
+        },
+        "trackIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "track": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "nodeId",
+        "property",
+        "keyframeIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "nodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "property": {
+          "enum": [
+            "transform.position",
+            "transform.rotationQuat",
+            "transform.scale"
+          ]
+        },
+        "keyframeIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "keyframe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "timeSeconds",
+        "value",
+        "interpolation"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "timeSeconds": {
+          "$ref": "#/$defs/number"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/number"
+            },
+            {
+              "$ref": "#/$defs/vec3"
+            },
+            {
+              "$ref": "#/$defs/quat"
+            }
+          ]
+        },
+        "interpolation": {
+          "enum": [
+            "step",
+            "linear",
+            "bezier"
+          ]
+        }
+      }
+    }
+  }
+}

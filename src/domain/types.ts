@@ -122,7 +122,10 @@ export interface Material {
   clearcoat: number;
   envIntensity: number;
   textureAssetIds: EntityId[];
+  textureSlots?: MaterialTextureSlots;
 }
+
+export interface MaterialTextureSlots { baseColor?: EntityId }
 
 export interface Asset {
   id: EntityId;

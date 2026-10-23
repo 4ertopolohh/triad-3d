@@ -43,6 +43,12 @@ describe("TASK-004 TSX export spike", () => {
     expect(generateSpikeTsx(project)).toEqual(generateSpikeTsx(project));
     expect(project).toEqual(original);
   });
+  it("reports an omitted baseColor texture in the spike export", () => {
+    const project = createMaterialAnimationProject();
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" };
+    expect(generateSpikeTsx(project).diagnostics).toContainEqual(expect.objectContaining({ code: "TEXTURES_OMITTED", path: "materials.material-1.textureSlots.baseColor" }));
+  });
 
   it("rejects invalid numbers and hierarchy without mutation", () => {
     for (const project of [createInvalidNumberProject(), createInvalidHierarchyProject()]) {

@@ -1,7 +1,7 @@
 import type { Material } from "./types";
 import type { ValidationIssue } from "./validate-project";
 
-/** Color components are stored in Linear-sRGB. Texture roles are intentionally unspecified. */
+/** Color components are stored in Linear-sRGB. Legacy textureAssetIds have no channel semantics. */
 export function validateMaterial(value: unknown, path = "material"): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const add = (field: string, message: string): void => { issues.push({ code: "INVALID_STRUCTURE", path: `${path}.${field}`, message }); };
@@ -10,7 +10,7 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
   }
   const material = value as Record<string, unknown>;
   const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
-  if (Object.keys(material).length !== keys.length || Object.keys(material).some(key => !keys.includes(key))) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots")) add("", "Структура материала содержит отсутствующие или лишние поля.");
   for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
   for (const field of ["baseColor", "emissive"] as const) {
     const color = material[field];
@@ -30,6 +30,11 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
   if (!Array.isArray(material.textureAssetIds) || material.textureAssetIds.some(id => typeof id !== "string" || !id.trim())
     || new Set(material.textureAssetIds).size !== material.textureAssetIds.length)
     add("textureAssetIds", "Ссылки на текстуры должны быть непустыми и уникальными ID.");
+  if (material.textureSlots !== undefined) {
+    const slots = material.textureSlots;
+    if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => key !== "baseColor")) add("textureSlots", "Неизвестный канал текстуры.");
+    else if ("baseColor" in slots && (typeof (slots as Record<string, unknown>).baseColor !== "string" || !(slots as { baseColor: string }).baseColor.trim())) add("textureSlots.baseColor", "ID текстуры должен быть непустой строкой.");
+  }
   return issues;
 }
 

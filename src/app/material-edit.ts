@@ -4,7 +4,7 @@ import type { ProjectCommand } from "../domain/command-bus";
 import { validateMaterial } from "../domain/validate-material";
 import { materialNodeReason } from "./material-actions";
 
-export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds">;
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots">;
 export type MaterialEditMode = "unique" | "shared";
 export interface MaterialEditContext {
   epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
@@ -25,6 +25,14 @@ export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode =
 }
 
 export function editMaterial(store: EditorStore, context: MaterialEditContext, field: MaterialField, value: number | readonly number[], groupId?: string): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "field", field, value }, groupId);
+}
+
+export function editBaseColorTexture(store: EditorStore, context: MaterialEditContext, assetId?: string): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "texture", assetId });
+}
+
+function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined }, groupId?: string): MaterialEditResult {
   const state = store.getSnapshot();
   if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
     || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
@@ -43,15 +51,29 @@ export function editMaterial(store: EditorStore, context: MaterialEditContext, f
     if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
   }
   const next = structuredClone(source) as Material;
-  if (field === "baseColor" || field === "emissive") {
+  if (change.kind === "texture") {
+    const assetId = change.assetId;
+    if (assetId !== undefined) {
+      if (!assetId.trim()) return { ok: false, message: "ID ресурса должен быть непустым." };
+      const asset = project.assets.find(item => item.id === assetId);
+      if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) return { ok: false, message: "Для основного цвета нужен импортированный PNG, JPEG или WebP." };
+      if (!store.readAssetBytes(assetId)) return { ok: false, message: "Байты изображения отсутствуют в памяти." };
+      next.textureSlots = { ...next.textureSlots, baseColor: assetId };
+    } else if (next.textureSlots) {
+      delete next.textureSlots.baseColor;
+      if (!Object.keys(next.textureSlots).length) delete next.textureSlots;
+    }
+  } else if (change.field === "baseColor" || change.field === "emissive") {
+    const { field, value } = change;
     if (!Array.isArray(value) || value.length !== 3) return { ok: false, message: "Укажите три компонента цвета." };
     next[field] = [value[0]!, value[1]!, value[2]!];
   } else {
+    const { field, value } = change;
     if (typeof value !== "number") return { ok: false, message: "Укажите число." };
     next[field] = value;
   }
-  if (field === "transmission" && typeof value === "number" && value > 0) next.opacity = 1;
-  if (field === "opacity" && typeof value === "number" && value < 1 && next.transmission > 0)
+  if (change.kind === "field" && change.field === "transmission" && typeof change.value === "number" && change.value > 0) next.opacity = 1;
+  if (change.kind === "field" && change.field === "opacity" && typeof change.value === "number" && change.value < 1 && next.transmission > 0)
     return { ok: false, message: "При transmission больше 0 непрозрачность должна быть 1." };
   const issues = validateMaterial(next);
   if (issues.length) return { ok: false, message: issues[0]!.message };

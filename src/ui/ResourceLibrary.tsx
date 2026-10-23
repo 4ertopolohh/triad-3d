@@ -31,7 +31,7 @@ export function ResourceLibrary({ store, state, blocked, onImport }: { store: Ed
   }, [store, signature, state.document.project]);
   return <div className="resource-library">
     <button type="button" disabled={blocked} onClick={onImport}>Импортировать ресурс</button>
-    <p className="panel-hint">Назначение текстуры на PBR-каналы будет добавлено отдельно.</p>
+    <p className="panel-hint">PNG, JPEG и WebP можно назначить в инспекторе материала как текстуру основного цвета.</p>
     {!entries.length && <p className="panel-hint">Ресурсов пока нет.</p>}
     {entries.map(entry => <div className="resource-card" key={entry.id}>
       {entry.url ? <img src={entry.url} alt={`Превью ресурса ${entry.format}`} /> : <div className="resource-placeholder">{entry.format === "HDR" || entry.format === "EXR" ? "HDR-превью недоступно" : "Превью недоступно"}</div>}
