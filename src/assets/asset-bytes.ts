@@ -18,4 +18,10 @@ export class AssetBytes {
   delete(id: string): void { this.values.delete(id); }
   clear(): void { this.values.clear(); }
   clone(): AssetBytes { return new AssetBytes(this.values); }
+  /** Shares immutable internal byte arrays; get/set still copy at the public boundary. */
+  fork(): AssetBytes {
+    const next = new AssetBytes();
+    for (const [id, bytes] of this.values) next.values.set(id, bytes);
+    return next;
+  }
 }

@@ -81,6 +81,7 @@ src/
     job-controller.ts
     material-actions.ts
     material-drag.ts
+    material-edit.ts
     mirror-actions.ts
     use-editor-store.ts
   assets/
@@ -127,6 +128,7 @@ src/
     gltf/
       import-glb.ts
   materials/
+    color.ts
     presets.ts
   renderer/
     adapter.ts
@@ -163,6 +165,7 @@ src/
     inspector-logic.ts
     Inspector.tsx
     JobOverlay.tsx
+    MaterialInspector.tsx
     MaterialLibrary.tsx
     MirrorEditor.tsx
     ObjectTree.tsx
@@ -176,6 +179,7 @@ tests/
     editor-store.test.ts
     job-controller.test.ts
     material-actions.test.ts
+    material-edit.test.ts
     mirror-actions.test.ts
   assets/
     native-project-archive.test.ts
@@ -225,6 +229,7 @@ tests/
   ui/
     bevel-editor.test.tsx
     inspector.test.ts
+    material-inspector.test.tsx
   visual/
     design-tokens.html
 .gitignore
@@ -3587,6 +3592,79 @@ export function resolveMaterialDrop(store: EditorStore, types: readonly string[]
 }
 </file>
 
+<file path="src/app/material-edit.ts">
+import type { EditorStore } from "./editor-store";
+import type { Material } from "../domain/types";
+import type { ProjectCommand } from "../domain/command-bus";
+import { validateMaterial } from "../domain/validate-material";
+import { materialNodeReason } from "./material-actions";
+
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds">;
+export type MaterialEditMode = "unique" | "shared";
+export interface MaterialEditContext {
+  epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
+}
+export type MaterialEditResult = { ok: true; revision: number; changed: boolean } | { ok: false; message: string };
+
+export function materialUsage(store: EditorStore, materialId: string) {
+  return store.getSnapshot().document.project.nodes.flatMap(node => node.materialSlots.filter(slot => slot.materialId === materialId).map(slot => ({ nodeId: node.id, slotName: slot.name })));
+}
+
+export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode = "unique"): MaterialEditContext | null {
+  const state = store.getSnapshot();
+  const nodeId = state.selection.activeId;
+  if (!nodeId || state.selection.ids.length !== 1) return null;
+  const node = state.document.project.nodes.find(item => item.id === nodeId);
+  if (node?.kind !== "mesh" || node.materialSlots.length !== 1) return null;
+  return { epoch: store.getProjectEpoch(), revision: state.document.revision, nodeId, materialId: node.materialSlots[0]!.materialId, slotName: node.materialSlots[0]!.name, mode };
+}
+
+export function editMaterial(store: EditorStore, context: MaterialEditContext, field: MaterialField, value: number | readonly number[], groupId?: string): MaterialEditResult {
+  const state = store.getSnapshot();
+  if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
+    || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
+    return { ok: false, message: "Проект или выбор изменился. Повторите действие." };
+  const reason = materialNodeReason(store, context.nodeId);
+  if (reason) return { ok: false, message: reason };
+  const project = state.document.project;
+  const node = project.nodes.find(item => item.id === context.nodeId);
+  if (node?.kind !== "mesh" || node.materialSlots.length !== 1 || node.materialSlots[0]?.name !== context.slotName || node.materialSlots[0]?.materialId !== context.materialId)
+    return { ok: false, message: "Назначение материала изменилось. Повторите действие." };
+  const source = project.materials.find(item => item.id === context.materialId);
+  if (!source) return { ok: false, message: "Материал больше не существует." };
+  const users = materialUsage(store, source.id);
+  if (context.mode === "shared") for (const user of users) {
+    const access = materialNodeReason(store, user.nodeId);
+    if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
+  }
+  const next = structuredClone(source) as Material;
+  if (field === "baseColor" || field === "emissive") {
+    if (!Array.isArray(value) || value.length !== 3) return { ok: false, message: "Укажите три компонента цвета." };
+    next[field] = [value[0]!, value[1]!, value[2]!];
+  } else {
+    if (typeof value !== "number") return { ok: false, message: "Укажите число." };
+    next[field] = value;
+  }
+  if (field === "transmission" && typeof value === "number" && value > 0) next.opacity = 1;
+  if (field === "opacity" && typeof value === "number" && value < 1 && next.transmission > 0)
+    return { ok: false, message: "При transmission больше 0 непрозрачность должна быть 1." };
+  const issues = validateMaterial(next);
+  if (issues.length) return { ok: false, message: issues[0]!.message };
+  if (JSON.stringify(next) === JSON.stringify(source)) return { ok: true, revision: context.revision, changed: false };
+  const commands: ProjectCommand[] = [];
+  if (users.length > 1 && context.mode === "unique") {
+    let id = crypto.randomUUID();
+    const used = new Set([...project.nodes, ...project.materials, ...project.assets, ...project.modifiers].map(item => item.id));
+    while (used.has(id)) id = crypto.randomUUID();
+    next.id = id;
+    commands.push({ commandId: crypto.randomUUID(), type: "ADD_MATERIAL", targetIds: [id], payload: { material: next } });
+    commands.push({ commandId: crypto.randomUUID(), type: "SET_MATERIAL_SLOT", targetIds: [node.id, id], payload: { nodeId: node.id, slotName: context.slotName, materialId: id } });
+  } else commands.push({ commandId: crypto.randomUUID(), type: "UPDATE_MATERIAL", targetIds: [source.id], payload: { material: next } });
+  const result = store.executeTransaction(commands, context.revision, crypto.randomUUID(), groupId);
+  return result.ok ? { ok: true, revision: result.revision, changed: result.changed } : { ok: false, message: result.message };
+}
+</file>
+
 <file path="src/app/mirror-actions.ts">
 import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
 import type { Project } from "../domain/types";
@@ -5933,6 +6011,23 @@ export function normalizeVertexIndices(source: { readonly positions: readonly nu
 }
 </file>
 
+<file path="src/materials/color.ts">
+import { hexToLinear } from "./presets";
+
+function linearChannelToSrgb(value: number): number {
+  return value <= 0.0031308 ? value * 12.92 : 1.055 * value ** (1 / 2.4) - 0.055;
+}
+
+export function linearToHex(color: readonly number[]): string | null {
+  if (color.length !== 3 || color.some(value => !Number.isFinite(value) || value < 0 || value > 1)) return null;
+  return `#${color.map(value => Math.round(linearChannelToSrgb(value) * 255).toString(16).padStart(2, "0")).join("")}`;
+}
+
+export function parseHexColor(raw: string): readonly [number, number, number] | null {
+  return /^#[0-9a-fA-F]{6}$/.test(raw) ? hexToLinear(raw) : null;
+}
+</file>
+
 <file path="src/materials/presets.ts">
 import type { Material } from "../domain/types";
 import type { DeepReadonly } from "../app/editor-store";
@@ -6992,6 +7087,141 @@ export function JobOverlay({ job, cancel }: { job: JobState; cancel: () => void 
 }
 </file>
 
+<file path="src/ui/MaterialInspector.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { EditorState, EditorStore } from "../app/editor-store";
+import { captureMaterialEdit, editMaterial, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import { materialNodeReason } from "../app/material-actions";
+import { isJobActive } from "../app/job-controller";
+import { materialPresets } from "../materials/presets";
+import { linearToHex, parseHexColor } from "../materials/color";
+
+const format = (value: number) => String(Number(value.toPrecision(12)));
+const scalarFields = [
+  { key: "metalness", label: "Металличность", min: 0, max: 1, step: .001 },
+  { key: "roughness", label: "Шероховатость", min: 0, max: 1, step: .001 },
+  { key: "opacity", label: "Непрозрачность", min: 0, max: 1, step: .001 },
+  { key: "transmission", label: "Пропускание света", min: 0, max: 1, step: .001 },
+  { key: "ior", label: "Преломление (IOR)", min: 1, max: 2.333, step: .001 },
+  { key: "clearcoat", label: "Лаковое покрытие", min: 0, max: 1, step: .001 },
+  { key: "envIntensity", label: "Интенсивность окружения", min: 0, max: 5, step: .01 },
+] as const;
+
+export function MaterialInspector({ store, state }: { store: EditorStore; state: EditorState }) {
+  const [mode, setMode] = useState<MaterialEditMode>("unique");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const session = useRef<{ context: MaterialEditContext; groupId: string; changed: boolean; field: string } | null>(null);
+  const skipBlur = useRef(false);
+  const epoch = store.getProjectEpoch();
+  const selection = state.selection.ids.join("\0");
+  useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
+
+  const node = state.selection.ids.length === 1 ? state.document.project.nodes.find(item => item.id === state.selection.activeId) : null;
+  const slot = node?.kind === "mesh" && node.materialSlots.length === 1 ? node.materialSlots[0] : null;
+  const material = state.document.project.materials.find(item => item.id === slot?.materialId);
+  const users = material ? materialUsage(store, material.id) : [];
+  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId)).find(Boolean) : null;
+  const reason = !node ? state.selection.ids.length > 1 ? "Несколько объектов: массовое редактирование материалов пока недоступно." : "Выберите Mesh с материалом."
+    : node.kind !== "mesh" ? "У группы нет редактируемого материала."
+    : node.meshSource.kind === "asset" ? "Внутренние материалы GLB доступны только для просмотра до поддержки отдельных слотов."
+    : !slot ? "Назначьте материал из библиотеки слева."
+    : !material ? "Назначенный материал не найден."
+    : isJobActive(state.job.status) ? "Дождитесь завершения операции."
+    : state.tool.mode !== "model" ? "В режиме «Сцена» свойства модели доступны только для просмотра."
+    : materialNodeReason(store, node.id) || sharedBlock || "";
+  const preset = materialPresets.find(item => item.name === material?.name);
+  const canEdit = !!material && !reason;
+
+  function start(field: string) {
+    const context = captureMaterialEdit(store, mode);
+    session.current = context ? { context, groupId: crypto.randomUUID(), changed: false, field } : null;
+    setError("");
+  }
+  function apply(field: MaterialField, value: number | readonly number[], grouped = false) {
+    if (!canEdit) return;
+    if (!session.current || session.current.field !== field) start(field);
+    const active = session.current;
+    if (!active) return;
+    const result = editMaterial(store, active.context, field, value, grouped ? active.groupId : undefined);
+    if (!result.ok) { setError(result.message); return; }
+    if (result.changed) {
+      active.changed = true;
+      active.context.revision = result.revision;
+      const updated = store.getSnapshot().document.project.nodes.find(item => item.id === active.context.nodeId);
+      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots[0]?.materialId ?? active.context.materialId;
+    }
+    setError("");
+    if (!grouped) session.current = null;
+  }
+  function finish() { session.current = null; setEditing(null); }
+  function escapeInput(target: HTMLInputElement) { skipBlur.current = true; finish(); target.blur(); }
+  function shouldSkipBlur() { if (!skipBlur.current) return false; skipBlur.current = false; return true; }
+  function cancel() {
+    const active = session.current;
+    if (active?.changed) {
+      const current = store.getSnapshot();
+      const result = store.cancelGesture(active.groupId, current.document.revision);
+      if (!result.ok) setError(result.message);
+    }
+    finish();
+  }
+  function commitNumber(field: MaterialField) {
+    const raw = draft.trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value)) { setError("Введите конечное число."); finish(); return; }
+    apply(field, value);
+    finish();
+  }
+  function reset(field: MaterialField) {
+    if (!preset) return;
+    start(field);
+    apply(field, preset.material[field]);
+  }
+  function colorRow(field: "baseColor" | "emissive", label: string) {
+    if (!material) return null;
+    const color = material[field];
+    const hex = linearToHex(color);
+    const colorKey = `${field}-hex`;
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-color-line"><input type="color" aria-label={`${label}: палитра sRGB`} value={hex ?? "#ffffff"} disabled={!canEdit} onChange={event => { const parsed = parseHexColor(event.target.value); if (parsed) apply(field, parsed); }} />
+        <label>HEX sRGB<input type="text" aria-label={`${label}: HEX sRGB`} value={editing === colorKey ? draft : hex ?? ""} placeholder={hex ? undefined : "HDR"} disabled={!canEdit} onFocus={() => { start(field); setEditing(colorKey); setDraft(hex ?? ""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== colorKey) return; const parsed = parseHexColor(draft); if (parsed) apply(field, parsed); else if (draft !== (hex ?? "")) setError("HEX должен содержать # и шесть цифр."); finish(); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+      {!hex && <p className="panel-hint">Цвет содержит HDR-компоненты. Палитра sRGB не показывает их точно; используйте числовые поля.</p>}
+      <div className="inspector-vector">{(["R", "G", "B"] as const).map((channel, index) => {
+        const key = `${field}-${index}`;
+        return <label key={key}>{channel} · linear<input type="text" inputMode="decimal" aria-label={`${label} ${channel} Linear-sRGB`} value={editing === key ? draft : format(color[index]!)} disabled={!canEdit} onFocus={() => { start(field); setEditing(key); setDraft(format(color[index]!)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === key) { const raw = draft.trim(); const value = Number(raw); if (raw && Number.isFinite(value)) apply(field, color.map((entry, i) => i === index ? value : entry)); else setError("Введите конечное число."); finish(); } }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+      })}</div>
+    </div>;
+  }
+  function scalarRow(spec: typeof scalarFields[number]) {
+    if (!material) return null;
+    const field = spec.key;
+    const value = material[field];
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{spec.label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-scalar-line"><input type="range" aria-label={`${spec.label}: слайдер`} min={spec.min} max={spec.max} step={spec.step} value={Math.min(spec.max, value)} disabled={!canEdit} onPointerDown={() => start(field)} onChange={event => apply(field, Number(event.target.value), true)} onPointerUp={finish} onKeyDown={event => { event.stopPropagation(); if (event.key === "Escape") { event.preventDefault(); cancel(); } else if (!session.current) start(field); }} onKeyUp={finish} />
+        <label><span className="sr-only">{spec.label}: точное значение</span><input type="text" inputMode="decimal" aria-label={`${spec.label}: точное значение`} value={editing === field ? draft : format(value)} disabled={!canEdit} onFocus={() => { start(field); setEditing(field); setDraft(format(value)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === field) commitNumber(field); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+    </div>;
+  }
+  return <section className="material-inspector" aria-label="Материал"><h4>Материал</h4>
+    {material && <strong>{material.name}</strong>}
+    {users.length > 1 && <><p className="panel-hint">Материал используется несколькими объектами ({users.length} слотов).</p><fieldset className="material-mode"><legend>Редактировать</legend><label><input type="radio" checked={mode === "unique"} onChange={() => { setMode("unique"); finish(); }} /> Только выбранный объект</label><label><input type="radio" checked={mode === "shared"} onChange={() => { setMode("shared"); finish(); }} /> Все объекты с этим материалом</label></fieldset></>}
+    {reason && <p className="panel-hint">{reason}</p>}
+    {material && <>
+      <div className="material-fields"><h4>Основные</h4>{colorRow("baseColor", "Базовый цвет")}{scalarFields.slice(0, 3).map(scalarRow)}</div>
+      <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
+      {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
+      {material.textureAssetIds.length > 0 && <p className="material-warning">Ссылки на текстуры сохранены, но текущий renderer их не отображает и Inspector не редактирует.</p>}
+      {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}
+      {preset && <p className="panel-hint">Сброс использует одноимённый встроенный пресет как ориентир, без подтверждения происхождения материала.</p>}
+    </>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </section>;
+}
+</file>
+
 <file path="src/ui/MirrorEditor.tsx">
 import { useRef, useState } from "react";
 import { applyMirrorChange, type MirrorChange } from "../app/mirror-actions";
@@ -7511,6 +7741,172 @@ describe("transactional heavy jobs", () => {
     expect(await pending).toMatchObject({ status: "cancelled" });
     expect(store.getSnapshot().document.revision).toBe(0);
     expect(await store.jobs.run(spec("after", async () => ({ ok: true, value: undefined })))).toMatchObject({ error: { code: "JOB_DISPOSED" } });
+  });
+});
+</file>
+
+<file path="tests/app/material-edit.test.ts">
+import { describe, expect, it } from "vitest";
+import { createEditorStore } from "../../src/app/editor-store";
+import { captureMaterialEdit, editMaterial } from "../../src/app/material-edit";
+import { materialPresets } from "../../src/materials/presets";
+import { linearToHex, parseHexColor } from "../../src/materials/color";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import * as T from "three";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+function setup() {
+  const project = createNestedMeshProject();
+  const first = project.nodes.find(node => node.id === "mesh-node")!;
+  const second = structuredClone(first);
+  second.id = "second-mesh";
+  project.nodes.push(second);
+  project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
+  const preset = materialPresets[0]!;
+  project.materials.push({ ...structuredClone(preset.material), id: "shared-material", textureAssetIds: [] });
+  if (first.kind !== "mesh" || second.kind !== "mesh") throw new Error("fixture");
+  first.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
+  second.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
+  const store = createEditorStore(project);
+  store.setSelection([first.id], first.id);
+  return store;
+}
+
+describe("material editing", () => {
+  it("clones on unique edit, preserves other fields and links, and supports undo/redo and serialization", async () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    expect(editMaterial(store, context, "roughness", .123456789).ok).toBe(true);
+    const state = store.getSnapshot();
+    const firstId = state.document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(firstId).not.toBe("shared-material");
+    expect(state.document.project.nodes.find(node => node.id === "second-mesh")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(state.document.project.materials.find(item => item.id === firstId)).toMatchObject({ roughness: .123456789, metalness: 1, textureAssetIds: [] });
+    expect(state.document.project.materials.find(item => item.id === "shared-material")?.roughness).toBe(.07);
+    expect(state.history.entries).toHaveLength(1);
+    const saved = serializeProjectDocument(store.captureDocument().project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: store.captureDocument().project });
+    const archive = await createNativeProjectArchive(store.captureDocument().project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const reopened = await openNativeProjectArchive(archive.value);
+      expect(reopened.ok).toBe(true);
+      if (reopened.ok) expect(reopened.value.project).toEqual(store.captureDocument().project);
+    }
+    expect(store.undo(state.document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe(firstId);
+  });
+
+  it("updates all references only in explicit shared mode and rejects hidden users", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store, "shared")!;
+    expect(editMaterial(store, context, "metalness", .4).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().document.project.materials[0]?.metalness).toBe(.4);
+    const revision = store.getSnapshot().document.revision;
+    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["second-mesh"], payload: { nodeId: "second-mesh", visible: false } }, revision).ok).toBe(true);
+    const before = store.getSnapshot();
+    const denied = editMaterial(store, captureMaterialEdit(store, "shared")!, "roughness", .2);
+    expect(denied.ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(true);
+  });
+
+  it("updates SceneSync material without replacing mesh geometry", () => {
+    const store = setup();
+    const sync = new SceneSync(() => {});
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    const first = sync.objects.get("mesh-node")!.content as T.Mesh;
+    const second = sync.objects.get("second-mesh")!.content as T.Mesh;
+    const geometry = first.geometry;
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .21).ok).toBe(true);
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    expect(sync.objects.get("mesh-node")!.content).toBe(first);
+    expect(first.geometry).toBe(geometry);
+    expect((first.material as T.MeshPhysicalMaterial).roughness).toBe(.21);
+    expect((second.material as T.MeshPhysicalMaterial).roughness).toBe(.07);
+    store.setSelection(["second-mesh"], "second-mesh");
+    expect(editMaterial(store, captureMaterialEdit(store, "shared")!, "metalness", .4).ok).toBe(true);
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    expect((second.material as T.MeshPhysicalMaterial).metalness).toBe(.4);
+    sync.dispose();
+  });
+
+  it("rejects invalid values, transmission conflicts and stale context without mutations", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    const before = store.getSnapshot();
+    expect(editMaterial(store, context, "ior", Number.NaN).ok).toBe(false);
+    expect(editMaterial(store, context, "envIntensity", Infinity).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editMaterial(store, context, "transmission", .6).ok).toBe(true);
+    const updated = captureMaterialEdit(store)!;
+    const material = store.getSnapshot().document.project.materials.find(item => item.id === updated.materialId)!;
+    expect(material.transmission).toBe(.6);
+    expect(material.opacity).toBe(1);
+    const unchanged = store.getSnapshot();
+    expect(editMaterial(store, updated, "opacity", .5).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(unchanged);
+    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
+    store.setSelection(["second-mesh"], "second-mesh");
+    expect(editMaterial(store, updated, "roughness", .2).ok).toBe(false);
+  });
+
+  it("groups a unique slider gesture into one undo and cancels it", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    const group = "gesture";
+    const first = editMaterial(store, context, "roughness", .2, group);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    context.revision = first.revision;
+    context.materialId = store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(editMaterial(store, context, "roughness", .3, group).ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.cancelGesture(group, store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
+
+  it("keeps no-ops out of history and converts colors without changing the document", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    expect(editMaterial(store, context, "roughness", .07)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(linearToHex(parseHexColor("#808080")!)).toBe("#808080");
+    expect(linearToHex([2, 0, 0])).toBeNull();
+    expect(parseHexColor("#bad")).toBeNull();
+  });
+
+  it("rejects scene mode, locked parent, active job and replaced project", async () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    store.setTool({ mode: "scene" });
+    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
+    store.setTool({ mode: "model" });
+    expect(store.executeCommand({ commandId: "lock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: true } }, 0).ok).toBe(true);
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
+    expect(store.executeCommand({ commandId: "unlock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: false } }, 1).ok).toBe(true);
+    let release!: () => void;
+    const pending = store.jobs.run({ id: "busy", name: "Проверка", cancellable: true, validate: () => null,
+      compute: () => new Promise<{ ok: true; value: string }>(resolve => { release = () => resolve({ ok: true, value: "done" }); }) });
+    await Promise.resolve();
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
+    release();
+    await pending;
+    const old = captureMaterialEdit(store)!;
+    const captured = store.captureDocument();
+    expect(store.replaceProject({ project: createNestedMeshProject(), assets: captured.assets }, captured.identity)).toBe(true);
+    expect(editMaterial(store, old, "roughness", .2).ok).toBe(false);
   });
 });
 </file>
@@ -9815,6 +10211,33 @@ describe("Inspector transform operations", () => {
     expect(updatedPrimitiveSource(source, "height", 0).ok).toBe(false);
     expect(updatedPrimitiveSource(source, "size", 5)).toEqual({ ok: true,
       value: { kind: "primitive", primitive: "cube", parameters: { size: 5 } } });
+  });
+});
+</file>
+
+<file path="tests/ui/material-inspector.test.tsx">
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { createElement } from "react";
+import { createEditorStore } from "../../src/app/editor-store";
+import { MaterialInspector } from "../../src/ui/MaterialInspector";
+import { materialPresets } from "../../src/materials/presets";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+describe("MaterialInspector", () => {
+  it("shows current PBR values without modifying the project on render", () => {
+    const project = createNestedMeshProject();
+    project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", roughness: .123456789, baseColor: [2, .2, .3] });
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    node.materialSlots = [{ name: "Основной", materialId: "m" }];
+    const store = createEditorStore(project);
+    store.setSelection([node.id], node.id);
+    const before = store.getSnapshot();
+    const html = renderToStaticMarkup(createElement(MaterialInspector, { store, state: before }));
+    expect(html).toContain("Шероховатость");
+    expect(html).toContain("0.123456789");
+    expect(html).toContain("HDR-компоненты");
+    expect(store.getSnapshot()).toBe(before);
   });
 });
 </file>
@@ -15124,284 +15547,6 @@ export class ModifierEvaluator {
 }
 </file>
 
-<file path="src/ui/Inspector.tsx">
-import { useEffect, useRef, useState } from "react";
-import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
-import type { Node } from "../domain/types";
-import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
-import { BooleanEditor } from "./BooleanEditor";
-import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
-
-const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
-const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
-const format = (value: number) => String(Number(value.toPrecision(12)));
-type TransformSession = EditSession & { groupId: string; applied?: string };
-
-export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const project = state.document.project;
-  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
-  const [draft, setDraft] = useState("");
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState<{ field: string; message: string } | null>(null);
-  const session = useRef<TransformSession | null>(null);
-  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const epoch = store.getProjectEpoch();
-  const selectedIds = selectionKey(state);
-  useEffect(() => {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null; session.current = null; setEditing(null); setError(null);
-    return () => { if (pending.current) clearTimeout(pending.current); };
-  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
-  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
-  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
-  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
-  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
-  const displayReason = displays.find(item => !item.ok);
-  const disabled = !!transformReason || !!displayReason;
-  function begin(key: string, value: number | null) {
-    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
-    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
-  }
-  function cancel(rollback = false) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    const captured = session.current;
-    if (rollback && captured?.applied && validSession(store, captured)) {
-      const current = store.getSnapshot();
-      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
-    }
-    session.current = null; setEditing(null); setError(null);
-  }
-  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
-    const captured = session.current;
-    if (!captured || captured.field !== key) return;
-    if (!validSession(store, captured) || blocked) { cancel(); return; }
-    if (!captured.touched) { if (final) cancel(); return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
-    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
-    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
-    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
-    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
-    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
-    captured.revision = result.revision;
-    captured.applied = raw;
-    if (final) cancel();
-  }
-  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = null;
-    applyValue(field, axis, key, draft, true, currentValue);
-  }
-  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
-    if (pending.current) clearTimeout(pending.current);
-    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
-  }
-  function reset(field: TransformField) {
-    if (disabled) return;
-    const current = store.getSnapshot();
-    const prepared = prepareTransformCommands(current, { field, reset: true });
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else cancel();
-  }
-  function changeFlag(field: "visible" | "locked", value: boolean) {
-    if (flagReason) return;
-    const current = store.getSnapshot();
-    const prepared = prepareFlagCommands(current, field, value);
-    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
-    const result = store.executeTransaction(prepared.value, current.document.revision);
-    if (!result.ok) setError({ field, message: result.message }); else setError(null);
-  }
-  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
-  const axisLabels = ["X", "Y", "Z"] as const;
-  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
-  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
-  return <div className="inspector">
-    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
-    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
-      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
-      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
-      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
-        {transformReason && <p className="panel-hint">{transformReason}</p>}
-        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
-        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
-          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
-          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
-            const key = `${field}-${axis}`;
-            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
-            const value = values.length === nodes.length ? mixedValue(values) : null;
-            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
-          })}</div>
-          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
-        </div>)}
-      </section>
-      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
-        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
-          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
-          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
-          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
-        })}
-        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
-      </section>
-      <section aria-label="Геометрия"><h4>Геометрия</h4>
-        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
-          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
-        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
-      </section>
-      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
-      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
-    </>}
-    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
-    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
-  </div>;
-}
-
-function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
-  if (blocked) return "Дождитесь завершения операции.";
-  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
-  const access = accessReason(state.document.project, node);
-  if (access) return access;
-  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
-    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
-    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
-  return "";
-}
-
-function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
-  const [error, setError] = useState("");
-  const reason = meshRestriction(state, node, blocked);
-  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
-  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
-  function convert() {
-    const current = store.getSnapshot();
-    const selected = current.document.project.nodes.find(item => item.id === node.id);
-    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
-      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  const epoch = store.getProjectEpoch();
-  function enter() {
-    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
-    setError(message ?? "");
-  }
-  return <div className="mesh-edit-actions">
-    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
-    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
-      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
-      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
-    {restriction && <p className="panel-hint">{restriction}</p>}
-    {error && <p className="primitive-error" role="alert">{error}</p>}
-  </div>;
-}
-
-function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
-  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
-  const [moveError, setMoveError] = useState("");
-  const [scaleError, setScaleError] = useState("");
-  const [extrudeDistance, setExtrudeDistance] = useState("0.25");
-  const [extrudeError, setExtrudeError] = useState("");
-  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
-  const epoch = store.getProjectEpoch();
-  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
-  const nodeId = node.id;
-  const reason = meshRestriction(state, node, blocked);
-  function apply(kind: "move" | "scale") {
-    const setError = kind === "move" ? setMoveError : setScaleError;
-    const current = store.getSnapshot();
-    const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
-      setError("Проект или выделение изменилось. Повторите действие."); return;
-    }
-    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
-    const failure = parsed.find(item => !item.ok);
-    if (failure && !failure.ok) { setError(failure.message); return; }
-    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
-    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
-    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
-    const vertices = store.selectedMeshVertices();
-    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
-    const result = kind === "move"
-      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
-      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
-    setError(result.ok ? "" : result.message);
-  }
-  function extrude() {
-    const current = store.getSnapshot();
-    const active = current.document.project.nodes.find(item => item.id === nodeId);
-    if (current.document.project.id !== state.document.project.id || current.document.revision !== state.document.revision
-      || store.getProjectEpoch() !== epoch || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)
-      || current.selection.ids.length !== 1 || current.selection.activeId !== nodeId || current.tool.mode !== "model"
-      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.mode !== "face" || current.meshEdit.faceIds.length !== 1) {
-      setExtrudeError("Проект или выделение изменилось. Повторите действие."); return;
-    }
-    const parsed = parseNumber(extrudeDistance);
-    if (!parsed.ok) { setExtrudeError(parsed.message); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "EXTRUDE_EDITABLE_FACE", targetIds: [nodeId],
-      payload: { nodeId, faceId: current.meshEdit.faceIds[0]!, distance: parsed.value } }, current.document.revision);
-    setExtrudeError(result.ok ? "" : result.message);
-  }
-  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
-  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
-  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
-  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
-    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
-    <p className="panel-hint">Локальные координаты объекта</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
-    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
-    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
-    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
-    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
-    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
-    {state.meshEdit.mode === "face" && <div className="mesh-edit-actions"><h4>Выдавливание грани</h4>
-      <p className="panel-hint">Выдавливание выполняется вдоль локальной нормали выбранной грани.</p>
-      <label>Глубина выдавливания<input type="text" inputMode="decimal" aria-label="Глубина выдавливания" value={extrudeDistance}
-        onChange={event => { setExtrudeDistance(event.target.value); setExtrudeError(""); }}
-        onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); extrude(); } }} /></label>
-      <button type="button" disabled={!!reason || state.meshEdit.faceIds.length !== 1}
-        title={reason || (state.meshEdit.faceIds.length !== 1 ? "Выберите ровно одну грань." : undefined)} onClick={extrude}>Выдавить грань</button>
-      {state.meshEdit.faceIds.length !== 1 && <p className="panel-hint">Выберите ровно одну грань.</p>}
-      {extrudeError && <p className="primitive-error" role="alert">{extrudeError}</p>}
-    </div>}
-  </section>;
-}
-
-function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
-  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
-  const specs = primitiveDefinitions[source.primitive].parameters;
-  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
-    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
-  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
-  const [draft, setDraft] = useState<Record<string, string>>({});
-  const [editing, setEditing] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const session = useRef<EditSession | null>(null);
-  const epoch = store.getProjectEpoch();
-  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
-  function apply(key: string, raw: string) {
-    const captured = session.current;
-    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
-    if (!captured.touched) { setEditing(null); session.current = null; return; }
-    const parsed = parseNumber(raw);
-    if (!parsed.ok) { setError(parsed.message); return; }
-    const next = updatedPrimitiveSource(source, key, parsed.value);
-    if (!next.ok) { setError(next.message); return; }
-    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
-    if (!result.ok) { setError(result.message); return; }
-    setEditing(null); setDraft({}); setError(""); session.current = null;
-  }
-  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
-    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
-    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
-    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
-  </div>;
-}
-</file>
-
 <file path="src/renderer/scene-sync.ts">
 import * as T from "three";
 import type { DeepReadonly } from "../app/editor-store";
@@ -16312,6 +16457,286 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
 }
 </file>
 
+<file path="src/ui/Inspector.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
+import type { Node } from "../domain/types";
+import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
+import { BooleanEditor } from "./BooleanEditor";
+import { MaterialInspector } from "./MaterialInspector";
+import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
+
+const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
+const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
+const format = (value: number) => String(Number(value.toPrecision(12)));
+type TransformSession = EditSession & { groupId: string; applied?: string };
+
+export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const project = state.document.project;
+  const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
+  const [draft, setDraft] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState<{ field: string; message: string } | null>(null);
+  const session = useRef<TransformSession | null>(null);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const epoch = store.getProjectEpoch();
+  const selectedIds = selectionKey(state);
+  useEffect(() => {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null; session.current = null; setEditing(null); setError(null);
+    return () => { if (pending.current) clearTimeout(pending.current); };
+  }, [epoch, selectedIds, state.tool.mode, state.tool.space, blocked]);
+  const modeReason = blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "В режиме «Сцена» свойства модели не редактируются." : "";
+  const transformReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node)).find(Boolean) || "";
+  const flagReason = modeReason || nodes.map(node => node.id === project.model.rootNodeId ? "Корень модели защищён." : accessReason(project, node, true)).find(Boolean) || "";
+  const displays = nodes.map(node => displayTransform(project, node, state.tool.space));
+  const displayReason = displays.find(item => !item.ok);
+  const disabled = !!transformReason || !!displayReason;
+  function begin(key: string, value: number | null) {
+    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
+    setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
+  }
+  function cancel(rollback = false) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    const captured = session.current;
+    if (rollback && captured?.applied && validSession(store, captured)) {
+      const current = store.getSnapshot();
+      if (current.history.entries[current.history.cursor - 1]?.groupId === captured.groupId) store.cancelGesture(captured.groupId, current.document.revision);
+    }
+    session.current = null; setEditing(null); setError(null);
+  }
+  function applyValue(field: TransformField, axis: Axis, key: string, raw: string, final: boolean, currentValue: number | null) {
+    const captured = session.current;
+    if (!captured || captured.field !== key) return;
+    if (!validSession(store, captured) || blocked) { cancel(); return; }
+    if (!captured.touched) { if (final) cancel(); return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
+    if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
+    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
+    if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
+    const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
+    if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
+    captured.revision = result.revision;
+    captured.applied = raw;
+    if (final) cancel();
+  }
+  function commit(field: TransformField, axis: Axis, key: string, currentValue: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    applyValue(field, axis, key, draft, true, currentValue);
+  }
+  function schedule(field: TransformField, axis: Axis, key: string, raw: string, value: number | null) {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = setTimeout(() => { pending.current = null; applyValue(field, axis, key, raw, false, value); }, 220);
+  }
+  function reset(field: TransformField) {
+    if (disabled) return;
+    const current = store.getSnapshot();
+    const prepared = prepareTransformCommands(current, { field, reset: true });
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else cancel();
+  }
+  function changeFlag(field: "visible" | "locked", value: boolean) {
+    if (flagReason) return;
+    const current = store.getSnapshot();
+    const prepared = prepareFlagCommands(current, field, value);
+    if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    const result = store.executeTransaction(prepared.value, current.document.revision);
+    if (!result.ok) setError({ field, message: result.message }); else setError(null);
+  }
+  const fields = ([ ["position", "Положение"], ["rotation", "Вращение"], ["scale", "Масштаб"] ] as const);
+  const axisLabels = ["X", "Y", "Z"] as const;
+  const primitive = nodes.length === 1 && nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "primitive" ? nodes[0] : null;
+  const mesh = nodes.length === 1 && nodes[0]?.kind === "mesh" ? nodes[0] : null;
+  return <div className="inspector">
+    <p className="eyebrow">{state.tool.mode === "scene" ? "Сцена" : "Свойства модели"}</p>
+    {!nodes.length ? <p className="panel-hint">Выберите объект в дереве или в рабочей области.</p> : <>
+      <h3>{nodes.length === 1 ? nodes[0]!.name : `Выбрано объектов: ${nodes.length}`}</h3>
+      {nodes.length === 1 && <p className="panel-hint">{nodes[0]!.kind === "group" ? "Группа" : nodes[0]!.meshSource.kind === "asset" ? "Импортированная сетка" : nodes[0]!.meshSource.kind === "editable" ? "Редактируемая сетка" : primitiveDefinitions[nodes[0]!.meshSource.primitive].label}</p>}
+      <section aria-label="Трансформация"><h4>Трансформация · {state.tool.space === "world" ? "мировая" : "локальная"}</h4>
+        {transformReason && <p className="panel-hint">{transformReason}</p>}
+        {displayReason && !displayReason.ok && <p className="primitive-error" role="alert">{displayReason.message}</p>}
+        {fields.map(([field, label]) => <div className="inspector-group" key={field}>
+          <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={disabled} title="Сбросить в текущей системе координат" onClick={() => reset(field)}>Сбросить</button></div>
+          <div className="inspector-vector">{axisLabels.map((axisLabel, axis) => {
+            const key = `${field}-${axis}`;
+            const values = displays.flatMap(item => item.ok ? [field === "rotation" ? eulerDegrees(item.value)[axis]! : item.value[field][axis]!] : []);
+            const value = values.length === nodes.length ? mixedValue(values) : null;
+            return <label key={key}>{axisLabel}{field === "rotation" ? "°" : ""}<input type="text" inputMode="decimal" aria-label={`${label} ${axisLabel}${field === "rotation" ? " в градусах" : ""}`} placeholder={value === null ? "—" : undefined} value={editing === key ? draft : value === null ? "" : format(value)} disabled={disabled} title={transformReason || (!displayReason?.ok ? displayReason?.message : "") || undefined} onFocus={() => begin(key, value)} onChange={event => { if (session.current) session.current.touched = true; setDraft(event.target.value); setError(null); schedule(field, axis as Axis, key, event.target.value, value); }} onBlur={() => { if (editing === key) commit(field, axis as Axis, key, value); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); commit(field, axis as Axis, key, value); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); cancel(true); (event.target as HTMLInputElement).blur(); } }} />{error?.field === key && <span className="primitive-error" role="alert">{error.message}</span>}</label>;
+          })}</div>
+          {error?.field === field && <p className="primitive-error" role="alert">{error.message}</p>}
+        </div>)}
+      </section>
+      <section aria-label="Состояние"><h4>Состояние</h4>{flagReason && <p className="panel-hint">{flagReason}</p>}
+        {([ ["visible", "Видимость"], ["locked", "Блокировка"] ] as const).map(([field, label]) => {
+          const common = nodes.every(node => node[field] === nodes[0]?.[field]) ? nodes[0]![field] : null;
+          const ownReason = nodes.some(node => field === "visible" ? node.locked : !node.visible) ? "Сначала восстановите видимость или снимите блокировку объекта." : "";
+          return <div className="inspector-flag" key={field}><span>{label}: {common === null ? "— смешано" : common ? "да" : "нет"}</span><button type="button" disabled={!!flagReason || !!ownReason && !(field === "visible" && common === false || field === "locked" && common === true)} title={flagReason || ownReason || undefined} onClick={() => changeFlag(field, common !== true)}>{field === "visible" ? common === true ? "Скрыть" : "Показать" : common === true ? "Разблокировать" : "Заблокировать"}</button></div>;
+        })}
+        {error && ["visible", "locked"].includes(error.field) && <p className="primitive-error" role="alert">{error.message}</p>}
+      </section>
+      <section aria-label="Геометрия"><h4>Геометрия</h4>
+        {primitive ? <PrimitiveEditor key={primitive.id} store={store} node={primitive} disabled={!!modeReason || !!accessReason(project, primitive)} reason={modeReason || accessReason(project, primitive)} />
+          : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
+        {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
+      </section>
+      <MaterialInspector store={store} state={state} />
+      {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
+      {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
+    </>}
+    <div className="info-block"><span>Схема документа</span><strong>{project.schemaVersion}</strong></div>
+    <div className="info-block"><span>Узлов модели</span><strong>{project.nodes.length}</strong></div>
+  </div>;
+}
+
+function meshRestriction(state: EditorState, node: DeepReadonly<Extract<Node, { kind: "mesh" }>>, blocked: boolean): string {
+  if (blocked) return "Дождитесь завершения операции.";
+  if (state.tool.mode !== "model") return "Доступно только в режиме «Модель».";
+  const access = accessReason(state.document.project, node);
+  if (access) return access;
+  if (node.modifierIds.some(id => state.document.project.modifiers.find(item => item.id === id)?.enabled)
+    || state.document.project.modifiers.some(item => item.enabled && item.kind === "boolean" && item.parameters.cutterNodeId === node.id))
+    return "Перед редактированием отключите активные модификаторы и зависимые Boolean.";
+  return "";
+}
+
+function MeshEditActions({ store, state, node, blocked }: { store: EditorStore; state: EditorState; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; blocked: boolean }) {
+  const [error, setError] = useState("");
+  const reason = meshRestriction(state, node, blocked);
+  const plane = node.meshSource.kind === "primitive" && node.meshSource.primitive === "plane";
+  const restriction = reason || (plane ? "Плоскость не является замкнутой сеткой и пока не преобразуется." : "");
+  function convert() {
+    const current = store.getSnapshot();
+    const selected = current.document.project.nodes.find(item => item.id === node.id);
+    if (current.selection.ids.length !== 1 || current.selection.activeId !== node.id || selected?.kind !== "mesh" || selected.meshSource.kind !== "primitive"
+      || current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch) { setError("Проект изменился. Повторите действие."); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "CONVERT_PRIMITIVE_TO_EDITABLE", targetIds: [node.id], payload: { nodeId: node.id } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  const epoch = store.getProjectEpoch();
+  function enter() {
+    const message = store.enterMeshEditMode("vertex", state.document.revision, epoch);
+    setError(message ?? "");
+  }
+  return <div className="mesh-edit-actions">
+    {node.meshSource.kind === "primitive" && <button type="button" disabled={!!restriction} title={restriction || undefined} onClick={convert}>Преобразовать в редактируемую сетку</button>}
+    {node.meshSource.kind === "editable" && (state.meshEdit.mode !== "object"
+      ? <button type="button" onClick={() => store.exitMeshEditMode()}>Вернуться к объектам</button>
+      : <button type="button" disabled={!!reason || state.selection.ids.length !== 1} title={reason || undefined} onClick={enter}>Редактировать вершины</button>)}
+    {restriction && <p className="panel-hint">{restriction}</p>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </div>;
+}
+
+function VertexEditor({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
+  const [delta, setDelta] = useState<[string, string, string]>(["0", "0", "0"]);
+  const [factors, setFactors] = useState<[string, string, string]>(["1", "1", "1"]);
+  const [moveError, setMoveError] = useState("");
+  const [scaleError, setScaleError] = useState("");
+  const [extrudeDistance, setExtrudeDistance] = useState("0.25");
+  const [extrudeError, setExtrudeError] = useState("");
+  const node = state.document.project.nodes.find(item => item.id === state.meshEdit.nodeId);
+  const epoch = store.getProjectEpoch();
+  if (node?.kind !== "mesh" || node.meshSource.kind !== "editable") return null;
+  const nodeId = node.id;
+  const reason = meshRestriction(state, node, blocked);
+  function apply(kind: "move" | "scale") {
+    const setError = kind === "move" ? setMoveError : setScaleError;
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.revision !== state.document.revision || store.getProjectEpoch() !== epoch || current.meshEdit.mode !== state.meshEdit.mode || current.meshEdit.nodeId !== nodeId
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)) {
+      setError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = (kind === "move" ? delta : factors).map(parseNumber);
+    const failure = parsed.find(item => !item.ok);
+    if (failure && !failure.ok) { setError(failure.message); return; }
+    const values = parsed.map(item => item.ok ? item.value : 0) as [number, number, number];
+    if (kind === "move" && values.every(value => value === 0) || kind === "scale" && values.every(value => value === 1)) { setError(""); return; }
+    if (kind === "scale" && values.some(value => value <= 0)) { setError("Коэффициенты масштаба должны быть строго положительными."); return; }
+    const vertices = store.selectedMeshVertices();
+    if (!vertices?.length) { setError("Выделение устарело или отсутствует."); return; }
+    const result = kind === "move"
+      ? store.executeCommand({ commandId: crypto.randomUUID(), type: "TRANSLATE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, delta: values } }, current.document.revision)
+      : store.executeCommand({ commandId: crypto.randomUUID(), type: "SCALE_EDITABLE_VERTICES", targetIds: [nodeId], payload: { nodeId, vertexIndices: vertices, factors: values } }, current.document.revision);
+    setError(result.ok ? "" : result.message);
+  }
+  function extrude() {
+    const current = store.getSnapshot();
+    const active = current.document.project.nodes.find(item => item.id === nodeId);
+    if (current.document.project.id !== state.document.project.id || current.document.revision !== state.document.revision
+      || store.getProjectEpoch() !== epoch || JSON.stringify(current.meshEdit) !== JSON.stringify(state.meshEdit)
+      || current.selection.ids.length !== 1 || current.selection.activeId !== nodeId || current.tool.mode !== "model"
+      || active?.kind !== "mesh" || active.meshSource.kind !== "editable" || current.meshEdit.mode !== "face" || current.meshEdit.faceIds.length !== 1) {
+      setExtrudeError("Проект или выделение изменилось. Повторите действие."); return;
+    }
+    const parsed = parseNumber(extrudeDistance);
+    if (!parsed.ok) { setExtrudeError(parsed.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "EXTRUDE_EDITABLE_FACE", targetIds: [nodeId],
+      payload: { nodeId, faceId: current.meshEdit.faceIds[0]!, distance: parsed.value } }, current.document.revision);
+    setExtrudeError(result.ok ? "" : result.message);
+  }
+  const modeLabel = state.meshEdit.mode === "vertex" ? "вершин" : state.meshEdit.mode === "edge" ? "рёбер" : "граней";
+  const count = state.meshEdit.mode === "vertex" ? state.meshEdit.vertexIndices.length : state.meshEdit.mode === "edge" ? state.meshEdit.edgeIds.length : state.meshEdit.faceIds.length;
+  const scaleReason = count === 1 && state.meshEdit.mode === "vertex" ? "Одна вершина совпадает с центром масштабирования. Выберите минимум две вершины." : "";
+  return <section aria-label={`Редактирование ${modeLabel}`}><h4>Редактирование {modeLabel}</h4>
+    <p className="panel-hint">{node.name} · Выбрано {modeLabel}: {count}</p>
+    <p className="panel-hint">Локальные координаты объекта</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Смещение {axis}<input type="text" inputMode="decimal" aria-label={`Смещение ${axis}`} value={delta[index]} onChange={event => { setDelta(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setMoveError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("move"); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count} onClick={() => apply("move")}>Применить смещение</button>
+    {moveError && <p className="primitive-error" role="alert">{moveError}</p>}
+    <p className="panel-hint">Масштабирование выбранных элементов по локальным осям сетки</p>
+    <div className="inspector-vector">{(["X", "Y", "Z"] as const).map((axis, index) => <label key={axis}>Масштаб {axis}<input type="text" inputMode="decimal" aria-label={`Масштаб ${axis}`} value={factors[index]} onChange={event => { setFactors(current => current.map((value, i) => i === index ? event.target.value : value) as [string, string, string]); setScaleError(""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply("scale"); } else if (event.key === "Escape") { event.preventDefault(); setFactors(["1", "1", "1"]); setScaleError(""); } }} /></label>)}</div>
+    <button type="button" disabled={!!reason || !count || !!scaleReason} title={scaleReason || reason || undefined} onClick={() => apply("scale")}>Применить масштабирование</button>
+    {(reason || scaleReason) && <p className="panel-hint">{reason || scaleReason}</p>}{scaleError && <p className="primitive-error" role="alert">{scaleError}</p>}
+    {state.meshEdit.mode === "face" && <div className="mesh-edit-actions"><h4>Выдавливание грани</h4>
+      <p className="panel-hint">Выдавливание выполняется вдоль локальной нормали выбранной грани.</p>
+      <label>Глубина выдавливания<input type="text" inputMode="decimal" aria-label="Глубина выдавливания" value={extrudeDistance}
+        onChange={event => { setExtrudeDistance(event.target.value); setExtrudeError(""); }}
+        onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); extrude(); } }} /></label>
+      <button type="button" disabled={!!reason || state.meshEdit.faceIds.length !== 1}
+        title={reason || (state.meshEdit.faceIds.length !== 1 ? "Выберите ровно одну грань." : undefined)} onClick={extrude}>Выдавить грань</button>
+      {state.meshEdit.faceIds.length !== 1 && <p className="panel-hint">Выберите ровно одну грань.</p>}
+      {extrudeError && <p className="primitive-error" role="alert">{extrudeError}</p>}
+    </div>}
+  </section>;
+}
+
+function PrimitiveEditor({ store, node, disabled, reason }: { store: EditorStore; node: DeepReadonly<Extract<Node, { kind: "mesh" }>>; disabled: boolean; reason: string }) {
+  const source = node.meshSource as DeepReadonly<PrimitiveSource>;
+  const specs = primitiveDefinitions[source.primitive].parameters;
+  const keys = source.primitive === "cube" && Object.keys(source.parameters).length === 1 && Object.hasOwn(source.parameters, "size")
+    ? ["size"] : Object.keys(specs).filter(key => key !== "size");
+  const committed = (key: string) => source.parameters[key] ?? (source.primitive === "cube" ? source.parameters.size : undefined) ?? specs[key]!.defaultValue;
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [editing, setEditing] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const session = useRef<EditSession | null>(null);
+  const epoch = store.getProjectEpoch();
+  useEffect(() => { session.current = null; setEditing(null); setDraft({}); setError(""); }, [node.id, epoch]);
+  function apply(key: string, raw: string) {
+    const captured = session.current;
+    if (!captured || !validSession(store, captured) || disabled) { setEditing(null); return; }
+    if (!captured.touched) { setEditing(null); session.current = null; return; }
+    const parsed = parseNumber(raw);
+    if (!parsed.ok) { setError(parsed.message); return; }
+    const next = updatedPrimitiveSource(source, key, parsed.value);
+    if (!next.ok) { setError(next.message); return; }
+    const result = store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_PRIMITIVE_PARAMETERS", targetIds: [node.id], payload: { nodeId: node.id, source: next.value } }, captured.revision);
+    if (!result.ok) { setError(result.message); return; }
+    setEditing(null); setDraft({}); setError(""); session.current = null;
+  }
+  return <div className="primitive-editor"><h3>{primitiveDefinitions[source.primitive].label}</h3>
+    {keys.map(key => <label key={key}>{specs[key]!.label}<span className="inspector-parameter"><input type="text" inputMode={specs[key]!.integer ? "numeric" : "decimal"} value={editing === key ? draft[key] ?? "" : format(committed(key))} disabled={disabled} onFocus={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: false }; setEditing(key); setDraft({ [key]: format(committed(key)) }); setError(""); }} onChange={event => { if (session.current) session.current.touched = true; setDraft({ [key]: event.target.value }); setError(""); }} onBlur={() => { if (editing === key && !error) apply(key, draft[key] ?? ""); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); apply(key, draft[key] ?? ""); (event.target as HTMLInputElement).blur(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(null); session.current = null; (event.target as HTMLInputElement).blur(); } }} /><button type="button" disabled={disabled} title={`Восстановить: ${specs[key]!.defaultValue}`} onClick={() => { const current = store.getSnapshot(); session.current = { revision: current.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(current), mode: current.tool.mode, space: current.tool.space, field: key, touched: true }; apply(key, String(specs[key]!.defaultValue)); }}>↺</button></span></label>)}
+    {reason && <p className="panel-hint">{reason}</p>}{error && <p className="primitive-error" role="alert">{error}</p>}
+    <p className="panel-hint">Enter или выход из поля применяет значение. Esc отменяет ввод.</p>
+  </div>;
+}
+</file>
+
 <file path="package.json">
 {
   "name": "triad-3d",
@@ -17180,6 +17605,19 @@ body { margin: 0; }
 .inspector-parameter { display: flex; gap: 5px; }
 .inspector-parameter button { flex: none; }
 .inspector .primitive-error { color: var(--color-state-danger); }
+.material-inspector { min-width: 0; }
+.material-fields, .material-field { display: grid; gap: 8px; min-width: 0; }
+.material-field { padding: 8px 0; border-bottom: var(--border-default); }
+.material-color-line, .material-scalar-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.material-color-line label { flex: 1; min-width: 0; }
+.material-color-line input[type="color"] { flex: none; width: 40px; height: 32px; padding: 0; }
+.material-color-line input[type="text"], .material-scalar-line input[type="text"] { box-sizing: border-box; width: 100%; min-width: 0; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+.material-scalar-line input[type="range"] { flex: 1; min-width: 0; }
+.material-scalar-line label { width: 86px; flex: none; }
+.material-mode { display: grid; gap: 6px; border: var(--border-default); border-radius: var(--radius-sm); font-size: var(--font-size-sm); }
+.material-mode label { display: flex; align-items: center; gap: 6px; }
+.material-advanced summary { cursor: pointer; font-size: var(--font-size-sm); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .boolean-editor label { display: grid; gap: 4px; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
 .boolean-editor select { min-width: 0; width: 100%; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
 .boolean-editor .boolean-check { display: flex; align-items: center; gap: 7px; }
@@ -18487,6 +18925,7 @@ function EditorShell() {
 - **CODEX-026B / TASK-026 / FR-021 / UI-08 / TST-011 (PARTIAL):** Displace Brush поддерживает выключенную симметрию и отражение по X/Y/Z относительно локальных плоскостей YZ/XZ/XY через начало mesh. Обе области показаны в предпросмотре и применяются одной транзакцией; пересечение и повторы samples объединяются по максимальному falloff. Параметры мазка фиксируются при pointerdown, смена параметров отменяет активный мазок. Старый payload команды сохраняет семантику `off`, невалидные значения отклоняются. Подтверждены typecheck, lint, 49 целевых тестов и production build; ручная браузерная проверка: UNVERIFIED. Существующие ограничения сетки и отсутствие полной гарантии против самопересечений сохраняются. Paint Brush, Material Brush и fill остаются в TASK-026.
 - **CODEX-030A / TASK-030 (реализовано):** В левом dock добавлены разделы «Геометрия» и «Материалы», поиск и пять категорий. Шесть валидных PBR-пресетов показываются на статически отрендеренной сфере через один временный WebGL renderer с локальным HDRI Poly Haven Studio Small 03 (Greg Zaal, CC0; источник и SHA-256 в `docs/renderer-decision.md`). Общий PBR-адаптер используется SceneSync и превью. При сбое HDRI применяется нейтральное освещение, при недоступном WebGL показывается явное сообщение; назначение остаётся доступным. Один выбранный primitive/editable Mesh получает материал через атомарную транзакцию ADD_MATERIAL + SET_MATERIAL_SLOT и один Undo-шаг; идентичный пресет повторно не создаётся. GLB с внутренними материалами не назначается до TASK-031, чтобы не заменять несколько слотов молча. Текстур и процедурного рельефа у камня пока нет (TASK-032–034); Drag & Drop и Material Inspector остаются TASK-031. Typecheck, lint, 15 целевых тестов и production build: PASS. Ручной browser smoke: UNVERIFIED — встроенный браузер не открыл локальный Vite URL (timeout). Существующее предупреждение о размере Vite chunk сохраняется.
 - **CODEX-031A / TASK-031 / FR-029 (частично):** Карточки пресетов поддерживают нативный Drag & Drop на фактический Mesh под указателем через SurfaceQuery, без смены selection. Общий action назначает материал через одну атомарную транзакцию; кнопка «Назначить», повторное использование материала, Undo/Redo и no-op сохранены. Внутренний MIME принимает только ID из локального реестра и активную RAM drag-сессию с ревизией/эпохой; недопустимые цели и GLB отклоняются с сообщением. Schema/архив не менялись. Typecheck, lint, build и 28 целевых тестов PASS. Браузер открыл WebGPU и WebGL2, но визуальный drag/drop не удалось подтвердить: захват canvas показывал однородный фон и пробный drag не дал наблюдаемого изменения (UNVERIFIED). Material Inspector остаётся отдельной частью TASK-031.
+- **CODEX-031B / TASK-031 (реализовано, ручная приёмка не подтверждена):** Правый Inspector показывает действующий доменный PBR-материал, Basic/Advanced-поля, Linear-sRGB и HEX, точные числовые поля, слайдеры и сброс отдельных свойств по однозначному совпадению имени встроенного пресета. Первое изменение общего материала в безопасном режиме создаёт копию с новым ID и переназначает один Mesh атомарно; явный общий режим обновляет все ссылки и запрещён при недоступном связанном объекте. Записи проверяют эпоху, ревизию, выбор, слот, права и полную валидацию; слайдер объединяет Undo, Esc откатывает жест. Transmission автоматически устанавливает opacity=1 с пояснением. Текстуры сохраняются без редактирования и пока не отображаются renderer. Схема/архив не менялись. Typecheck, lint, build и 65 целевых тестов PASS. Ручной desktop smoke и аппаратное сравнение WebGPU/WebGL2 в этом задании не выполнены; визуальный критерий остаётся UNVERIFIED. Сборка сохраняет существующее предупреждение о крупном chunk.
 </file>
 
 </files>

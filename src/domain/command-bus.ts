@@ -16,6 +16,7 @@ import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, ty
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
   | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
   | { commandId: string; type: "UPDATE_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
   | { commandId: string; type: "REMOVE_MATERIAL"; targetIds: [EntityId]; payload: { materialId: EntityId } }
@@ -137,6 +138,15 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "ADD_ASSET") {
+    const asset = payload.asset;
+    return ownKeys(payload, ["asset"]) && record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+      && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
+      && /^(image\/(?:png|jpeg|webp|vnd\.radiance|x-exr))$/.test(String(asset.mediaType))
+      && asset.path === `assets/${asset.hash}.${asset.mediaType === "image/jpeg" ? "jpg" : asset.mediaType === "image/vnd.radiance" ? "hdr" : asset.mediaType === "image/x-exr" ? "exr" : String(asset.mediaType).slice(6)}`
+      && asset.colorSpace === (asset.mediaType === "image/vnd.radiance" || asset.mediaType === "image/x-exr" ? "linear" : "srgb")
+      && same(value.targetIds, [asset.id]);
+  }
   if (value.type === "ADD_MATERIAL" || value.type === "UPDATE_MATERIAL") return ownKeys(payload, ["material"])
     && validateMaterial(payload.material).length === 0 && same(value.targetIds, [(payload.material as Material).id]);
   if (value.type === "REMOVE_MATERIAL") return ownKeys(payload, ["materialId"])
@@ -318,6 +328,13 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "ADD_ASSET") {
+    const asset = command.payload.asset;
+    if (entityIds(project).has(asset.id) || project.assets.some(item => item.path === asset.path))
+      return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID или путь ресурса уже используется.");
+    project.assets.push(structuredClone(asset));
+    return null;
+  }
   if (command.type === "ADD_MATERIAL") {
     if (entityIds(project).has(command.payload.material.id)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "ID материала уже занят.");
     project.materials.push(structuredClone(command.payload.material)); return null;

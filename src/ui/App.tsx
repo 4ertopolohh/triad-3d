@@ -13,6 +13,8 @@ import { ObjectTree } from "./ObjectTree";
 import { Inspector } from "./Inspector";
 import { JobOverlay } from "./JobOverlay";
 import { MaterialLibrary } from "./MaterialLibrary";
+import { ResourceLibrary } from "./ResourceLibrary";
+import { prepareImageAsset } from "../assets/prepare-image-asset";
 import { isJobActive } from "../app/job-controller";
 
 const RendererSpike = import.meta.env.DEV
@@ -52,6 +54,8 @@ function EditorShell() {
   const state = useEditorStore(editorStore);
   const fileInput = useRef<HTMLInputElement>(null);
   const glbInput = useRef<HTMLInputElement>(null);
+  const resourceInput = useRef<HTMLInputElement>(null);
+  const importAbort = useRef<AbortController | null>(null);
   const workspace = useRef<HTMLDivElement>(null);
   const fileLock = useRef(false);
   const [fileBusy, setFileBusy] = useState(false);
@@ -59,7 +63,7 @@ function EditorShell() {
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
   const [dragging, setDragging] = useState(false);
-  const [librarySection, setLibrarySection] = useState<"geometry" | "materials">("geometry");
+  const [librarySection, setLibrarySection] = useState<"geometry" | "materials" | "resources">("geometry");
   const dragCleanup = useRef<(() => void) | null>(null);
   const project = selectProject(state);
   const dirty = selectDirty(state);
@@ -69,7 +73,7 @@ function EditorShell() {
   const blocked = fileBusy || !!pendingGlb || jobBlocked;
   const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
-  useEffect(() => () => { dragCleanup.current?.(); }, []);
+  useEffect(() => () => { dragCleanup.current?.(); importAbort.current?.abort(); }, []);
   useEffect(() => {
     if (!dirty) return;
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -225,6 +229,23 @@ function EditorShell() {
     } catch { notice("error", "Не удалось проверить GLB."); }
     finally { fileLock.current = false; setFileBusy(false); }
   }
+  async function importResource(file: File) {
+    if (blocked || fileLock.current) return;
+    const captured = editorStore.captureImportContext();
+    const controller = new AbortController();
+    importAbort.current = controller;
+    fileLock.current = true;
+    setFileBusy(true);
+    notice("info", "Проверка ресурса…");
+    try {
+      const prepared = await prepareImageAsset(file, undefined, controller.signal);
+      if (!prepared.ok) { notice(prepared.error.code === "CANCELLED" ? "info" : "error", prepared.error.message); return; }
+      const result = await editorStore.addAsset({ commandId: crypto.randomUUID(), type: "ADD_ASSET", targetIds: [prepared.value.asset.id], payload: { asset: prepared.value.asset } },
+        prepared.value.bytes, captured.revision, captured.identity, controller.signal);
+      notice(result.ok ? "success" : controller.signal.aborted ? "info" : "error", result.ok ? result.changed ? "Ресурс добавлен. Сохраните проект для записи в .triad3d." : "Ресурс уже есть в проекте." : result.message);
+    } catch { notice("error", "Не удалось импортировать ресурс."); }
+    finally { if (importAbort.current === controller) importAbort.current = null; fileLock.current = false; setFileBusy(false); }
+  }
   function confirmGlb() {
     if (!pendingGlb) return;
     const result = commitGlb(editorStore, pendingGlb.prepared, pendingGlb.revision, pendingGlb.identity);
@@ -259,9 +280,10 @@ function EditorShell() {
           <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
           <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
+          <input ref={resourceInput} className="file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.hdr,.exr,image/png,image/jpeg,image/webp" aria-label="Выбрать изображение, HDR или EXR" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importResource(file); }} />
         </div>
       </header>
-      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span><button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
+      {fileStatus && <div className={`file-status status-${fileStatus.kind}`} role={fileStatus.kind === "error" ? "alert" : "status"} aria-live={fileStatus.kind === "error" ? "assertive" : "polite"}><span>{fileStatus.text}</span>{fileBusy && importAbort.current && <button type="button" onClick={() => importAbort.current?.abort()}>Отменить импорт</button>}<button type="button" aria-label="Закрыть сообщение" onClick={() => setFileStatus(null)}>×</button></div>}
       {pendingGlb && <div className="import-confirm" role="group" aria-label="Подтверждение импорта GLB">
         <span>«{pendingGlb.prepared.name}»: {pendingGlb.prepared.triangles} треугольников. Внутренние PBR-материалы сохраняются в GLB, но пока не редактируются отдельно. Анимации и сложные сцены не поддерживаются.</span>
         <button type="button" onClick={confirmGlb}>Добавить в модель</button>
@@ -274,7 +296,7 @@ function EditorShell() {
           {state.view.leftTab === "structure" ?
           <div className="panel-content">
             <ObjectTree store={editorStore} project={project} selection={state.selection} blocked={blocked} mode={state.tool.mode} notice={notice} />
-          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} />}</div>}
+          </div> : <div className="panel-content"><div className="library-sections" role="group" aria-label="Раздел библиотеки"><button type="button" aria-pressed={librarySection === "geometry"} onClick={() => setLibrarySection("geometry")}>Геометрия</button><button type="button" aria-pressed={librarySection === "materials"} onClick={() => setLibrarySection("materials")}>Материалы</button><button type="button" aria-pressed={librarySection === "resources"} onClick={() => setLibrarySection("resources")}>Ресурсы</button></div>{librarySection === "geometry" ? <><p className="eyebrow">Геометрические примитивы</p><div className="primitive-library">{(Object.keys(primitiveDefinitions) as PrimitiveKind[]).map(kind => <button type="button" key={kind} disabled={!canEditModel} title={!canEditModel ? blocked ? "Дождитесь завершения операции." : state.tool.mode === "scene" ? "Переключитесь в режим «Модель»." : "Корень модели скрыт или заблокирован." : `Добавить: ${primitiveDefinitions[kind].label}`} onClick={() => addPrimitive(kind)}>{primitiveDefinitions[kind].label}</button>)}</div><p className="panel-hint">Выберите фигуру, чтобы добавить её в модель. Импортированный GLB сохраняется в проекте.</p></> : librarySection === "materials" ? <MaterialLibrary store={editorStore} state={state} blocked={blocked} notice={notice} /> : <ResourceLibrary store={editorStore} state={state} blocked={blocked} onImport={() => resourceInput.current?.click()} />}</div>}
         </aside>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">

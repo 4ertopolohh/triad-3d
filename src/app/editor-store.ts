@@ -3,7 +3,7 @@ import { CommandErrorCode } from "../domain/command-bus";
 import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
 import type { EntityId, Project } from "../domain/types";
 import { AssetBytes } from "../assets/asset-bytes";
-import type { LoadedProject } from "../assets/native-project-archive";
+import { ARCHIVE_LIMITS, type LoadedProject } from "../assets/native-project-archive";
 import { createJobController, isJobActive, type JobController, type JobState } from "./job-controller";
 import { MAX_VISIBLE_VERTICES, normalizeVertexIndices } from "../geometry/vertex-selection";
 import { buildMeshTopology, MAX_TOPOLOGY_TRIANGLES, selectedTopologyVertices } from "../geometry/mesh-topology";
@@ -40,6 +40,7 @@ export interface EditorStore {
   redo(expectedRevision: number): CommandResult;
   cancelGesture(groupId: string, expectedRevision: number): CommandResult;
   addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
+  addAsset(command: Extract<ProjectCommand, { type: "ADD_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object, signal?: AbortSignal): Promise<CommandResult>;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   enterVertexMode(expectedRevision: number, expectedEpoch: object): string | null;
   exitVertexMode(): void;
@@ -54,6 +55,7 @@ export interface EditorStore {
   readAssetBytes(id: string): Uint8Array | undefined;
   getProjectEpoch(): object;
   captureDocument(): { project: Project; assets: AssetBytes; revision: number; identity: object };
+  captureImportContext(): { revision: number; identity: object };
   confirmSaved(revision: number, identity: object): boolean;
   replaceProject(loaded: LoadedProject, identity: object): boolean;
 }
@@ -256,8 +258,44 @@ export function createEditorStore(initialProject: Project): EditorStore {
       if (!command.payload.asset && (command.payload.node.meshSource.kind !== "asset" || !assetBytes.ids().includes(command.payload.node.meshSource.assetId)))
         return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_REFERENCE, message: "Байты повторно используемого ресурса отсутствуют." };
       try {
-        const nextAssets = assetBytes.clone();
+        const nextAssets = assetBytes.fork();
         if (command.payload.asset) nextAssets.set(command.payload.asset.id, bytes);
+        const result = bus.executeCommand(command, expectedRevision);
+        if (!result.ok) return result;
+        assetBytes = nextAssets;
+        return commit(result);
+      } catch {
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
+      }
+    },
+    async addAsset(command, bytes, expectedRevision, expectedIdentity, signal) {
+      if (signal?.aborted) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Импорт отменён." };
+      if (jobActive()) return busy(command.commandId);
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      const asset = command.payload.asset;
+      if (!bytes.byteLength || bytes.byteLength > ARCHIVE_LIMITS.asset)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Ресурс пуст или превышает лимит 64 МиБ." };
+      try {
+        const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as BufferSource))].map(n => n.toString(16).padStart(2, "0")).join("");
+        if (hash !== asset.hash) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "SHA-256 ресурса не совпадает с байтами." };
+      } catch { return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось проверить SHA-256 ресурса." }; }
+      if (signal?.aborted) return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "Импорт отменён." };
+      if (jobActive()) return busy(command.commandId);
+      if (identity !== expectedIdentity || state.document.revision !== expectedRevision)
+        return { ok: false, id: command.commandId, code: CommandErrorCode.REVISION_CONFLICT, message: "Проект изменился во время подготовки импорта." };
+      const duplicate = state.document.project.assets.find(item => item.hash === asset.hash && item.mediaType === asset.mediaType);
+      if (duplicate) {
+        const existing = assetBytes.get(duplicate.id);
+        if (existing && existing.byteLength === bytes.byteLength && existing.every((value, index) => value === bytes[index]))
+          return { ok: true, id: command.commandId, project: structuredClone(state.document.project) as Project, revision: expectedRevision,
+            patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
+      }
+      if (state.document.project.assets.some(item => item.id === asset.id))
+        return { ok: false, id: command.commandId, code: CommandErrorCode.INVALID_COMMAND, message: "ID ресурса уже занят." };
+      try {
+        const nextAssets = assetBytes.fork();
+        nextAssets.set(asset.id, bytes);
         const result = bus.executeCommand(command, expectedRevision);
         if (!result.ok) return result;
         assetBytes = nextAssets;
@@ -270,6 +308,7 @@ export function createEditorStore(initialProject: Project): EditorStore {
     readAssetBytes: (id) => assetBytes.get(id),
     getProjectEpoch: () => projectEpoch,
     captureDocument: () => ({ project: structuredClone(state.document.project) as Project, assets: assetBytes.clone(), revision: state.document.revision, identity }),
+    captureImportContext: () => ({ revision: state.document.revision, identity }),
     confirmSaved(revision, expectedIdentity) {
       if (jobActive()) return false;
       if (identity !== expectedIdentity || state.document.revision !== revision) return false;
