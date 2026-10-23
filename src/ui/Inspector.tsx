@@ -3,6 +3,7 @@ import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store
 import type { Node } from "../domain/types";
 import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
 import { BooleanEditor } from "./BooleanEditor";
+import { MaterialInspector } from "./MaterialInspector";
 import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
 
 const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
@@ -122,6 +123,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
           : <p className="panel-hint">{nodes.length > 1 ? "Для нескольких объектов параметры геометрии не редактируются вместе." : nodes[0]?.kind === "group" ? "У группы нет параметров геометрии." : nodes[0]?.kind === "mesh" && nodes[0].meshSource.kind === "editable" ? "Координаты вершин хранятся в редактируемой сетке." : "Геометрия импортированного GLB доступна только для просмотра."}</p>}
         {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
+      <MaterialInspector store={store} state={state} />
       {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}

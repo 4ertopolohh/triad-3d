@@ -1,0 +1,132 @@
+import { useEffect, useRef, useState } from "react";
+import type { EditorState, EditorStore } from "../app/editor-store";
+import { captureMaterialEdit, editMaterial, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import { materialNodeReason } from "../app/material-actions";
+import { isJobActive } from "../app/job-controller";
+import { materialPresets } from "../materials/presets";
+import { linearToHex, parseHexColor } from "../materials/color";
+
+const format = (value: number) => String(Number(value.toPrecision(12)));
+const scalarFields = [
+  { key: "metalness", label: "Металличность", min: 0, max: 1, step: .001 },
+  { key: "roughness", label: "Шероховатость", min: 0, max: 1, step: .001 },
+  { key: "opacity", label: "Непрозрачность", min: 0, max: 1, step: .001 },
+  { key: "transmission", label: "Пропускание света", min: 0, max: 1, step: .001 },
+  { key: "ior", label: "Преломление (IOR)", min: 1, max: 2.333, step: .001 },
+  { key: "clearcoat", label: "Лаковое покрытие", min: 0, max: 1, step: .001 },
+  { key: "envIntensity", label: "Интенсивность окружения", min: 0, max: 5, step: .01 },
+] as const;
+
+export function MaterialInspector({ store, state }: { store: EditorStore; state: EditorState }) {
+  const [mode, setMode] = useState<MaterialEditMode>("unique");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const session = useRef<{ context: MaterialEditContext; groupId: string; changed: boolean; field: string } | null>(null);
+  const skipBlur = useRef(false);
+  const epoch = store.getProjectEpoch();
+  const selection = state.selection.ids.join("\0");
+  useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
+
+  const node = state.selection.ids.length === 1 ? state.document.project.nodes.find(item => item.id === state.selection.activeId) : null;
+  const slot = node?.kind === "mesh" && node.materialSlots.length === 1 ? node.materialSlots[0] : null;
+  const material = state.document.project.materials.find(item => item.id === slot?.materialId);
+  const users = material ? materialUsage(store, material.id) : [];
+  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId)).find(Boolean) : null;
+  const reason = !node ? state.selection.ids.length > 1 ? "Несколько объектов: массовое редактирование материалов пока недоступно." : "Выберите Mesh с материалом."
+    : node.kind !== "mesh" ? "У группы нет редактируемого материала."
+    : node.meshSource.kind === "asset" ? "Внутренние материалы GLB доступны только для просмотра до поддержки отдельных слотов."
+    : !slot ? "Назначьте материал из библиотеки слева."
+    : !material ? "Назначенный материал не найден."
+    : isJobActive(state.job.status) ? "Дождитесь завершения операции."
+    : state.tool.mode !== "model" ? "В режиме «Сцена» свойства модели доступны только для просмотра."
+    : materialNodeReason(store, node.id) || sharedBlock || "";
+  const preset = materialPresets.find(item => item.name === material?.name);
+  const canEdit = !!material && !reason;
+
+  function start(field: string) {
+    const context = captureMaterialEdit(store, mode);
+    session.current = context ? { context, groupId: crypto.randomUUID(), changed: false, field } : null;
+    setError("");
+  }
+  function apply(field: MaterialField, value: number | readonly number[], grouped = false) {
+    if (!canEdit) return;
+    if (!session.current || session.current.field !== field) start(field);
+    const active = session.current;
+    if (!active) return;
+    const result = editMaterial(store, active.context, field, value, grouped ? active.groupId : undefined);
+    if (!result.ok) { setError(result.message); return; }
+    if (result.changed) {
+      active.changed = true;
+      active.context.revision = result.revision;
+      const updated = store.getSnapshot().document.project.nodes.find(item => item.id === active.context.nodeId);
+      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots[0]?.materialId ?? active.context.materialId;
+    }
+    setError("");
+    if (!grouped) session.current = null;
+  }
+  function finish() { session.current = null; setEditing(null); }
+  function escapeInput(target: HTMLInputElement) { skipBlur.current = true; finish(); target.blur(); }
+  function shouldSkipBlur() { if (!skipBlur.current) return false; skipBlur.current = false; return true; }
+  function cancel() {
+    const active = session.current;
+    if (active?.changed) {
+      const current = store.getSnapshot();
+      const result = store.cancelGesture(active.groupId, current.document.revision);
+      if (!result.ok) setError(result.message);
+    }
+    finish();
+  }
+  function commitNumber(field: MaterialField) {
+    const raw = draft.trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value)) { setError("Введите конечное число."); finish(); return; }
+    apply(field, value);
+    finish();
+  }
+  function reset(field: MaterialField) {
+    if (!preset) return;
+    start(field);
+    apply(field, preset.material[field]);
+  }
+  function colorRow(field: "baseColor" | "emissive", label: string) {
+    if (!material) return null;
+    const color = material[field];
+    const hex = linearToHex(color);
+    const colorKey = `${field}-hex`;
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-color-line"><input type="color" aria-label={`${label}: палитра sRGB`} value={hex ?? "#ffffff"} disabled={!canEdit} onChange={event => { const parsed = parseHexColor(event.target.value); if (parsed) apply(field, parsed); }} />
+        <label>HEX sRGB<input type="text" aria-label={`${label}: HEX sRGB`} value={editing === colorKey ? draft : hex ?? ""} placeholder={hex ? undefined : "HDR"} disabled={!canEdit} onFocus={() => { start(field); setEditing(colorKey); setDraft(hex ?? ""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== colorKey) return; const parsed = parseHexColor(draft); if (parsed) apply(field, parsed); else if (draft !== (hex ?? "")) setError("HEX должен содержать # и шесть цифр."); finish(); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+      {!hex && <p className="panel-hint">Цвет содержит HDR-компоненты. Палитра sRGB не показывает их точно; используйте числовые поля.</p>}
+      <div className="inspector-vector">{(["R", "G", "B"] as const).map((channel, index) => {
+        const key = `${field}-${index}`;
+        return <label key={key}>{channel} · linear<input type="text" inputMode="decimal" aria-label={`${label} ${channel} Linear-sRGB`} value={editing === key ? draft : format(color[index]!)} disabled={!canEdit} onFocus={() => { start(field); setEditing(key); setDraft(format(color[index]!)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === key) { const raw = draft.trim(); const value = Number(raw); if (raw && Number.isFinite(value)) apply(field, color.map((entry, i) => i === index ? value : entry)); else setError("Введите конечное число."); finish(); } }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+      })}</div>
+    </div>;
+  }
+  function scalarRow(spec: typeof scalarFields[number]) {
+    if (!material) return null;
+    const field = spec.key;
+    const value = material[field];
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{spec.label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-scalar-line"><input type="range" aria-label={`${spec.label}: слайдер`} min={spec.min} max={spec.max} step={spec.step} value={Math.min(spec.max, value)} disabled={!canEdit} onPointerDown={() => start(field)} onChange={event => apply(field, Number(event.target.value), true)} onPointerUp={finish} onKeyDown={event => { event.stopPropagation(); if (event.key === "Escape") { event.preventDefault(); cancel(); } else if (!session.current) start(field); }} onKeyUp={finish} />
+        <label><span className="sr-only">{spec.label}: точное значение</span><input type="text" inputMode="decimal" aria-label={`${spec.label}: точное значение`} value={editing === field ? draft : format(value)} disabled={!canEdit} onFocus={() => { start(field); setEditing(field); setDraft(format(value)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === field) commitNumber(field); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+    </div>;
+  }
+  return <section className="material-inspector" aria-label="Материал"><h4>Материал</h4>
+    {material && <strong>{material.name}</strong>}
+    {users.length > 1 && <><p className="panel-hint">Материал используется несколькими объектами ({users.length} слотов).</p><fieldset className="material-mode"><legend>Редактировать</legend><label><input type="radio" checked={mode === "unique"} onChange={() => { setMode("unique"); finish(); }} /> Только выбранный объект</label><label><input type="radio" checked={mode === "shared"} onChange={() => { setMode("shared"); finish(); }} /> Все объекты с этим материалом</label></fieldset></>}
+    {reason && <p className="panel-hint">{reason}</p>}
+    {material && <>
+      <div className="material-fields"><h4>Основные</h4>{colorRow("baseColor", "Базовый цвет")}{scalarFields.slice(0, 3).map(scalarRow)}</div>
+      <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
+      {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
+      {material.textureAssetIds.length > 0 && <p className="material-warning">Ссылки на текстуры сохранены, но текущий renderer их не отображает и Inspector не редактирует.</p>}
+      {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}
+      {preset && <p className="panel-hint">Сброс использует одноимённый встроенный пресет как ориентир, без подтверждения происхождения материала.</p>}
+    </>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </section>;
+}
