@@ -1,12 +1,13 @@
 import Ajv2020 from "ajv/dist/2020.js";
-import documentSchema from "./schemas/document-v1.2.schema.json";
+import documentSchema from "./schemas/document-v1.3.schema.json";
+import v12DocumentSchema from "./schemas/document-v1.2.schema.json";
 import previousDocumentSchema from "./schemas/document-v1.1.schema.json";
 import oldDocumentSchema from "./schemas/document-v1.schema.json";
 import manifestSchema from "./schemas/manifest-v1.schema.json";
 import type { Project } from "./types";
 import { validateProject } from "./validate-project";
 
-export const DOCUMENT_SCHEMA_VERSION = "1.2.0";
+export const DOCUMENT_SCHEMA_VERSION = "1.3.0";
 export const NATIVE_FORMAT_VERSION = "1.0.0";
 export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
 
@@ -34,6 +35,7 @@ export interface DocumentMigration {
 
 const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
 const documentValidator = ajv.compile(documentSchema);
+const v12DocumentValidator = ajv.compile(v12DocumentSchema);
 const previousDocumentValidator = ajv.compile(previousDocumentSchema);
 const oldDocumentValidator = ajv.compile(oldDocumentSchema);
 const manifestValidator = ajv.compile(manifestSchema);
@@ -110,6 +112,9 @@ const builtinMigrations: readonly DocumentMigration[] = [{ from: "1.0.0", to: "1
 } }, { from: "1.1.0", to: "1.2.0", migrate(input) {
   if (!previousDocumentValidator(input)) throw new Error("Invalid v1.1 document");
   return { ...(input as Record<string, unknown>), schemaVersion: "1.2.0" };
+} }, { from: "1.2.0", to: "1.3.0", migrate(input) {
+  if (!v12DocumentValidator(input)) throw new Error("Invalid v1.2 document");
+  return { ...(input as Record<string, unknown>), schemaVersion: "1.3.0" };
 } }];
 
 export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {

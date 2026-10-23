@@ -1,10 +1,10 @@
 import type { EditorStore } from "./editor-store";
-import type { Material } from "../domain/types";
+import type { BaseColorProjection, Material } from "../domain/types";
 import type { ProjectCommand } from "../domain/command-bus";
 import { validateMaterial } from "../domain/validate-material";
 import { materialNodeReason } from "./material-actions";
 
-export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots">;
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings">;
 export type MaterialEditMode = "unique" | "shared";
 export interface MaterialEditContext {
   epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
@@ -31,8 +31,11 @@ export function editMaterial(store: EditorStore, context: MaterialEditContext, f
 export function editBaseColorTexture(store: EditorStore, context: MaterialEditContext, assetId?: string): MaterialEditResult {
   return applyMaterialEdit(store, context, { kind: "texture", assetId });
 }
+export function editBaseColorProjection(store: EditorStore, context: MaterialEditContext, projection: BaseColorProjection): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "projection", projection });
+}
 
-function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined }, groupId?: string): MaterialEditResult {
+function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection }, groupId?: string): MaterialEditResult {
   const state = store.getSnapshot();
   if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
     || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
@@ -45,13 +48,27 @@ function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, cha
     return { ok: false, message: "Назначение материала изменилось. Повторите действие." };
   const source = project.materials.find(item => item.id === context.materialId);
   if (!source) return { ok: false, message: "Материал больше не существует." };
+  if (change.kind === "projection") {
+    const problems = validateMaterial({ ...source, textureMappings: { baseColor: change.projection } });
+    if (problems.length) return { ok: false, message: problems[0]!.message };
+  }
   const users = materialUsage(store, source.id);
   if (context.mode === "shared") for (const user of users) {
     const access = materialNodeReason(store, user.nodeId);
     if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
   }
+  if (change.kind === "projection" && change.projection.mode === "uv" && (!source.textureMappings?.baseColor || source.textureMappings.baseColor.mode === "uv"))
+    return { ok: true, revision: context.revision, changed: false };
   const next = structuredClone(source) as Material;
-  if (change.kind === "texture") {
+  if (change.kind === "projection") {
+    // Historical UV has no stored configuration. Treat explicit UV as the same state.
+    if (change.projection.mode === "uv") {
+      if (next.textureMappings) {
+        delete next.textureMappings.baseColor;
+        if (!Object.keys(next.textureMappings).length) delete next.textureMappings;
+      }
+    } else next.textureMappings = { ...next.textureMappings, baseColor: change.projection };
+  } else if (change.kind === "texture") {
     const assetId = change.assetId;
     if (assetId !== undefined) {
       if (!assetId.trim()) return { ok: false, message: "ID ресурса должен быть непустым." };

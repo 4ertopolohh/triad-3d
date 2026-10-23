@@ -9,6 +9,7 @@ import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
 import { createPhysicalMaterial } from "./pbr-material";
 import { BaseColorTextures } from "./base-color-textures";
+import { ProjectionGeometry } from "./planar-projection";
 
 export type RenderProject = DeepReadonly<Project>;
 export type AssetReader = (id: string) => Uint8Array | undefined;
@@ -65,17 +66,19 @@ export class SceneSync {
   private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
   private closed = false;
   private textures = new BaseColorTextures(() => this.emit());
+  private projection = new ProjectionGeometry();
   private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
   private readAsset: AssetReader = () => undefined;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string): T.MeshPhysicalMaterial {
+  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): T.MeshPhysicalMaterial {
     const material = ownedMaterial(value);
     const id = value?.textureSlots?.baseColor;
     if (!id) return material;
+    if (imported && value?.textureMappings?.baseColor?.mode === "planar") { this.diagnostics.push(`${name}: плоская проекция для импортированного GLB недоступна.`); return material; }
     if (!geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
     const asset = this.assets.get(id);
     if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) { this.diagnostics.push(`${name}: ресурс основного цвета недоступен или имеет неподдерживаемый формат.`); return material; }
-    this.textures.bind(material, asset, this.readAsset);
+    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode === "planar");
     return material;
   }
   private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); disposeObject(content); }
@@ -125,7 +128,13 @@ export class SceneSync {
       if (key === entry.key) continue;
       const sourceKey = JSON.stringify([source, asset]);
       if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
-        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
+        if (source?.kind !== "asset") entry.content.traverse(object => { if (object instanceof T.Mesh) this.projection.apply(object.geometry, materials[0]?.textureMappings?.baseColor); });
+        if (this.derived.has(node.id)) {
+          const warnings = (this.modifierDiagnostics.get(node.id) ?? []).filter(message => !message.includes("у результата модификатора нет UV"));
+          if (materials[0]?.textureSlots?.baseColor && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
+          if (warnings.length) this.modifierDiagnostics.set(node.id, warnings); else this.modifierDiagnostics.delete(node.id);
+        }
+        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, source?.kind === "asset"), material => this.textures.release(material));
         entry.key = key;
         continue;
       }
@@ -141,6 +150,7 @@ export class SceneSync {
       try {
         if (source.kind === "primitive" || source.kind === "editable") {
           const geometry = source.kind === "primitive" ? primitiveGeometry(source) : editableGeometry(source);
+          this.projection.apply(geometry, materials[0]?.textureMappings?.baseColor);
           assign(new T.Mesh(geometry, this.makeMaterial(materials[0], geometry, node.name)));
         }
         else {
@@ -150,7 +160,7 @@ export class SceneSync {
           next.loading = true;
           void this.decoder(bytes).then(content => {
             // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, true), material => this.textures.release(material));
             assign(content);
           }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
         }
@@ -188,6 +198,7 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
+        this.projection.apply(geometry, this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor);
         content = new T.Mesh(geometry, this.makeMaterial(this.nodeMaterials.get(nodeId), geometry, nodeId));
       }
       if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); delete entry.content; }

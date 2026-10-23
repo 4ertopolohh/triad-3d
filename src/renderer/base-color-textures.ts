@@ -9,8 +9,8 @@ export class BaseColorTextures {
   private owners = new Map<T.MeshPhysicalMaterial, string>();
   constructor(private changed: () => void) {}
 
-  bind(material: T.MeshPhysicalMaterial, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined): void {
-    const key = `${asset.id}:${asset.hash}`;
+  bind(material: T.MeshPhysicalMaterial, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined, repeat = false): void {
+    const key = `${asset.id}:${asset.hash}:${repeat ? "repeat" : "default"}`;
     let entry = this.entries.get(key);
     if (!entry) {
       entry = { users: new Set() };
@@ -25,6 +25,7 @@ export class BaseColorTextures {
           if (this.entries.get(key) !== current || !current.users.size) { bitmap.close(); return; }
           const texture = new T.Texture(bitmap);
           texture.colorSpace = T.SRGBColorSpace;
+          if (repeat) texture.wrapS = texture.wrapT = T.RepeatWrapping;
           texture.needsUpdate = true;
           texture.userData.triadSharedTexture = true;
           current.bitmap = bitmap; current.texture = texture;

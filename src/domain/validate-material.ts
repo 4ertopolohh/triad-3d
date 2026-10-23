@@ -10,7 +10,7 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
   }
   const material = value as Record<string, unknown>;
   const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
-  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots")) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots" && key !== "textureMappings")) add("", "Структура материала содержит отсутствующие или лишние поля.");
   for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
   for (const field of ["baseColor", "emissive"] as const) {
     const color = material[field];
@@ -34,6 +34,25 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
     const slots = material.textureSlots;
     if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => key !== "baseColor")) add("textureSlots", "Неизвестный канал текстуры.");
     else if ("baseColor" in slots && (typeof (slots as Record<string, unknown>).baseColor !== "string" || !(slots as { baseColor: string }).baseColor.trim())) add("textureSlots.baseColor", "ID текстуры должен быть непустой строкой.");
+  }
+  if (material.textureMappings !== undefined) {
+    const mappings = material.textureMappings;
+    if (!mappings || typeof mappings !== "object" || Array.isArray(mappings) || Object.keys(mappings).some(key => key !== "baseColor")) add("textureMappings", "Неизвестный канал проекции.");
+    else if ("baseColor" in mappings) {
+      const projection = (mappings as Record<string, unknown>).baseColor;
+      if (!projection || typeof projection !== "object" || Array.isArray(projection)) add("textureMappings.baseColor", "Некорректная проекция.");
+      else {
+        const config = projection as Record<string, unknown>;
+        if (config.mode === "uv") {
+          if (Object.keys(config).some(key => key !== "mode")) add("textureMappings.baseColor", "Режим UV не принимает параметры проекции.");
+        } else if (config.mode === "planar") {
+          if (Object.keys(config).some(key => !["mode", "axis", "tiling", "offset"].includes(key)) || !["x", "y", "z"].includes(config.axis as string)) add("textureMappings.baseColor", "Некорректная ось или поля проекции.");
+          const pair = (value: unknown, positive: boolean) => Array.isArray(value) && value.length === 2 && value.every(number => typeof number === "number" && Number.isFinite(number) && (positive ? number > 0 && number <= 1024 : Math.abs(number) <= 100000));
+          if (!pair(config.tiling, true)) add("textureMappings.baseColor.tiling", "Повторение должно содержать два конечных положительных числа не больше 1024.");
+          if (!pair(config.offset, false)) add("textureMappings.baseColor.offset", "Смещение должно содержать два конечных числа по модулю не больше 100000.");
+        } else add("textureMappings.baseColor.mode", "Неизвестный режим проекции.");
+      }
+    }
   }
   return issues;
 }

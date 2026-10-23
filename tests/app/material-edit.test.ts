@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createEditorStore } from "../../src/app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture } from "../../src/app/material-edit";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection } from "../../src/app/material-edit";
 import { materialPresets } from "../../src/materials/presets";
 import { linearToHex, parseHexColor } from "../../src/materials/color";
 import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
@@ -28,6 +28,32 @@ function setup() {
 }
 
 describe("material editing", () => {
+  it("changes projection atomically with copy-on-write, no-op, undo and native round-trip", async () => {
+    const store = setup();
+    const planar = { mode: "planar" as const, axis: "y" as const, tiling: [2, 3] as const, offset: [-.5, 1] as const };
+    const before = store.getSnapshot();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, { ...planar, tiling: [0, 1] }).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, planar)).toMatchObject({ ok: true, changed: true });
+    const project = store.captureDocument().project;
+    const id = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(id).not.toBe("shared-material");
+    expect(project.materials.find(material => material.id === id)?.textureMappings?.baseColor).toEqual(planar);
+    expect(project.materials.find(material => material.id === "shared-material")?.textureMappings).toBeUndefined();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, planar)).toMatchObject({ ok: true, changed: false });
+    const archive = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const reopened = await openNativeProjectArchive(archive.value);
+      expect(reopened.ok).toBe(true);
+      if (reopened.ok) expect(reopened.value.project.materials.find(material => material.id === id)?.textureMappings?.baseColor).toEqual(planar);
+    }
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, { mode: "uv" })).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials.find(material => material.id === id)?.textureMappings).toBeUndefined();
+  });
   it("assigns, replaces and removes a raster map with copy-on-write and native round-trip", async () => {
     const store = setup();
     const bytes = new Uint8Array([1, 2, 3]);

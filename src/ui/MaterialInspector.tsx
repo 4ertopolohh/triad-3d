@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { EditorState, EditorStore } from "../app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import type { BaseColorProjection } from "../domain/types";
 import { materialNodeReason } from "../app/material-actions";
 import { isJobActive } from "../app/job-controller";
 import { materialPresets } from "../materials/presets";
@@ -47,6 +48,17 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   const selectedTexture = material?.textureSlots?.baseColor;
   const selectedAsset = state.document.project.assets.find(asset => asset.id === selectedTexture);
   const missingUv = node?.kind === "mesh" && node.meshSource.kind === "editable" && !node.meshSource.uv;
+  const projection: BaseColorProjection = material?.textureMappings?.baseColor ?? { mode: "uv" };
+  function setProjection(value: BaseColorProjection) {
+    if (!canEdit) return;
+    const context = captureMaterialEdit(store, mode);
+    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
+    const result = editBaseColorProjection(store, context, value);
+    setError(result.ok ? "" : result.message);
+  }
+  function projectionNumber(label: string, value: number, change: (number: number) => BaseColorProjection) {
+    return <label key={label}>{label}<input type="text" inputMode="decimal" aria-label={label} value={editing === label ? draft : format(value)} disabled={!canEdit} onFocus={() => { setEditing(label); setDraft(format(value)); setError(""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== label) return; const raw = draft.trim(); const number = Number(raw); if (raw && Number.isFinite(number)) setProjection(change(number)); else setError("Введите конечное число."); setEditing(null); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+  }
   function setTexture(assetId?: string) {
     if (!canEdit) return;
     const context = captureMaterialEdit(store, mode);
@@ -140,7 +152,11 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
         </select></label>
         {selectedAsset && <p className="panel-hint">{selectedAsset.path} · {selectedAsset.id}</p>}
         <button type="button" disabled={!canEdit || !selectedTexture} title={reason || undefined} onClick={() => setTexture()}>Снять текстуру</button>
-        {missingUv && selectedTexture && <p className="material-warning">У геометрии нет UV; текстура не отображается.</p>}
+        <label>Проекция текстуры<select aria-label="Проекция текстуры" value={projection.mode} disabled={!canEdit} onChange={event => setProjection(event.target.value === "planar" ? { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0] } : { mode: "uv" })}><option value="uv">UV</option><option value="planar">Плоскость</option></select></label>
+        {projection.mode === "planar" && <><label>Ось проекции<select aria-label="Ось проекции" value={projection.axis} disabled={!canEdit} onChange={event => setProjection({ ...projection, axis: event.target.value as "x" | "y" | "z" })}><option value="x">X</option><option value="y">Y</option><option value="z">Z</option></select></label>
+          <div className="inspector-vector">{projectionNumber("Повторение U", projection.tiling[0], number => ({ ...projection, tiling: [number, projection.tiling[1]] }))}{projectionNumber("Повторение V", projection.tiling[1], number => ({ ...projection, tiling: [projection.tiling[0], number] }))}{projectionNumber("Смещение U", projection.offset[0], number => ({ ...projection, offset: [number, projection.offset[1]] }))}{projectionNumber("Смещение V", projection.offset[1], number => ({ ...projection, offset: [projection.offset[0], number] }))}</div></>}
+        {missingUv && selectedTexture && projection.mode === "uv" && <p className="material-warning">У геометрии нет UV; текстура не отображается. Выберите «Плоскость» для проекции.</p>}
+        {selectedTexture && !store.readAssetBytes(selectedTexture) && <p className="material-warning">Байты текстуры недоступны в памяти.</p>}
       </div>
       <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
       {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}

@@ -123,9 +123,11 @@ export interface Material {
   envIntensity: number;
   textureAssetIds: EntityId[];
   textureSlots?: MaterialTextureSlots;
+  textureMappings?: { baseColor?: BaseColorProjection };
 }
 
 export interface MaterialTextureSlots { baseColor?: EntityId }
+export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] };
 
 export interface Asset {
   id: EntityId;
