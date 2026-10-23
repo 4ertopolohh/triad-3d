@@ -74,14 +74,14 @@ export class SceneSync {
     const material = ownedMaterial(value);
     const id = value?.textureSlots?.baseColor;
     if (!id) return material;
-    if (imported && value?.textureMappings?.baseColor?.mode === "planar") { this.diagnostics.push(`${name}: плоская проекция для импортированного GLB недоступна.`); return material; }
+    if (imported && value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv") { this.diagnostics.push(`${name}: проекция для импортированного GLB недоступна.`); return material; }
     if (!geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
     const asset = this.assets.get(id);
     if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) { this.diagnostics.push(`${name}: ресурс основного цвета недоступен или имеет неподдерживаемый формат.`); return material; }
-    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode === "planar");
+    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode !== undefined && value.textureMappings.baseColor.mode !== "uv");
     return material;
   }
-  private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); disposeObject(content); }
+  private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); content.traverse(object => { if (object instanceof T.Mesh) this.projection.releaseMesh(object); }); disposeObject(content); }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
     if (this.closed) return;
     if (this.projectId !== project.id || this.epoch !== epoch) { this.clear(); this.projectId = project.id; this.epoch = epoch; this.cameraKey = ""; }
@@ -128,7 +128,18 @@ export class SceneSync {
       if (key === entry.key) continue;
       const sourceKey = JSON.stringify([source, asset]);
       if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
-        if (source?.kind !== "asset") entry.content.traverse(object => { if (object instanceof T.Mesh) this.projection.apply(object.geometry, materials[0]?.textureMappings?.baseColor); });
+        if (source?.kind !== "asset") {
+          let projectionFailed = false;
+          const meshes: T.Mesh[] = [];
+          entry.content.traverse(object => { if (object instanceof T.Mesh) meshes.push(object); });
+          const mapping = materials[0]?.textureMappings?.baseColor;
+          const replaceGeometry = meshes.some(mesh => this.projection.needsUpdate(mesh, mapping) && this.projection.replacesGeometry(mesh, mapping));
+          if (replaceGeometry) this.surfaces.release(entry.content);
+          try { for (const mesh of meshes) this.projection.applyMesh(mesh, mapping); }
+          catch (error) { projectionFailed = true; this.diagnostics.push(`${node.name}: ${error instanceof Error ? error.message : "Ошибка проекции."}`); }
+          finally { if (replaceGeometry) this.surfaces.register(node.id, entry.object, entry.content); }
+          if (projectionFailed) continue;
+        }
         if (this.derived.has(node.id)) {
           const warnings = (this.modifierDiagnostics.get(node.id) ?? []).filter(message => !message.includes("у результата модификатора нет UV"));
           if (materials[0]?.textureSlots?.baseColor && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
@@ -150,8 +161,11 @@ export class SceneSync {
       try {
         if (source.kind === "primitive" || source.kind === "editable") {
           const geometry = source.kind === "primitive" ? primitiveGeometry(source) : editableGeometry(source);
-          this.projection.apply(geometry, materials[0]?.textureMappings?.baseColor);
-          assign(new T.Mesh(geometry, this.makeMaterial(materials[0], geometry, node.name)));
+          const content = new T.Mesh(geometry);
+          try { this.projection.applyMesh(content, materials[0]?.textureMappings?.baseColor); }
+          catch (error) { this.diagnostics.push(`${node.name}: ${error instanceof Error ? error.message : "Ошибка проекции."}`); }
+          content.material = this.makeMaterial(materials[0], content.geometry, node.name);
+          assign(content);
         }
         else {
           if (!asset || asset.mediaType !== "model/gltf-binary") throw new Error("Ресурс GLB отсутствует или имеет неподдерживаемый тип.");
@@ -198,14 +212,15 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
-        this.projection.apply(geometry, this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor);
-        content = new T.Mesh(geometry, this.makeMaterial(this.nodeMaterials.get(nodeId), geometry, nodeId));
+        content = new T.Mesh(geometry);
+        this.projection.applyMesh(content, this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor);
+        content.material = this.makeMaterial(this.nodeMaterials.get(nodeId), content.geometry, nodeId);
       }
       if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); delete entry.content; }
       if (content) { entry.object.add(content); entry.content = content; this.surfaces.register(nodeId, entry.object, content); }
       else geometry.dispose();
       this.derived.add(nodeId);
-      this.setModifierDiagnostics(nodeId, this.nodeMaterials.get(nodeId)?.textureSlots?.baseColor && !geometry.getAttribute("uv")
+      this.setModifierDiagnostics(nodeId, this.nodeMaterials.get(nodeId)?.textureSlots?.baseColor && !content?.geometry.getAttribute("uv")
         ? [...diagnostics, "у результата модификатора нет UV; текстура основного цвета не отображается."] : diagnostics);
     } catch (error) { if (content) this.disposeContent(content); else geometry.dispose(); throw error; }
   }

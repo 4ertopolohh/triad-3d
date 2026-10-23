@@ -93,6 +93,7 @@ src/
     schemas/
       document-v1.1.schema.json
       document-v1.2.schema.json
+      document-v1.3.schema.json
       document-v1.schema.json
       manifest-v1.schema.json
     command-bus.ts
@@ -138,6 +139,7 @@ src/
     material-preview.ts
     modifier-preview.ts
     pbr-material.ts
+    planar-projection.ts
     primitive.ts
     scene-sync.ts
     sub-element-picking.ts
@@ -230,6 +232,7 @@ tests/
     adapter.test.ts
     displace-brush-interactions.test.ts
     modifier-preview.test.ts
+    planar-projection.test.ts
     primitives.test.ts
     scene-sync.test.ts
     sub-element-edit.test.ts
@@ -5542,6 +5545,863 @@ export async function prepareImageAsset(file: File, decoder: Decoder = browserIm
 }
 </file>
 
+<file path="src/domain/schemas/document-v1.3.schema.json">
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://triad-3d.local/schemas/document-v1.3.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "model",
+    "scene",
+    "nodes",
+    "modifiers",
+    "materials",
+    "assets",
+    "animations",
+    "tracks",
+    "keyframes"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1.3.0"
+    },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
+    "name": {
+      "type": "string"
+    },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
+    "scene": {
+      "$ref": "#/$defs/scene"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/node"
+      }
+    },
+    "modifiers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/modifier"
+      }
+    },
+    "materials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/material"
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/asset"
+      }
+    },
+    "animations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/animation"
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/track"
+      }
+    },
+    "keyframes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/keyframe"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "number": {
+      "type": "number"
+    },
+    "vec3": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        }
+      ],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "quat": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "$ref": "#/$defs/number"
+        }
+      ],
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "transform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position",
+        "rotationQuat",
+        "scale"
+      ],
+      "properties": {
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "rotationQuat": {
+          "$ref": "#/$defs/quat"
+        },
+        "scale": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rootNodeId",
+        "revision"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "rootNodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projection",
+        "position",
+        "target",
+        "fovDegrees",
+        "near",
+        "far"
+      ],
+      "properties": {
+        "projection": {
+          "const": "perspective"
+        },
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "target": {
+          "$ref": "#/$defs/vec3"
+        },
+        "fovDegrees": {
+          "$ref": "#/$defs/number"
+        },
+        "near": {
+          "$ref": "#/$defs/number"
+        },
+        "far": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "background": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "color",
+        "intensity"
+      ],
+      "properties": {
+        "color": {
+          "$ref": "#/$defs/vec3"
+        },
+        "environmentAssetId": {
+          "$ref": "#/$defs/id"
+        },
+        "intensity": {
+          "$ref": "#/$defs/number"
+        }
+      }
+    },
+    "light": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "color",
+        "intensity",
+        "position",
+        "target"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "ambient",
+            "directional",
+            "point",
+            "spot"
+          ]
+        },
+        "color": {
+          "$ref": "#/$defs/vec3"
+        },
+        "intensity": {
+          "$ref": "#/$defs/number"
+        },
+        "position": {
+          "$ref": "#/$defs/vec3"
+        },
+        "target": {
+          "$ref": "#/$defs/vec3"
+        }
+      }
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "modelId",
+        "transform",
+        "visible"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "modelId": {
+          "$ref": "#/$defs/id"
+        },
+        "transform": {
+          "$ref": "#/$defs/transform"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "scene": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "camera",
+        "background",
+        "lights",
+        "instances"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "camera": {
+          "$ref": "#/$defs/camera"
+        },
+        "background": {
+          "$ref": "#/$defs/background"
+        },
+        "lights": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/light"
+          }
+        },
+        "instances": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/instance"
+          }
+        }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "materialId"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "materialId": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "nodeBase": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "parentId",
+        "children",
+        "transform",
+        "visible",
+        "locked",
+        "materialSlots",
+        "modifierIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "group",
+            "mesh"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parentId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "transform": {
+          "$ref": "#/$defs/transform"
+        },
+        "visible": {
+          "type": "boolean"
+        },
+        "locked": {
+          "type": "boolean"
+        },
+        "materialSlots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/slot"
+          }
+        },
+        "modifierIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "meshSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "primitive",
+            "parameters"
+          ],
+          "properties": {
+            "kind": {
+              "const": "primitive"
+            },
+            "primitive": {
+              "enum": [
+                "cube",
+                "sphere",
+                "torus",
+                "cylinder",
+                "cone",
+                "plane"
+              ]
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/number"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "assetId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "asset"
+            },
+            "assetId": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        },
+        {
+          "required": [
+            "kind",
+            "positions",
+            "indices"
+          ],
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "editable"
+            },
+            "indices": {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "uv": {
+              "items": {
+                "$ref": "#/$defs/number"
+              },
+              "type": "array"
+            },
+            "positions": {
+              "items": {
+                "$ref": "#/$defs/number"
+              },
+              "type": "array"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "node": {
+      "oneOf": [
+        {
+          "type": "object",
+          "allOf": [
+            {
+              "$ref": "#/$defs/nodeBase"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "group"
+                }
+              },
+              "required": [
+                "kind"
+              ]
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "type": "object",
+          "allOf": [
+            {
+              "$ref": "#/$defs/nodeBase"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "mesh"
+                },
+                "meshSource": {
+                  "$ref": "#/$defs/meshSource"
+                }
+              },
+              "required": [
+                "kind",
+                "meshSource"
+              ]
+            }
+          ],
+          "unevaluatedProperties": false
+        }
+      ]
+    },
+    "modifierParameter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/number"
+          }
+        }
+      ]
+    },
+    "modifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "nodeId",
+        "kind",
+        "order",
+        "enabled",
+        "version",
+        "parameters"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "nodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "boolean",
+            "mirror",
+            "array",
+            "bend",
+            "twist",
+            "taper",
+            "bevel"
+          ]
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/modifierParameter"
+          }
+        }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "baseColor",
+        "metalness",
+        "roughness",
+        "emissive",
+        "opacity",
+        "transmission",
+        "ior",
+        "clearcoat",
+        "envIntensity",
+        "textureAssetIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "baseColor": {
+          "$ref": "#/$defs/vec3"
+        },
+        "metalness": {
+          "$ref": "#/$defs/number"
+        },
+        "roughness": {
+          "$ref": "#/$defs/number"
+        },
+        "emissive": {
+          "$ref": "#/$defs/vec3"
+        },
+        "opacity": {
+          "$ref": "#/$defs/number"
+        },
+        "transmission": {
+          "$ref": "#/$defs/number"
+        },
+        "ior": {
+          "$ref": "#/$defs/number"
+        },
+        "clearcoat": {
+          "$ref": "#/$defs/number"
+        },
+        "envIntensity": {
+          "$ref": "#/$defs/number"
+        },
+        "textureAssetIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "textureSlots": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseColor": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        },
+        "textureMappings": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "baseColor": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "const": "uv"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "axis",
+                    "tiling",
+                    "offset"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "const": "planar"
+                    },
+                    "axis": {
+                      "enum": [
+                        "x",
+                        "y",
+                        "z"
+                      ]
+                    },
+                    "tiling": {
+                      "type": "array",
+                      "minItems": 2,
+                      "maxItems": 2,
+                      "items": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "maximum": 1024
+                      }
+                    },
+                    "offset": {
+                      "type": "array",
+                      "minItems": 2,
+                      "maxItems": 2,
+                      "items": {
+                        "type": "number",
+                        "minimum": -100000,
+                        "maximum": 100000
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "hash",
+        "mediaType",
+        "path",
+        "colorSpace"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "hash": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "colorSpace": {
+          "enum": [
+            "srgb",
+            "linear",
+            "none"
+          ]
+        }
+      }
+    },
+    "animation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "durationSeconds",
+        "loop",
+        "trackIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "name": {
+          "type": "string"
+        },
+        "durationSeconds": {
+          "$ref": "#/$defs/number"
+        },
+        "loop": {
+          "type": "boolean"
+        },
+        "trackIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "track": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "nodeId",
+        "property",
+        "keyframeIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "nodeId": {
+          "$ref": "#/$defs/id"
+        },
+        "property": {
+          "enum": [
+            "transform.position",
+            "transform.rotationQuat",
+            "transform.scale"
+          ]
+        },
+        "keyframeIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "keyframe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "timeSeconds",
+        "value",
+        "interpolation"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "timeSeconds": {
+          "$ref": "#/$defs/number"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/number"
+            },
+            {
+              "$ref": "#/$defs/vec3"
+            },
+            {
+              "$ref": "#/$defs/quat"
+            }
+          ]
+        },
+        "interpolation": {
+          "enum": [
+            "step",
+            "linear",
+            "bezier"
+          ]
+        }
+      }
+    }
+  }
+}
+</file>
+
 <file path="src/domain/schemas/document-v1.schema.json">
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6890,70 +7750,6 @@ export function matchesPreset(material: DeepReadonly<Material>, preset: Material
 }
 </file>
 
-<file path="src/renderer/base-color-textures.ts">
-import * as T from "three";
-import type { Asset } from "../domain/types";
-
-type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Set<T.MeshPhysicalMaterial>; error?: string; pending?: Promise<void> | undefined };
-
-/** Owned by one SceneSync. Materials borrow textures; the cache alone disposes them. */
-export class BaseColorTextures {
-  private entries = new Map<string, Entry>();
-  private owners = new Map<T.MeshPhysicalMaterial, string>();
-  constructor(private changed: () => void) {}
-
-  bind(material: T.MeshPhysicalMaterial, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined): void {
-    const key = `${asset.id}:${asset.hash}`;
-    let entry = this.entries.get(key);
-    if (!entry) {
-      entry = { users: new Set() };
-      this.entries.set(key, entry);
-      const current = entry;
-      const bytes = read(asset.id);
-      if (!bytes) current.error = `Ресурс ${asset.id}: байты изображения отсутствуют в памяти.`;
-      else current.pending = (async () => {
-        let bitmap: ImageBitmap | undefined;
-        try {
-          bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: asset.mediaType }), { imageOrientation: "flipY" });
-          if (this.entries.get(key) !== current || !current.users.size) { bitmap.close(); return; }
-          const texture = new T.Texture(bitmap);
-          texture.colorSpace = T.SRGBColorSpace;
-          texture.needsUpdate = true;
-          texture.userData.triadSharedTexture = true;
-          current.bitmap = bitmap; current.texture = texture;
-          for (const user of current.users) { user.map = texture; user.needsUpdate = true; }
-        } catch { bitmap?.close(); current.error = `Ресурс ${asset.id}: не удалось декодировать изображение.`; }
-        finally { current.pending = undefined; this.changed(); }
-      })();
-    }
-    entry.users.add(material);
-    this.owners.set(material, key);
-    if (entry.texture) { material.map = entry.texture; material.needsUpdate = true; }
-  }
-
-  release(material: T.Material): void {
-    if (!(material instanceof T.MeshPhysicalMaterial)) return;
-    const key = this.owners.get(material);
-    if (!key) return;
-    this.owners.delete(material);
-    const entry = this.entries.get(key);
-    if (!entry) return;
-    entry.users.delete(material);
-    material.map = null;
-    if (!entry.users.size) {
-      this.entries.delete(key);
-      entry.texture?.dispose(); entry.bitmap?.close();
-    }
-  }
-
-  releaseObject(root: T.Object3D): void {
-    root.traverse(object => { if (object instanceof T.Mesh) for (const material of Array.isArray(object.material) ? object.material : [object.material]) this.release(material); });
-  }
-  diagnostics(): string[] { return [...this.entries.values()].flatMap(entry => entry.error ? [entry.error] : []); }
-  dispose(): void { for (const material of [...this.owners.keys()]) this.release(material); }
-}
-</file>
-
 <file path="src/renderer/material-preview.ts">
 import * as T from "three";
 import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
@@ -7018,6 +7814,43 @@ export function createPhysicalMaterial(value?: DeepReadonly<Material>): T.MeshPh
   return new T.MeshPhysicalMaterial({ color: new T.Color(...value.baseColor), metalness: value.metalness, roughness: value.roughness,
     emissive: new T.Color(...value.emissive), opacity: value.opacity, transparent: value.transmission === 0 && value.opacity < 1,
     transmission: value.transmission, ior: value.ior, clearcoat: value.clearcoat, envMapIntensity: value.envIntensity });
+}
+</file>
+
+<file path="src/renderer/planar-projection.ts">
+import * as T from "three";
+import type { BaseColorProjection } from "../domain/types";
+
+/** Local coordinates, fixed orientation: X => Z/Y, Y => X/Z, Z => X/Y. */
+export function planarUv(positions: ArrayLike<number>, projection: Extract<BaseColorProjection, { mode: "planar" }>): Float32Array {
+  const result = new Float32Array(positions.length / 3 * 2);
+  const [uAxis, vAxis] = projection.axis === "x" ? [2, 1] : projection.axis === "y" ? [0, 2] : [0, 1];
+  for (let i = 0, j = 0; i < positions.length; i += 3, j += 2) {
+    result[j] = positions[i + uAxis]! * projection.tiling[0] + projection.offset[0];
+    result[j + 1] = positions[i + vAxis]! * projection.tiling[1] + projection.offset[1];
+  }
+  return result;
+}
+
+/** Geometry belongs to SceneSync. Keep authored UV for exact Planar -> UV restoration. */
+export class ProjectionGeometry {
+  private authored = new WeakMap<T.BufferGeometry, T.BufferAttribute | T.InterleavedBufferAttribute | undefined>();
+  apply(geometry: T.BufferGeometry, projection?: BaseColorProjection): void {
+    if (!this.authored.has(geometry)) this.authored.set(geometry, geometry.getAttribute("uv"));
+    const original = this.authored.get(geometry);
+    if (projection?.mode === "planar") {
+      const position = geometry.getAttribute("position");
+      if (!position) return;
+      const positions = new Float32Array(position.count * 3);
+      for (let i = 0; i < position.count; i++) {
+        positions[3 * i] = position.getX(i);
+        positions[3 * i + 1] = position.getY(i);
+        positions[3 * i + 2] = position.getZ(i);
+      }
+      geometry.setAttribute("uv", new T.BufferAttribute(planarUv(positions, projection), 2));
+    } else if (original) geometry.setAttribute("uv", original);
+    else geometry.deleteAttribute("uv");
+  }
 }
 </file>
 
@@ -10260,6 +11093,111 @@ describe("production modifier preview", () => {
 });
 </file>
 
+<file path="tests/renderer/planar-projection.test.ts">
+import { describe, expect, it, vi } from "vitest";
+import * as T from "three";
+import { planarUv, ProjectionGeometry } from "../../src/renderer/planar-projection";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import { createMaterialAnimationProject } from "../fixtures/projects";
+
+describe("baseColor projection", () => {
+  const points = [2, 3, 5, -1, 4, 7, 0, 0, 0];
+  it("uses stable local axes and leaves input unchanged", () => {
+    const before = [...points];
+    expect([...planarUv(points, { mode: "planar", axis: "x", tiling: [2, 3], offset: [1, -1] })]).toEqual([11, 8, 15, 11, 1, -1]);
+    expect([...planarUv(points, { mode: "planar", axis: "y", tiling: [1, 1], offset: [0, 0] })]).toEqual([2, 5, -1, 7, 0, 0]);
+    expect([...planarUv(points, { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0] })]).toEqual([2, 3, -1, 4, 0, 0]);
+    expect(points).toEqual(before);
+  });
+  it("restores authored UV exactly after planar changes", () => {
+    const geometry = new T.BufferGeometry();
+    geometry.setAttribute("position", new T.Float32BufferAttribute(points, 3));
+    const authored = new T.Float32BufferAttribute([.1, .2, .3, .4, .5, .6], 2);
+    geometry.setAttribute("uv", authored);
+    const projection = new ProjectionGeometry();
+    const config = { mode: "planar" as const, axis: "x" as const, tiling: [1, 1] as const, offset: [0, 0] as const };
+    projection.apply(geometry, config);
+    expect([...geometry.getAttribute("uv").array]).toEqual([5, 3, 7, 4, 0, 0]);
+    projection.apply(geometry, config);
+    expect([...geometry.getAttribute("uv").array]).toEqual([5, 3, 7, 4, 0, 0]);
+    projection.apply(geometry, { mode: "uv" });
+    expect(geometry.getAttribute("uv")).toBe(authored);
+    expect([...geometry.getAttribute("position").array]).toEqual(points);
+  });
+  it("projects a UV-less editable mesh, updates without rebuilding, and separates samplers", async () => {
+    const project = createMaterialAnimationProject();
+    const mesh = project.nodes.find(node => node.id === "mesh-node")!;
+    if (mesh.kind !== "mesh") throw new Error("fixture");
+    mesh.meshSource = { kind: "editable", positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], indices: [0, 1, 2] };
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" };
+    project.materials[0]!.textureMappings = { baseColor: { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0] } };
+    const close = vi.fn(); vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue({ close } as unknown as ImageBitmap));
+    try {
+      const sync = new SceneSync(() => {});
+      sync.sync(project, () => new Uint8Array([1]));
+      await Promise.resolve(); await Promise.resolve();
+      const content = sync.objects.get("mesh-node")!.content as T.Mesh;
+      const geometry = content.geometry;
+      expect([...geometry.getAttribute("uv").array]).toEqual([0, 0, 1, 0, 0, 1]);
+      expect((content.material as T.MeshPhysicalMaterial).map?.wrapS).toBe(T.RepeatWrapping);
+      project.materials[0]!.textureMappings!.baseColor = { mode: "planar", axis: "x", tiling: [2, 1], offset: [0, 0] };
+      sync.sync(project, () => new Uint8Array([1]));
+      expect(content.geometry).toBe(geometry);
+      expect([...geometry.getAttribute("uv").array]).toEqual([0, 0, 0, 0, 0, 1]);
+      delete project.materials[0]!.textureMappings;
+      sync.sync(project, () => new Uint8Array([1]));
+      expect(geometry.getAttribute("uv")).toBeUndefined();
+      expect((content.material as T.MeshPhysicalMaterial).map).toBeNull();
+      sync.dispose();
+      expect(close).toHaveBeenCalledOnce();
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("keeps simultaneous UV and Planar samplers independent", async () => {
+    const project = createMaterialAnimationProject();
+    const original = project.nodes.find(node => node.id === "mesh-node")!;
+    const second = structuredClone(original); second.id = "second-mesh";
+    project.nodes.push(second); project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
+    const planar = structuredClone(project.materials[0]!); planar.id = "planar-material";
+    planar.textureMappings = { baseColor: { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0] } };
+    project.materials.push(planar);
+    second.materialSlots = [{ name: "Основной", materialId: planar.id }];
+    project.assets.push({ id: "image", hash: "a".repeat(64), mediaType: "image/png", path: "assets/image.png", colorSpace: "srgb" });
+    project.materials[0]!.textureSlots = { baseColor: "image" }; planar.textureSlots = { baseColor: "image" };
+    const close = vi.fn(); vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue({ close } as unknown as ImageBitmap));
+    try {
+      const sync = new SceneSync(() => {}); sync.sync(project, () => new Uint8Array([1]));
+      await Promise.resolve(); await Promise.resolve();
+      const uvMap = ((sync.objects.get(original.id)!.content as T.Mesh).material as T.MeshPhysicalMaterial).map!;
+      const planarMap = ((sync.objects.get(second.id)!.content as T.Mesh).material as T.MeshPhysicalMaterial).map!;
+      expect(uvMap).not.toBe(planarMap);
+      expect(uvMap.wrapS).toBe(T.ClampToEdgeWrapping);
+      expect(planarMap.wrapS).toBe(T.RepeatWrapping);
+      sync.dispose(); expect(close).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it("projects the current derived mesh and updates it without reevaluation", () => {
+    const project = createMaterialAnimationProject();
+    const sync = new SceneSync(() => {});
+    sync.sync(project, () => undefined);
+    const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    const indices = new Uint32Array([0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3]);
+    sync.setDerived("mesh-node", { positions, indices }, false);
+    const content = sync.objects.get("mesh-node")!.content as T.Mesh;
+    expect(content.geometry.getAttribute("uv")).toBeUndefined();
+    project.materials[0]!.textureMappings = { baseColor: { mode: "planar", axis: "y", tiling: [2, 1], offset: [1, 0] } };
+    sync.sync(project, () => undefined);
+    expect(sync.objects.get("mesh-node")!.content).toBe(content);
+    expect([...content.geometry.getAttribute("uv").array]).toEqual([1, 0, 3, 0, 1, 0, 1, 1]);
+    expect([...positions]).toEqual([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    delete project.materials[0]!.textureMappings;
+    sync.sync(project, () => undefined);
+    expect(content.geometry.getAttribute("uv")).toBeUndefined();
+    sync.dispose();
+  });
+});
+</file>
+
 <file path="tests/renderer/primitives.test.ts">
 import { describe, expect, it, vi } from "vitest";
 import * as T from "three";
@@ -10726,33 +11664,6 @@ describe("Inspector transform operations", () => {
     expect(updatedPrimitiveSource(source, "height", 0).ok).toBe(false);
     expect(updatedPrimitiveSource(source, "size", 5)).toEqual({ ok: true,
       value: { kind: "primitive", primitive: "cube", parameters: { size: 5 } } });
-  });
-});
-</file>
-
-<file path="tests/ui/material-inspector.test.tsx">
-import { describe, expect, it } from "vitest";
-import { renderToStaticMarkup } from "react-dom/server";
-import { createElement } from "react";
-import { createEditorStore } from "../../src/app/editor-store";
-import { MaterialInspector } from "../../src/ui/MaterialInspector";
-import { materialPresets } from "../../src/materials/presets";
-import { createNestedMeshProject } from "../fixtures/projects";
-
-describe("MaterialInspector", () => {
-  it("shows current PBR values without modifying the project on render", () => {
-    const project = createNestedMeshProject();
-    project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", roughness: .123456789, baseColor: [2, .2, .3] });
-    const node = project.nodes.find(item => item.id === "mesh-node")!;
-    node.materialSlots = [{ name: "Основной", materialId: "m" }];
-    const store = createEditorStore(project);
-    store.setSelection([node.id], node.id);
-    const before = store.getSnapshot();
-    const html = renderToStaticMarkup(createElement(MaterialInspector, { store, state: before }));
-    expect(html).toContain("Шероховатость");
-    expect(html).toContain("0.123456789");
-    expect(html).toContain("HDR-компоненты");
-    expect(store.getSnapshot()).toBe(before);
   });
 });
 </file>
@@ -11382,145 +12293,6 @@ export function applyMaterialPresetToNode(store: EditorStore, preset: MaterialPr
 }
 </file>
 
-<file path="src/app/material-edit.ts">
-import type { EditorStore } from "./editor-store";
-import type { Material } from "../domain/types";
-import type { ProjectCommand } from "../domain/command-bus";
-import { validateMaterial } from "../domain/validate-material";
-import { materialNodeReason } from "./material-actions";
-
-export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots">;
-export type MaterialEditMode = "unique" | "shared";
-export interface MaterialEditContext {
-  epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
-}
-export type MaterialEditResult = { ok: true; revision: number; changed: boolean } | { ok: false; message: string };
-
-export function materialUsage(store: EditorStore, materialId: string) {
-  return store.getSnapshot().document.project.nodes.flatMap(node => node.materialSlots.filter(slot => slot.materialId === materialId).map(slot => ({ nodeId: node.id, slotName: slot.name })));
-}
-
-export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode = "unique"): MaterialEditContext | null {
-  const state = store.getSnapshot();
-  const nodeId = state.selection.activeId;
-  if (!nodeId || state.selection.ids.length !== 1) return null;
-  const node = state.document.project.nodes.find(item => item.id === nodeId);
-  if (node?.kind !== "mesh" || node.materialSlots.length !== 1) return null;
-  return { epoch: store.getProjectEpoch(), revision: state.document.revision, nodeId, materialId: node.materialSlots[0]!.materialId, slotName: node.materialSlots[0]!.name, mode };
-}
-
-export function editMaterial(store: EditorStore, context: MaterialEditContext, field: MaterialField, value: number | readonly number[], groupId?: string): MaterialEditResult {
-  return applyMaterialEdit(store, context, { kind: "field", field, value }, groupId);
-}
-
-export function editBaseColorTexture(store: EditorStore, context: MaterialEditContext, assetId?: string): MaterialEditResult {
-  return applyMaterialEdit(store, context, { kind: "texture", assetId });
-}
-
-function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined }, groupId?: string): MaterialEditResult {
-  const state = store.getSnapshot();
-  if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
-    || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
-    return { ok: false, message: "Проект или выбор изменился. Повторите действие." };
-  const reason = materialNodeReason(store, context.nodeId);
-  if (reason) return { ok: false, message: reason };
-  const project = state.document.project;
-  const node = project.nodes.find(item => item.id === context.nodeId);
-  if (node?.kind !== "mesh" || node.materialSlots.length !== 1 || node.materialSlots[0]?.name !== context.slotName || node.materialSlots[0]?.materialId !== context.materialId)
-    return { ok: false, message: "Назначение материала изменилось. Повторите действие." };
-  const source = project.materials.find(item => item.id === context.materialId);
-  if (!source) return { ok: false, message: "Материал больше не существует." };
-  const users = materialUsage(store, source.id);
-  if (context.mode === "shared") for (const user of users) {
-    const access = materialNodeReason(store, user.nodeId);
-    if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
-  }
-  const next = structuredClone(source) as Material;
-  if (change.kind === "texture") {
-    const assetId = change.assetId;
-    if (assetId !== undefined) {
-      if (!assetId.trim()) return { ok: false, message: "ID ресурса должен быть непустым." };
-      const asset = project.assets.find(item => item.id === assetId);
-      if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) return { ok: false, message: "Для основного цвета нужен импортированный PNG, JPEG или WebP." };
-      if (!store.readAssetBytes(assetId)) return { ok: false, message: "Байты изображения отсутствуют в памяти." };
-      next.textureSlots = { ...next.textureSlots, baseColor: assetId };
-    } else if (next.textureSlots) {
-      delete next.textureSlots.baseColor;
-      if (!Object.keys(next.textureSlots).length) delete next.textureSlots;
-    }
-  } else if (change.field === "baseColor" || change.field === "emissive") {
-    const { field, value } = change;
-    if (!Array.isArray(value) || value.length !== 3) return { ok: false, message: "Укажите три компонента цвета." };
-    next[field] = [value[0]!, value[1]!, value[2]!];
-  } else {
-    const { field, value } = change;
-    if (typeof value !== "number") return { ok: false, message: "Укажите число." };
-    next[field] = value;
-  }
-  if (change.kind === "field" && change.field === "transmission" && typeof change.value === "number" && change.value > 0) next.opacity = 1;
-  if (change.kind === "field" && change.field === "opacity" && typeof change.value === "number" && change.value < 1 && next.transmission > 0)
-    return { ok: false, message: "При transmission больше 0 непрозрачность должна быть 1." };
-  const issues = validateMaterial(next);
-  if (issues.length) return { ok: false, message: issues[0]!.message };
-  if (JSON.stringify(next) === JSON.stringify(source)) return { ok: true, revision: context.revision, changed: false };
-  const commands: ProjectCommand[] = [];
-  if (users.length > 1 && context.mode === "unique") {
-    let id = crypto.randomUUID();
-    const used = new Set([...project.nodes, ...project.materials, ...project.assets, ...project.modifiers].map(item => item.id));
-    while (used.has(id)) id = crypto.randomUUID();
-    next.id = id;
-    commands.push({ commandId: crypto.randomUUID(), type: "ADD_MATERIAL", targetIds: [id], payload: { material: next } });
-    commands.push({ commandId: crypto.randomUUID(), type: "SET_MATERIAL_SLOT", targetIds: [node.id, id], payload: { nodeId: node.id, slotName: context.slotName, materialId: id } });
-  } else commands.push({ commandId: crypto.randomUUID(), type: "UPDATE_MATERIAL", targetIds: [source.id], payload: { material: next } });
-  const result = store.executeTransaction(commands, context.revision, crypto.randomUUID(), groupId);
-  return result.ok ? { ok: true, revision: result.revision, changed: result.changed } : { ok: false, message: result.message };
-}
-</file>
-
-<file path="src/domain/validate-material.ts">
-import type { Material } from "./types";
-import type { ValidationIssue } from "./validate-project";
-
-/** Color components are stored in Linear-sRGB. Legacy textureAssetIds have no channel semantics. */
-export function validateMaterial(value: unknown, path = "material"): ValidationIssue[] {
-  const issues: ValidationIssue[] = [];
-  const add = (field: string, message: string): void => { issues.push({ code: "INVALID_STRUCTURE", path: `${path}.${field}`, message }); };
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    add("", "Материал должен быть объектом."); return issues;
-  }
-  const material = value as Record<string, unknown>;
-  const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
-  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots")) add("", "Структура материала содержит отсутствующие или лишние поля.");
-  for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
-  for (const field of ["baseColor", "emissive"] as const) {
-    const color = material[field];
-    if (!Array.isArray(color) || color.length !== 3 || color.some(component => typeof component !== "number" || !Number.isFinite(component) || component < 0))
-      add(field, "Цвет Linear-sRGB должен содержать три конечных неотрицательных числа.");
-  }
-  for (const field of ["metalness", "roughness", "opacity", "transmission", "clearcoat"] as const) {
-    const number = material[field];
-    if (typeof number !== "number" || !Number.isFinite(number) || number < 0 || number > 1) add(field, "Значение должно быть конечным числом от 0 до 1.");
-  }
-  if (typeof material.ior !== "number" || !Number.isFinite(material.ior) || material.ior < 1 || material.ior > 2.333)
-    add("ior", "Показатель преломления должен быть от 1 до 2,333.");
-  if (typeof material.envIntensity !== "number" || !Number.isFinite(material.envIntensity) || material.envIntensity < 0)
-    add("envIntensity", "Интенсивность окружения должна быть конечным неотрицательным числом.");
-  if (typeof material.transmission === "number" && material.transmission > 0 && material.opacity !== 1)
-    add("opacity", "При передаче света transmission непрозрачность opacity должна быть равна 1.");
-  if (!Array.isArray(material.textureAssetIds) || material.textureAssetIds.some(id => typeof id !== "string" || !id.trim())
-    || new Set(material.textureAssetIds).size !== material.textureAssetIds.length)
-    add("textureAssetIds", "Ссылки на текстуры должны быть непустыми и уникальными ID.");
-  if (material.textureSlots !== undefined) {
-    const slots = material.textureSlots;
-    if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => key !== "baseColor")) add("textureSlots", "Неизвестный канал текстуры.");
-    else if ("baseColor" in slots && (typeof (slots as Record<string, unknown>).baseColor !== "string" || !(slots as { baseColor: string }).baseColor.trim())) add("textureSlots.baseColor", "ID текстуры должен быть непустой строкой.");
-  }
-  return issues;
-}
-
-export function isMaterial(value: unknown): value is Material { return validateMaterial(value).length === 0; }
-</file>
-
 <file path="src/geometry/displace-brush.ts">
 import type { Vec3 } from "../domain/types";
 import { SEAM_TOLERANCE, validateEditableSource, type EditableMeshSource } from "./mesh-edit";
@@ -11929,6 +12701,71 @@ export class ThreeRendererAdapter implements RendererAdapter {
     this.cleanupJob = (async () => { await this.job; this.removeListeners(); if (this.renderer) { try { await this.renderer.dispose(); } finally { this.renderer = undefined; } } })();
     return this.cleanupJob;
   }
+}
+</file>
+
+<file path="src/renderer/base-color-textures.ts">
+import * as T from "three";
+import type { Asset } from "../domain/types";
+
+type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Set<T.MeshPhysicalMaterial>; error?: string; pending?: Promise<void> | undefined };
+
+/** Owned by one SceneSync. Materials borrow textures; the cache alone disposes them. */
+export class BaseColorTextures {
+  private entries = new Map<string, Entry>();
+  private owners = new Map<T.MeshPhysicalMaterial, string>();
+  constructor(private changed: () => void) {}
+
+  bind(material: T.MeshPhysicalMaterial, asset: Readonly<Asset>, read: (id: string) => Uint8Array | undefined, repeat = false): void {
+    const key = `${asset.id}:${asset.hash}:${repeat ? "repeat" : "default"}`;
+    let entry = this.entries.get(key);
+    if (!entry) {
+      entry = { users: new Set() };
+      this.entries.set(key, entry);
+      const current = entry;
+      const bytes = read(asset.id);
+      if (!bytes) current.error = `Ресурс ${asset.id}: байты изображения отсутствуют в памяти.`;
+      else current.pending = (async () => {
+        let bitmap: ImageBitmap | undefined;
+        try {
+          bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: asset.mediaType }), { imageOrientation: "flipY" });
+          if (this.entries.get(key) !== current || !current.users.size) { bitmap.close(); return; }
+          const texture = new T.Texture(bitmap);
+          texture.colorSpace = T.SRGBColorSpace;
+          if (repeat) texture.wrapS = texture.wrapT = T.RepeatWrapping;
+          texture.needsUpdate = true;
+          texture.userData.triadSharedTexture = true;
+          current.bitmap = bitmap; current.texture = texture;
+          for (const user of current.users) { user.map = texture; user.needsUpdate = true; }
+        } catch { bitmap?.close(); current.error = `Ресурс ${asset.id}: не удалось декодировать изображение.`; }
+        finally { current.pending = undefined; this.changed(); }
+      })();
+    }
+    entry.users.add(material);
+    this.owners.set(material, key);
+    if (entry.texture) { material.map = entry.texture; material.needsUpdate = true; }
+  }
+
+  release(material: T.Material): void {
+    if (!(material instanceof T.MeshPhysicalMaterial)) return;
+    const key = this.owners.get(material);
+    if (!key) return;
+    this.owners.delete(material);
+    const entry = this.entries.get(key);
+    if (!entry) return;
+    entry.users.delete(material);
+    material.map = null;
+    if (!entry.users.size) {
+      this.entries.delete(key);
+      entry.texture?.dispose(); entry.bitmap?.close();
+    }
+  }
+
+  releaseObject(root: T.Object3D): void {
+    root.traverse(object => { if (object instanceof T.Mesh) for (const material of Array.isArray(object.material) ? object.material : [object.material]) this.release(material); });
+  }
+  diagnostics(): string[] { return [...this.entries.values()].flatMap(entry => entry.error ? [entry.error] : []); }
+  dispose(): void { for (const material of [...this.owners.keys()]) this.release(material); }
 }
 </file>
 
@@ -12356,162 +13193,6 @@ function DeformItemForm({ store, targetId, modifier, kind, index, length, disabl
 }
 </file>
 
-<file path="src/ui/MaterialInspector.tsx">
-import { useEffect, useRef, useState } from "react";
-import type { EditorState, EditorStore } from "../app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
-import { materialNodeReason } from "../app/material-actions";
-import { isJobActive } from "../app/job-controller";
-import { materialPresets } from "../materials/presets";
-import { linearToHex, parseHexColor } from "../materials/color";
-
-const format = (value: number) => String(Number(value.toPrecision(12)));
-const scalarFields = [
-  { key: "metalness", label: "Металличность", min: 0, max: 1, step: .001 },
-  { key: "roughness", label: "Шероховатость", min: 0, max: 1, step: .001 },
-  { key: "opacity", label: "Непрозрачность", min: 0, max: 1, step: .001 },
-  { key: "transmission", label: "Пропускание света", min: 0, max: 1, step: .001 },
-  { key: "ior", label: "Преломление (IOR)", min: 1, max: 2.333, step: .001 },
-  { key: "clearcoat", label: "Лаковое покрытие", min: 0, max: 1, step: .001 },
-  { key: "envIntensity", label: "Интенсивность окружения", min: 0, max: 5, step: .01 },
-] as const;
-
-export function MaterialInspector({ store, state }: { store: EditorStore; state: EditorState }) {
-  const [mode, setMode] = useState<MaterialEditMode>("unique");
-  const [editing, setEditing] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-  const [error, setError] = useState("");
-  const session = useRef<{ context: MaterialEditContext; groupId: string; changed: boolean; field: string } | null>(null);
-  const skipBlur = useRef(false);
-  const epoch = store.getProjectEpoch();
-  const selection = state.selection.ids.join("\0");
-  useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
-
-  const node = state.selection.ids.length === 1 ? state.document.project.nodes.find(item => item.id === state.selection.activeId) : null;
-  const slot = node?.kind === "mesh" && node.materialSlots.length === 1 ? node.materialSlots[0] : null;
-  const material = state.document.project.materials.find(item => item.id === slot?.materialId);
-  const users = material ? materialUsage(store, material.id) : [];
-  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId)).find(Boolean) : null;
-  const reason = !node ? state.selection.ids.length > 1 ? "Несколько объектов: массовое редактирование материалов пока недоступно." : "Выберите Mesh с материалом."
-    : node.kind !== "mesh" ? "У группы нет редактируемого материала."
-    : node.meshSource.kind === "asset" ? "Внутренние материалы GLB доступны только для просмотра до поддержки отдельных слотов."
-    : !slot ? "Назначьте материал из библиотеки слева."
-    : !material ? "Назначенный материал не найден."
-    : isJobActive(state.job.status) ? "Дождитесь завершения операции."
-    : state.tool.mode !== "model" ? "В режиме «Сцена» свойства модели доступны только для просмотра."
-    : materialNodeReason(store, node.id) || sharedBlock || "";
-  const preset = materialPresets.find(item => item.name === material?.name);
-  const canEdit = !!material && !reason;
-  const rasterAssets = state.document.project.assets.filter(asset => ["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType));
-  const selectedTexture = material?.textureSlots?.baseColor;
-  const selectedAsset = state.document.project.assets.find(asset => asset.id === selectedTexture);
-  const missingUv = node?.kind === "mesh" && node.meshSource.kind === "editable" && !node.meshSource.uv;
-  function setTexture(assetId?: string) {
-    if (!canEdit) return;
-    const context = captureMaterialEdit(store, mode);
-    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
-    const result = editBaseColorTexture(store, context, assetId);
-    setError(result.ok ? "" : result.message);
-  }
-
-  function start(field: string) {
-    const context = captureMaterialEdit(store, mode);
-    session.current = context ? { context, groupId: crypto.randomUUID(), changed: false, field } : null;
-    setError("");
-  }
-  function apply(field: MaterialField, value: number | readonly number[], grouped = false) {
-    if (!canEdit) return;
-    if (!session.current || session.current.field !== field) start(field);
-    const active = session.current;
-    if (!active) return;
-    const result = editMaterial(store, active.context, field, value, grouped ? active.groupId : undefined);
-    if (!result.ok) { setError(result.message); return; }
-    if (result.changed) {
-      active.changed = true;
-      active.context.revision = result.revision;
-      const updated = store.getSnapshot().document.project.nodes.find(item => item.id === active.context.nodeId);
-      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots[0]?.materialId ?? active.context.materialId;
-    }
-    setError("");
-    if (!grouped) session.current = null;
-  }
-  function finish() { session.current = null; setEditing(null); }
-  function escapeInput(target: HTMLInputElement) { skipBlur.current = true; finish(); target.blur(); }
-  function shouldSkipBlur() { if (!skipBlur.current) return false; skipBlur.current = false; return true; }
-  function cancel() {
-    const active = session.current;
-    if (active?.changed) {
-      const current = store.getSnapshot();
-      const result = store.cancelGesture(active.groupId, current.document.revision);
-      if (!result.ok) setError(result.message);
-    }
-    finish();
-  }
-  function commitNumber(field: MaterialField) {
-    const raw = draft.trim();
-    const value = Number(raw);
-    if (!raw || !Number.isFinite(value)) { setError("Введите конечное число."); finish(); return; }
-    apply(field, value);
-    finish();
-  }
-  function reset(field: MaterialField) {
-    if (!preset) return;
-    start(field);
-    apply(field, preset.material[field]);
-  }
-  function colorRow(field: "baseColor" | "emissive", label: string) {
-    if (!material) return null;
-    const color = material[field];
-    const hex = linearToHex(color);
-    const colorKey = `${field}-hex`;
-    return <div className="material-field" key={field}>
-      <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
-      <div className="material-color-line"><input type="color" aria-label={`${label}: палитра sRGB`} value={hex ?? "#ffffff"} disabled={!canEdit} onChange={event => { const parsed = parseHexColor(event.target.value); if (parsed) apply(field, parsed); }} />
-        <label>HEX sRGB<input type="text" aria-label={`${label}: HEX sRGB`} value={editing === colorKey ? draft : hex ?? ""} placeholder={hex ? undefined : "HDR"} disabled={!canEdit} onFocus={() => { start(field); setEditing(colorKey); setDraft(hex ?? ""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== colorKey) return; const parsed = parseHexColor(draft); if (parsed) apply(field, parsed); else if (draft !== (hex ?? "")) setError("HEX должен содержать # и шесть цифр."); finish(); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
-      {!hex && <p className="panel-hint">Цвет содержит HDR-компоненты. Палитра sRGB не показывает их точно; используйте числовые поля.</p>}
-      <div className="inspector-vector">{(["R", "G", "B"] as const).map((channel, index) => {
-        const key = `${field}-${index}`;
-        return <label key={key}>{channel} · linear<input type="text" inputMode="decimal" aria-label={`${label} ${channel} Linear-sRGB`} value={editing === key ? draft : format(color[index]!)} disabled={!canEdit} onFocus={() => { start(field); setEditing(key); setDraft(format(color[index]!)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === key) { const raw = draft.trim(); const value = Number(raw); if (raw && Number.isFinite(value)) apply(field, color.map((entry, i) => i === index ? value : entry)); else setError("Введите конечное число."); finish(); } }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
-      })}</div>
-    </div>;
-  }
-  function scalarRow(spec: typeof scalarFields[number]) {
-    if (!material) return null;
-    const field = spec.key;
-    const value = material[field];
-    return <div className="material-field" key={field}>
-      <div className="inspector-group-heading"><strong>{spec.label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
-      <div className="material-scalar-line"><input type="range" aria-label={`${spec.label}: слайдер`} min={spec.min} max={spec.max} step={spec.step} value={Math.min(spec.max, value)} disabled={!canEdit} onPointerDown={() => start(field)} onChange={event => apply(field, Number(event.target.value), true)} onPointerUp={finish} onKeyDown={event => { event.stopPropagation(); if (event.key === "Escape") { event.preventDefault(); cancel(); } else if (!session.current) start(field); }} onKeyUp={finish} />
-        <label><span className="sr-only">{spec.label}: точное значение</span><input type="text" inputMode="decimal" aria-label={`${spec.label}: точное значение`} value={editing === field ? draft : format(value)} disabled={!canEdit} onFocus={() => { start(field); setEditing(field); setDraft(format(value)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === field) commitNumber(field); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
-    </div>;
-  }
-  return <section className="material-inspector" aria-label="Материал"><h4>Материал</h4>
-    {material && <strong>{material.name}</strong>}
-    {users.length > 1 && <><p className="panel-hint">Материал используется несколькими объектами ({users.length} слотов).</p><fieldset className="material-mode"><legend>Редактировать</legend><label><input type="radio" checked={mode === "unique"} onChange={() => { setMode("unique"); finish(); }} /> Только выбранный объект</label><label><input type="radio" checked={mode === "shared"} onChange={() => { setMode("shared"); finish(); }} /> Все объекты с этим материалом</label></fieldset></>}
-    {reason && <p className="panel-hint">{reason}</p>}
-    {material && <>
-      <div className="material-fields"><h4>Основные</h4>{colorRow("baseColor", "Базовый цвет")}{scalarFields.slice(0, 3).map(scalarRow)}</div>
-      <div className="material-fields"><h4>Текстуры</h4><label>Основной цвет
-        <select aria-label="Текстура основного цвета" value={selectedTexture ?? ""} disabled={!canEdit} title={reason || undefined} onChange={event => setTexture(event.target.value || undefined)}>
-          <option value="">Не назначено</option>
-          {rasterAssets.map(asset => <option key={asset.id} value={asset.id}>{asset.path} · {asset.id}</option>)}
-          {selectedTexture && !selectedAsset && <option value={selectedTexture}>Недоступный ресурс · {selectedTexture}</option>}
-        </select></label>
-        {selectedAsset && <p className="panel-hint">{selectedAsset.path} · {selectedAsset.id}</p>}
-        <button type="button" disabled={!canEdit || !selectedTexture} title={reason || undefined} onClick={() => setTexture()}>Снять текстуру</button>
-        {missingUv && selectedTexture && <p className="material-warning">У геометрии нет UV; текстура не отображается.</p>}
-      </div>
-      <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
-      {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
-      {material.textureAssetIds.length > 0 && <p className="material-warning">У сохранённых legacy-ссылок на текстуры канал не определён.</p>}
-      {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}
-      {preset && <p className="panel-hint">Сброс использует одноимённый встроенный пресет как ориентир, без подтверждения происхождения материала.</p>}
-    </>}
-    {error && <p className="primitive-error" role="alert">{error}</p>}
-  </section>;
-}
-</file>
-
 <file path="src/ui/MaterialLibrary.tsx">
 import { useEffect, useState } from "react";
 import type { EditorStore, EditorState } from "../app/editor-store";
@@ -12842,200 +13523,6 @@ describe("material presets", () => {
     expect(applyMaterialPresetToNode(store, preset, 0, "mesh-node", epoch).ok).toBe(false);
     expect(store.getSnapshot().document.project.materials).toHaveLength(0);
     expect(store.getSnapshot().history.entries).toHaveLength(0);
-  });
-});
-</file>
-
-<file path="tests/app/material-edit.test.ts">
-import { describe, expect, it } from "vitest";
-import { createEditorStore } from "../../src/app/editor-store";
-import { captureMaterialEdit, editMaterial, editBaseColorTexture } from "../../src/app/material-edit";
-import { materialPresets } from "../../src/materials/presets";
-import { linearToHex, parseHexColor } from "../../src/materials/color";
-import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
-import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
-import { AssetBytes } from "../../src/assets/asset-bytes";
-import { SceneSync } from "../../src/renderer/scene-sync";
-import * as T from "three";
-import { createNestedMeshProject } from "../fixtures/projects";
-
-function setup() {
-  const project = createNestedMeshProject();
-  const first = project.nodes.find(node => node.id === "mesh-node")!;
-  const second = structuredClone(first);
-  second.id = "second-mesh";
-  project.nodes.push(second);
-  project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
-  const preset = materialPresets[0]!;
-  project.materials.push({ ...structuredClone(preset.material), id: "shared-material", textureAssetIds: [] });
-  if (first.kind !== "mesh" || second.kind !== "mesh") throw new Error("fixture");
-  first.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
-  second.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
-  const store = createEditorStore(project);
-  store.setSelection([first.id], first.id);
-  return store;
-}
-
-describe("material editing", () => {
-  it("assigns, replaces and removes a raster map with copy-on-write and native round-trip", async () => {
-    const store = setup();
-    const bytes = new Uint8Array([1, 2, 3]);
-    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
-    const context = store.captureImportContext();
-    const asset = { id: "raster", hash, path: `assets/${hash}.png`, mediaType: "image/png", colorSpace: "srgb" as const };
-    expect((await store.addAsset({ commandId: crypto.randomUUID(), type: "ADD_ASSET", targetIds: [asset.id], payload: { asset } }, bytes, context.revision, context.identity)).ok).toBe(true);
-    const edit = captureMaterialEdit(store)!;
-    expect(editBaseColorTexture(store, edit, asset.id)).toMatchObject({ ok: true, changed: true });
-    const project = store.captureDocument().project;
-    const assignedId = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
-    expect(assignedId).not.toBe("shared-material");
-    expect(project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id);
-    expect(project.materials.find(item => item.id === "shared-material")?.textureSlots).toBeUndefined();
-    const saved = await createNativeProjectArchive(project, store.getAssetBytes(), "0.1.0");
-    expect(saved.ok).toBe(true);
-    if (saved.ok) {
-      const opened = await openNativeProjectArchive(saved.value);
-      expect(opened.ok).toBe(true);
-      if (opened.ok) { expect(opened.value.project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id); expect(opened.value.assets.get(asset.id)).toEqual(bytes); }
-    }
-    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, asset.id)).toMatchObject({ ok: true, changed: false });
-    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
-    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
-    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, undefined)).toMatchObject({ ok: true, changed: true });
-    expect(store.getSnapshot().document.project.materials.find(item => item.id === assignedId)?.textureSlots).toBeUndefined();
-  });
-  it("clones on unique edit, preserves other fields and links, and supports undo/redo and serialization", async () => {
-    const store = setup();
-    const context = captureMaterialEdit(store)!;
-    expect(editMaterial(store, context, "roughness", .123456789).ok).toBe(true);
-    const state = store.getSnapshot();
-    const firstId = state.document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
-    expect(firstId).not.toBe("shared-material");
-    expect(state.document.project.nodes.find(node => node.id === "second-mesh")!.materialSlots[0]!.materialId).toBe("shared-material");
-    expect(state.document.project.materials.find(item => item.id === firstId)).toMatchObject({ roughness: .123456789, metalness: 1, textureAssetIds: [] });
-    expect(state.document.project.materials.find(item => item.id === "shared-material")?.roughness).toBe(.07);
-    expect(state.history.entries).toHaveLength(1);
-    const saved = serializeProjectDocument(store.captureDocument().project);
-    expect(saved.ok).toBe(true);
-    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: store.captureDocument().project });
-    const archive = await createNativeProjectArchive(store.captureDocument().project, new AssetBytes(), "0.1.0");
-    expect(archive.ok).toBe(true);
-    if (archive.ok) {
-      const reopened = await openNativeProjectArchive(archive.value);
-      expect(reopened.ok).toBe(true);
-      if (reopened.ok) expect(reopened.value.project).toEqual(store.captureDocument().project);
-    }
-    expect(store.undo(state.document.revision).ok).toBe(true);
-    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
-    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
-    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
-    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe(firstId);
-  });
-
-  it("updates all references only in explicit shared mode and rejects hidden users", () => {
-    const store = setup();
-    const context = captureMaterialEdit(store, "shared")!;
-    expect(editMaterial(store, context, "metalness", .4).ok).toBe(true);
-    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
-    expect(store.getSnapshot().document.project.materials[0]?.metalness).toBe(.4);
-    const revision = store.getSnapshot().document.revision;
-    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["second-mesh"], payload: { nodeId: "second-mesh", visible: false } }, revision).ok).toBe(true);
-    const before = store.getSnapshot();
-    const denied = editMaterial(store, captureMaterialEdit(store, "shared")!, "roughness", .2);
-    expect(denied.ok).toBe(false);
-    expect(store.getSnapshot()).toBe(before);
-    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(true);
-  });
-
-  it("updates SceneSync material without replacing mesh geometry", () => {
-    const store = setup();
-    const sync = new SceneSync(() => {});
-    sync.sync(store.getSnapshot().document.project, () => undefined);
-    const first = sync.objects.get("mesh-node")!.content as T.Mesh;
-    const second = sync.objects.get("second-mesh")!.content as T.Mesh;
-    const geometry = first.geometry;
-    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .21).ok).toBe(true);
-    sync.sync(store.getSnapshot().document.project, () => undefined);
-    expect(sync.objects.get("mesh-node")!.content).toBe(first);
-    expect(first.geometry).toBe(geometry);
-    expect((first.material as T.MeshPhysicalMaterial).roughness).toBe(.21);
-    expect((second.material as T.MeshPhysicalMaterial).roughness).toBe(.07);
-    store.setSelection(["second-mesh"], "second-mesh");
-    expect(editMaterial(store, captureMaterialEdit(store, "shared")!, "metalness", .4).ok).toBe(true);
-    sync.sync(store.getSnapshot().document.project, () => undefined);
-    expect((second.material as T.MeshPhysicalMaterial).metalness).toBe(.4);
-    sync.dispose();
-  });
-
-  it("rejects invalid values, transmission conflicts and stale context without mutations", () => {
-    const store = setup();
-    const context = captureMaterialEdit(store)!;
-    const before = store.getSnapshot();
-    expect(editMaterial(store, context, "ior", Number.NaN).ok).toBe(false);
-    expect(editMaterial(store, context, "envIntensity", Infinity).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(before);
-    expect(editMaterial(store, context, "transmission", .6).ok).toBe(true);
-    const updated = captureMaterialEdit(store)!;
-    const material = store.getSnapshot().document.project.materials.find(item => item.id === updated.materialId)!;
-    expect(material.transmission).toBe(.6);
-    expect(material.opacity).toBe(1);
-    const unchanged = store.getSnapshot();
-    expect(editMaterial(store, updated, "opacity", .5).ok).toBe(false);
-    expect(store.getSnapshot()).toBe(unchanged);
-    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
-    store.setSelection(["second-mesh"], "second-mesh");
-    expect(editMaterial(store, updated, "roughness", .2).ok).toBe(false);
-  });
-
-  it("groups a unique slider gesture into one undo and cancels it", () => {
-    const store = setup();
-    const context = captureMaterialEdit(store)!;
-    const group = "gesture";
-    const first = editMaterial(store, context, "roughness", .2, group);
-    expect(first.ok).toBe(true);
-    if (!first.ok) return;
-    context.revision = first.revision;
-    context.materialId = store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
-    expect(editMaterial(store, context, "roughness", .3, group).ok).toBe(true);
-    expect(store.getSnapshot().history.entries).toHaveLength(1);
-    expect(store.cancelGesture(group, store.getSnapshot().document.revision).ok).toBe(true);
-    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
-    expect(store.getSnapshot().history.entries).toHaveLength(0);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-  });
-
-  it("keeps no-ops out of history and converts colors without changing the document", () => {
-    const store = setup();
-    const context = captureMaterialEdit(store)!;
-    expect(editMaterial(store, context, "roughness", .07)).toMatchObject({ ok: true, changed: false });
-    expect(store.getSnapshot().history.entries).toHaveLength(0);
-    expect(store.getSnapshot().document.dirty).toBe(false);
-    expect(linearToHex(parseHexColor("#808080")!)).toBe("#808080");
-    expect(linearToHex([2, 0, 0])).toBeNull();
-    expect(parseHexColor("#bad")).toBeNull();
-  });
-
-  it("rejects scene mode, locked parent, active job and replaced project", async () => {
-    const store = setup();
-    const context = captureMaterialEdit(store)!;
-    store.setTool({ mode: "scene" });
-    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
-    store.setTool({ mode: "model" });
-    expect(store.executeCommand({ commandId: "lock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: true } }, 0).ok).toBe(true);
-    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
-    expect(store.executeCommand({ commandId: "unlock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: false } }, 1).ok).toBe(true);
-    let release!: () => void;
-    const pending = store.jobs.run({ id: "busy", name: "Проверка", cancellable: true, validate: () => null,
-      compute: () => new Promise<{ ok: true; value: string }>(resolve => { release = () => resolve({ ok: true, value: "done" }); }) });
-    await Promise.resolve();
-    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
-    release();
-    await pending;
-    const old = captureMaterialEdit(store)!;
-    const captured = store.captureDocument();
-    expect(store.replaceProject({ project: createNestedMeshProject(), assets: captured.assets }, captured.identity)).toBe(true);
-    expect(editMaterial(store, old, "roughness", .2).ok).toBe(false);
   });
 });
 </file>
@@ -14443,6 +14930,45 @@ describe("viewport transform safeguards", () => {
 });
 </file>
 
+<file path="tests/ui/material-inspector.test.tsx">
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { createElement } from "react";
+import { createEditorStore } from "../../src/app/editor-store";
+import { MaterialInspector } from "../../src/ui/MaterialInspector";
+import { materialPresets } from "../../src/materials/presets";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+describe("MaterialInspector", () => {
+  it("shows current PBR values without modifying the project on render", () => {
+    const project = createNestedMeshProject();
+    project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", roughness: .123456789, baseColor: [2, .2, .3] });
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    node.materialSlots = [{ name: "Основной", materialId: "m" }];
+    const store = createEditorStore(project);
+    store.setSelection([node.id], node.id);
+    const before = store.getSnapshot();
+    const html = renderToStaticMarkup(createElement(MaterialInspector, { store, state: before }));
+    expect(html).toContain("Шероховатость");
+    expect(html).toContain("0.123456789");
+    expect(html).toContain("HDR-компоненты");
+    expect(html).toContain("Проекция текстуры");
+    expect(html).toContain("Плоскость");
+    expect(store.getSnapshot()).toBe(before);
+  });
+  it("shows planar controls from the domain material", () => {
+    const project = createNestedMeshProject();
+    project.materials.push({ ...structuredClone(materialPresets[0]!.material), id: "m", textureMappings: { baseColor: { mode: "planar", axis: "y", tiling: [2, 3], offset: [4, -5] } } });
+    const node = project.nodes.find(item => item.id === "mesh-node")!;
+    node.materialSlots = [{ name: "Основной", materialId: "m" }];
+    const store = createEditorStore(project); store.setSelection([node.id], node.id);
+    const html = renderToStaticMarkup(createElement(MaterialInspector, { store, state: store.getSnapshot() }));
+    for (const label of ["Ось проекции", "Повторение U", "Повторение V", "Смещение U", "Смещение V"]) expect(html).toContain(label);
+    expect(html).toContain('value="2"');
+  });
+});
+</file>
+
 <file path="eslint.config.js">
 import js from "@eslint/js";
 import globals from "globals";
@@ -14454,6 +14980,118 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   { files: ["**/*.{js,mjs,ts,tsx}"], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
 );
+</file>
+
+<file path="src/app/material-edit.ts">
+import type { EditorStore } from "./editor-store";
+import type { BaseColorProjection, Material } from "../domain/types";
+import type { ProjectCommand } from "../domain/command-bus";
+import { validateMaterial } from "../domain/validate-material";
+import { materialNodeReason } from "./material-actions";
+
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings">;
+export type MaterialEditMode = "unique" | "shared";
+export interface MaterialEditContext {
+  epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
+}
+export type MaterialEditResult = { ok: true; revision: number; changed: boolean } | { ok: false; message: string };
+
+export function materialUsage(store: EditorStore, materialId: string) {
+  return store.getSnapshot().document.project.nodes.flatMap(node => node.materialSlots.filter(slot => slot.materialId === materialId).map(slot => ({ nodeId: node.id, slotName: slot.name })));
+}
+
+export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode = "unique"): MaterialEditContext | null {
+  const state = store.getSnapshot();
+  const nodeId = state.selection.activeId;
+  if (!nodeId || state.selection.ids.length !== 1) return null;
+  const node = state.document.project.nodes.find(item => item.id === nodeId);
+  if (node?.kind !== "mesh" || node.materialSlots.length !== 1) return null;
+  return { epoch: store.getProjectEpoch(), revision: state.document.revision, nodeId, materialId: node.materialSlots[0]!.materialId, slotName: node.materialSlots[0]!.name, mode };
+}
+
+export function editMaterial(store: EditorStore, context: MaterialEditContext, field: MaterialField, value: number | readonly number[], groupId?: string): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "field", field, value }, groupId);
+}
+
+export function editBaseColorTexture(store: EditorStore, context: MaterialEditContext, assetId?: string): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "texture", assetId });
+}
+export function editBaseColorProjection(store: EditorStore, context: MaterialEditContext, projection: BaseColorProjection): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "projection", projection });
+}
+
+function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection }, groupId?: string): MaterialEditResult {
+  const state = store.getSnapshot();
+  if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
+    || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
+    return { ok: false, message: "Проект или выбор изменился. Повторите действие." };
+  const reason = materialNodeReason(store, context.nodeId);
+  if (reason) return { ok: false, message: reason };
+  const project = state.document.project;
+  const node = project.nodes.find(item => item.id === context.nodeId);
+  if (node?.kind !== "mesh" || node.materialSlots.length !== 1 || node.materialSlots[0]?.name !== context.slotName || node.materialSlots[0]?.materialId !== context.materialId)
+    return { ok: false, message: "Назначение материала изменилось. Повторите действие." };
+  const source = project.materials.find(item => item.id === context.materialId);
+  if (!source) return { ok: false, message: "Материал больше не существует." };
+  if (change.kind === "projection") {
+    const problems = validateMaterial({ ...source, textureMappings: { baseColor: change.projection } });
+    if (problems.length) return { ok: false, message: problems[0]!.message };
+  }
+  const users = materialUsage(store, source.id);
+  if (context.mode === "shared") for (const user of users) {
+    const access = materialNodeReason(store, user.nodeId);
+    if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
+  }
+  if (change.kind === "projection" && change.projection.mode === "uv" && (!source.textureMappings?.baseColor || source.textureMappings.baseColor.mode === "uv"))
+    return { ok: true, revision: context.revision, changed: false };
+  const next = structuredClone(source) as Material;
+  if (change.kind === "projection") {
+    // Historical UV has no stored configuration. Treat explicit UV as the same state.
+    if (change.projection.mode === "uv") {
+      if (next.textureMappings) {
+        delete next.textureMappings.baseColor;
+        if (!Object.keys(next.textureMappings).length) delete next.textureMappings;
+      }
+    } else next.textureMappings = { ...next.textureMappings, baseColor: change.projection };
+  } else if (change.kind === "texture") {
+    const assetId = change.assetId;
+    if (assetId !== undefined) {
+      if (!assetId.trim()) return { ok: false, message: "ID ресурса должен быть непустым." };
+      const asset = project.assets.find(item => item.id === assetId);
+      if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) return { ok: false, message: "Для основного цвета нужен импортированный PNG, JPEG или WebP." };
+      if (!store.readAssetBytes(assetId)) return { ok: false, message: "Байты изображения отсутствуют в памяти." };
+      next.textureSlots = { ...next.textureSlots, baseColor: assetId };
+    } else if (next.textureSlots) {
+      delete next.textureSlots.baseColor;
+      if (!Object.keys(next.textureSlots).length) delete next.textureSlots;
+    }
+  } else if (change.field === "baseColor" || change.field === "emissive") {
+    const { field, value } = change;
+    if (!Array.isArray(value) || value.length !== 3) return { ok: false, message: "Укажите три компонента цвета." };
+    next[field] = [value[0]!, value[1]!, value[2]!];
+  } else {
+    const { field, value } = change;
+    if (typeof value !== "number") return { ok: false, message: "Укажите число." };
+    next[field] = value;
+  }
+  if (change.kind === "field" && change.field === "transmission" && typeof change.value === "number" && change.value > 0) next.opacity = 1;
+  if (change.kind === "field" && change.field === "opacity" && typeof change.value === "number" && change.value < 1 && next.transmission > 0)
+    return { ok: false, message: "При transmission больше 0 непрозрачность должна быть 1." };
+  const issues = validateMaterial(next);
+  if (issues.length) return { ok: false, message: issues[0]!.message };
+  if (JSON.stringify(next) === JSON.stringify(source)) return { ok: true, revision: context.revision, changed: false };
+  const commands: ProjectCommand[] = [];
+  if (users.length > 1 && context.mode === "unique") {
+    let id = crypto.randomUUID();
+    const used = new Set([...project.nodes, ...project.materials, ...project.assets, ...project.modifiers].map(item => item.id));
+    while (used.has(id)) id = crypto.randomUUID();
+    next.id = id;
+    commands.push({ commandId: crypto.randomUUID(), type: "ADD_MATERIAL", targetIds: [id], payload: { material: next } });
+    commands.push({ commandId: crypto.randomUUID(), type: "SET_MATERIAL_SLOT", targetIds: [node.id, id], payload: { nodeId: node.id, slotName: context.slotName, materialId: id } });
+  } else commands.push({ commandId: crypto.randomUUID(), type: "UPDATE_MATERIAL", targetIds: [source.id], payload: { material: next } });
+  const result = store.executeTransaction(commands, context.revision, crypto.randomUUID(), groupId);
+  return result.ok ? { ok: true, revision: result.revision, changed: result.changed } : { ok: false, message: result.message };
+}
 </file>
 
 <file path="src/assets/asset-bytes.ts">
@@ -14515,433 +15153,67 @@ export function disposeObject(root: Object3D): void {
 }
 </file>
 
-<file path="src/domain/create-project.ts">
-import type { EntityId, Project } from "./types";
+<file path="src/domain/validate-material.ts">
+import type { Material } from "./types";
+import type { ValidationIssue } from "./validate-project";
 
-export type IdFactory = () => EntityId;
-
-export function createProject(idFactory: IdFactory = () => crypto.randomUUID()): Project {
-  const projectId = idFactory();
-  const modelId = idFactory();
-  const sceneId = idFactory();
-  const rootId = idFactory();
-  const lightId = idFactory();
-
-  return {
-    schemaVersion: "1.2.0",
-    id: projectId,
-    name: "Новый проект",
-    model: { id: modelId, rootNodeId: rootId, revision: 0 },
-    scene: {
-      id: sceneId,
-      camera: {
-        projection: "perspective",
-        position: [4, 3, 5],
-        target: [0, 0, 0],
-        fovDegrees: 45,
-        near: 0.1,
-        far: 1000,
-      },
-      background: { color: [0.12, 0.12, 0.12], intensity: 1 },
-      lights: [{
-        id: lightId,
-        kind: "ambient",
-        color: [1, 1, 1],
-        intensity: 0.8,
-        position: [0, 0, 0],
-        target: [0, 0, 0],
-      }],
-      instances: [],
-    },
-    nodes: [{
-      id: rootId,
-      kind: "group",
-      name: "Модель",
-      parentId: null,
-      children: [],
-      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
-      visible: true,
-      locked: false,
-      materialSlots: [],
-      modifierIds: [],
-    }],
-    modifiers: [],
-    materials: [],
-    assets: [],
-    animations: [],
-    tracks: [],
-    keyframes: [],
-  };
-}
-</file>
-
-<file path="src/domain/project-serialization.ts">
-import Ajv2020 from "ajv/dist/2020.js";
-import documentSchema from "./schemas/document-v1.2.schema.json";
-import previousDocumentSchema from "./schemas/document-v1.1.schema.json";
-import oldDocumentSchema from "./schemas/document-v1.schema.json";
-import manifestSchema from "./schemas/manifest-v1.schema.json";
-import type { Project } from "./types";
-import { validateProject } from "./validate-project";
-
-export const DOCUMENT_SCHEMA_VERSION = "1.2.0";
-export const NATIVE_FORMAT_VERSION = "1.0.0";
-export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
-
-export type SerializationErrorCode = "FILE_INVALID" | "SCHEMA_UNSUPPORTED";
-export interface SerializationError {
-  code: SerializationErrorCode;
-  message: string;
-  path?: string;
-  details?: string;
-}
-export type Result<T> = { ok: true; value: T } | { ok: false; error: SerializationError };
-
-export interface NativeManifest {
-  formatVersion: string;
-  appVersion: string;
-  document: { path: "document.json"; sha256: string };
-  assets: { id: string; path: string; sha256: string }[];
-}
-
-export interface DocumentMigration {
-  readonly from: string;
-  readonly to: string;
-  migrate(input: unknown): unknown;
-}
-
-const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
-const documentValidator = ajv.compile(documentSchema);
-const previousDocumentValidator = ajv.compile(previousDocumentSchema);
-const oldDocumentValidator = ajv.compile(oldDocumentSchema);
-const manifestValidator = ajv.compile(manifestSchema);
-const fail = (code: SerializationErrorCode, message: string, path?: string, details?: string): Result<never> => ({
-  ok: false, error: { code, message, ...(path === undefined ? {} : { path }), ...(details === undefined ? {} : { details }) },
-});
-
-function schemaError(errors: typeof documentValidator.errors): Result<never> {
-  const first = errors?.[0];
-  const path = first?.keyword === "required" && typeof first.params.missingProperty === "string"
-    ? `${first.instancePath}/${first.params.missingProperty}`
-    : first?.keyword === "additionalProperties" && typeof first.params.additionalProperty === "string"
-      ? `${first.instancePath}/${first.params.additionalProperty}` : first?.instancePath;
-  return fail("FILE_INVALID", "Структура документа не соответствует схеме.", path || "/", first?.message);
-}
-
-function inspect(value: unknown): Result<true> {
-  const active = new WeakSet<object>();
-  const stack: { value: unknown; depth: number; path: string; exit?: boolean }[] = [{ value, depth: 0, path: "/" }];
-  let count = 0;
-  while (stack.length) {
-    const item = stack.pop();
-    if (!item) break;
-    if (item.exit) {
-      active.delete(item.value as object);
-      continue;
-    }
-    if (++count > SERIALIZATION_LIMITS.maxValues) return fail("FILE_INVALID", "Превышен лимит элементов документа.", item.path);
-    if (item.depth > SERIALIZATION_LIMITS.maxDepth) return fail("FILE_INVALID", "Превышена глубина документа.", item.path);
-    if (typeof item.value === "number" && !Number.isFinite(item.value)) return fail("FILE_INVALID", "Число должно быть конечным.", item.path);
-    if (item.value && typeof item.value === "object") {
-      if (active.has(item.value)) return fail("FILE_INVALID", "Цикл в документе.", item.path);
-      active.add(item.value);
-      stack.push({ ...item, exit: true });
-      for (const key of Object.keys(item.value)) {
-        stack.push({ value: (item.value as Record<string, unknown>)[key], depth: item.depth + 1, path: `${item.path === "/" ? "" : item.path}/${key}` });
+/** Color components are stored in Linear-sRGB. Legacy textureAssetIds have no channel semantics. */
+export function validateMaterial(value: unknown, path = "material"): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const add = (field: string, message: string): void => { issues.push({ code: "INVALID_STRUCTURE", path: `${path}.${field}`, message }); };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    add("", "Материал должен быть объектом."); return issues;
+  }
+  const material = value as Record<string, unknown>;
+  const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
+  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots" && key !== "textureMappings")) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
+  for (const field of ["baseColor", "emissive"] as const) {
+    const color = material[field];
+    if (!Array.isArray(color) || color.length !== 3 || color.some(component => typeof component !== "number" || !Number.isFinite(component) || component < 0))
+      add(field, "Цвет Linear-sRGB должен содержать три конечных неотрицательных числа.");
+  }
+  for (const field of ["metalness", "roughness", "opacity", "transmission", "clearcoat"] as const) {
+    const number = material[field];
+    if (typeof number !== "number" || !Number.isFinite(number) || number < 0 || number > 1) add(field, "Значение должно быть конечным числом от 0 до 1.");
+  }
+  if (typeof material.ior !== "number" || !Number.isFinite(material.ior) || material.ior < 1 || material.ior > 2.333)
+    add("ior", "Показатель преломления должен быть от 1 до 2,333.");
+  if (typeof material.envIntensity !== "number" || !Number.isFinite(material.envIntensity) || material.envIntensity < 0)
+    add("envIntensity", "Интенсивность окружения должна быть конечным неотрицательным числом.");
+  if (typeof material.transmission === "number" && material.transmission > 0 && material.opacity !== 1)
+    add("opacity", "При передаче света transmission непрозрачность opacity должна быть равна 1.");
+  if (!Array.isArray(material.textureAssetIds) || material.textureAssetIds.some(id => typeof id !== "string" || !id.trim())
+    || new Set(material.textureAssetIds).size !== material.textureAssetIds.length)
+    add("textureAssetIds", "Ссылки на текстуры должны быть непустыми и уникальными ID.");
+  if (material.textureSlots !== undefined) {
+    const slots = material.textureSlots;
+    if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => key !== "baseColor")) add("textureSlots", "Неизвестный канал текстуры.");
+    else if ("baseColor" in slots && (typeof (slots as Record<string, unknown>).baseColor !== "string" || !(slots as { baseColor: string }).baseColor.trim())) add("textureSlots.baseColor", "ID текстуры должен быть непустой строкой.");
+  }
+  if (material.textureMappings !== undefined) {
+    const mappings = material.textureMappings;
+    if (!mappings || typeof mappings !== "object" || Array.isArray(mappings) || Object.keys(mappings).some(key => key !== "baseColor")) add("textureMappings", "Неизвестный канал проекции.");
+    else if ("baseColor" in mappings) {
+      const projection = (mappings as Record<string, unknown>).baseColor;
+      if (!projection || typeof projection !== "object" || Array.isArray(projection)) add("textureMappings.baseColor", "Некорректная проекция.");
+      else {
+        const config = projection as Record<string, unknown>;
+        if (config.mode === "uv") {
+          if (Object.keys(config).some(key => key !== "mode")) add("textureMappings.baseColor", "Режим UV не принимает параметры проекции.");
+        } else if (config.mode === "planar") {
+          if (Object.keys(config).some(key => !["mode", "axis", "tiling", "offset"].includes(key)) || !["x", "y", "z"].includes(config.axis as string)) add("textureMappings.baseColor", "Некорректная ось или поля проекции.");
+          const pair = (value: unknown, positive: boolean) => Array.isArray(value) && value.length === 2 && value.every(number => typeof number === "number" && Number.isFinite(number) && (positive ? number > 0 && number <= 1024 : Math.abs(number) <= 100000));
+          if (!pair(config.tiling, true)) add("textureMappings.baseColor.tiling", "Повторение должно содержать два конечных положительных числа не больше 1024.");
+          if (!pair(config.offset, false)) add("textureMappings.baseColor.offset", "Смещение должно содержать два конечных числа по модулю не больше 100000.");
+        } else add("textureMappings.baseColor.mode", "Неизвестный режим проекции.");
       }
     }
   }
-  return { ok: true, value: true };
+  return issues;
 }
 
-function isProject(value: unknown): value is Project {
-  return documentValidator(value);
-}
-
-function isNativeManifest(value: unknown): value is NativeManifest {
-  return manifestValidator(value);
-}
-
-function validateDocument(value: unknown): Result<Project> {
-  const safety = inspect(value);
-  if (!safety.ok) return safety;
-  if (!isProject(value)) return schemaError(documentValidator.errors);
-  const issues = validateProject(value);
-  if (issues.length) {
-    const issue = issues[0];
-    return fail("FILE_INVALID", "Нарушена целостность проекта.", issue?.path, issue?.code);
-  }
-  return { ok: true, value };
-}
-
-function versionOf(value: unknown): Result<string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект проекта.", "/");
-  const version = (value as Record<string, unknown>).schemaVersion;
-  if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия документа.", "/schemaVersion");
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) return fail("SCHEMA_UNSUPPORTED", "Неверный формат версии документа.", "/schemaVersion");
-  return { ok: true, value: version };
-}
-
-const builtinMigrations: readonly DocumentMigration[] = [{ from: "1.0.0", to: "1.1.0", migrate(input) {
-  if (!oldDocumentValidator(input)) throw new Error("Invalid v1 document");
-  return { ...(input as Record<string, unknown>), schemaVersion: "1.1.0" };
-} }, { from: "1.1.0", to: "1.2.0", migrate(input) {
-  if (!previousDocumentValidator(input)) throw new Error("Invalid v1.1 document");
-  return { ...(input as Record<string, unknown>), schemaVersion: "1.2.0" };
-} }];
-
-export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {
-  const initial = versionOf(value);
-  if (!initial.ok) return initial;
-  let version = initial.value;
-  let current = value;
-  const visited = new Set<string>();
-  while (version !== DOCUMENT_SCHEMA_VERSION) {
-    if (visited.has(version) || visited.size >= 32) return fail("SCHEMA_UNSUPPORTED", "Цикл или слишком длинная цепочка миграций.", "/schemaVersion");
-    visited.add(version);
-    const migration = [...migrations, ...builtinMigrations].find((entry) => entry.from === version);
-    if (!migration) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version} не поддерживается.`, "/schemaVersion");
-    try {
-      // Migration code is trusted application code; each step receives an isolated copy.
-      current = migration.migrate(JSON.parse(JSON.stringify(current)));
-    } catch {
-      return fail("FILE_INVALID", "Миграция документа завершилась ошибкой.", "/schemaVersion");
-    }
-    const next = versionOf(current);
-    if (!next.ok) return next;
-    if (next.value !== migration.to) return fail("FILE_INVALID", "Миграция вернула неожиданную версию.", "/schemaVersion");
-    version = next.value;
-  }
-  return { ok: true, value: current };
-}
-
-export function serializeProjectDocument(project: Project): Result<string> {
-  try {
-    const version = versionOf(project);
-    if (!version.ok) return version;
-    if (version.value !== DOCUMENT_SCHEMA_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version.value} не поддерживается.`, "/schemaVersion");
-    const checked = validateDocument(project);
-    if (!checked.ok) return checked;
-    const json = JSON.stringify(project);
-    if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
-    return { ok: true, value: json };
-  } catch {
-    return fail("FILE_INVALID", "Не удалось сериализовать документ.");
-  }
-}
-
-export function deserializeProjectDocument(json: string, migrations: readonly DocumentMigration[] = []): Result<Project> {
-  if (typeof json !== "string") return fail("FILE_INVALID", "Ожидается JSON-строка.");
-  if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
-  let parsed: unknown;
-  try { parsed = JSON.parse(json); } catch { return fail("FILE_INVALID", "Некорректный JSON."); }
-  const safety = inspect(parsed);
-  if (!safety.ok) return safety;
-  const migrated = migrateProjectDocument(parsed, migrations);
-  if (!migrated.ok) return migrated;
-  const checked = validateDocument(migrated.value);
-  if (!checked.ok) return checked;
-  // A parsed JSON tree is already independent; migrations are checked again above.
-  return checked;
-}
-
-function safeArchivePath(path: string): boolean {
-  return path.length > 0 && path.length <= 1024 && !/[\\:%]/.test(path) &&
-    !Array.from(path).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) &&
-    !path.startsWith("/") && !path.endsWith("/") &&
-    path.split("/").every((part) => part !== "" && part !== "." && part !== ".." && !/[. ]$/.test(part) &&
-      !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part));
-}
-
-export function validateNativeManifest(value: unknown): Result<NativeManifest> {
-  try {
-    const safety = inspect(value);
-    if (!safety.ok) return safety;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект manifest.");
-    const version = (value as Record<string, unknown>).formatVersion;
-    if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия manifest.", "/formatVersion");
-    if (version !== NATIVE_FORMAT_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия контейнера ${version} не поддерживается.`, "/formatVersion");
-    if (!isNativeManifest(value)) return schemaError(manifestValidator.errors);
-    const manifest = value;
-    const paths = new Set<string>([manifest.document.path.toLowerCase()]);
-    const ids = new Set<string>();
-    for (const [index, asset] of manifest.assets.entries()) {
-      if (!safeArchivePath(asset.path)) return fail("FILE_INVALID", "Недопустимый путь ресурса.", `/assets/${index}/path`);
-      const folded = asset.path.toLowerCase();
-      if (paths.has(folded)) return fail("FILE_INVALID", "Пути в manifest конфликтуют.", `/assets/${index}/path`);
-      if (ids.has(asset.id)) return fail("FILE_INVALID", "ID ресурса повторяется.", `/assets/${index}/id`);
-      paths.add(folded);
-      ids.add(asset.id);
-    }
-    return { ok: true, value: manifest };
-  } catch {
-    return fail("FILE_INVALID", "Не удалось проверить manifest.");
-  }
-}
-</file>
-
-<file path="src/domain/types.ts">
-export type EntityId = string;
-export type Vec3 = readonly [number, number, number];
-export type Quaternion = readonly [number, number, number, number];
-export type ColorRgb = readonly [number, number, number];
-
-export interface Transform {
-  position: Vec3;
-  rotationQuat: Quaternion;
-  scale: Vec3;
-}
-
-export interface Project {
-  schemaVersion: string;
-  id: EntityId;
-  name: string;
-  model: Model;
-  scene: Scene;
-  nodes: Node[];
-  modifiers: Modifier[];
-  materials: Material[];
-  assets: Asset[];
-  animations: AnimationClip[];
-  tracks: Track[];
-  keyframes: Keyframe[];
-}
-
-export interface Model {
-  id: EntityId;
-  rootNodeId: EntityId;
-  revision: number;
-}
-
-export interface Scene {
-  id: EntityId;
-  camera: CameraState;
-  background: SceneBackground;
-  lights: Light[];
-  instances: Instance[];
-}
-
-export interface CameraState {
-  projection: "perspective";
-  position: Vec3;
-  target: Vec3;
-  fovDegrees: number;
-  near: number;
-  far: number;
-}
-
-export interface SceneBackground {
-  color: ColorRgb;
-  environmentAssetId?: EntityId;
-  intensity: number;
-}
-
-export interface Light {
-  id: EntityId;
-  kind: "ambient" | "directional" | "point" | "spot";
-  color: ColorRgb;
-  intensity: number;
-  position: Vec3;
-  target: Vec3;
-}
-
-export interface Instance {
-  id: EntityId;
-  modelId: EntityId;
-  transform: Transform;
-  visible: boolean;
-}
-
-export interface GroupNode {
-  id: EntityId;
-  kind: "group";
-  name: string;
-  parentId: EntityId | null;
-  children: EntityId[];
-  transform: Transform;
-  visible: boolean;
-  locked: boolean;
-  materialSlots: MaterialSlot[];
-  modifierIds: EntityId[];
-}
-
-export interface MeshNode extends Omit<GroupNode, "kind"> {
-  kind: "mesh";
-  meshSource: MeshSource;
-}
-
-export type Node = GroupNode | MeshNode;
-
-export interface MaterialSlot {
-  name: string;
-  materialId: EntityId;
-}
-
-export type MeshSource =
-  | { kind: "primitive"; primitive: "cube" | "sphere" | "torus" | "cylinder" | "cone" | "plane"; parameters: Record<string, number> }
-  | { kind: "editable"; positions: number[]; indices: number[]; uv?: number[] }
-  | { kind: "asset"; assetId: EntityId };
-
-export interface Modifier {
-  id: EntityId;
-  nodeId: EntityId;
-  kind: "boolean" | "mirror" | "array" | "bend" | "twist" | "taper" | "bevel";
-  order: number;
-  enabled: boolean;
-  version: number;
-  parameters: Record<string, number | string | boolean | readonly number[]>;
-}
-
-export interface Material {
-  id: EntityId;
-  name: string;
-  baseColor: ColorRgb;
-  metalness: number;
-  roughness: number;
-  emissive: ColorRgb;
-  opacity: number;
-  transmission: number;
-  ior: number;
-  clearcoat: number;
-  envIntensity: number;
-  textureAssetIds: EntityId[];
-  textureSlots?: MaterialTextureSlots;
-}
-
-export interface MaterialTextureSlots { baseColor?: EntityId }
-
-export interface Asset {
-  id: EntityId;
-  hash: string;
-  mediaType: string;
-  path: string;
-  colorSpace: "srgb" | "linear" | "none";
-}
-
-export interface AnimationClip {
-  id: EntityId;
-  name: string;
-  durationSeconds: number;
-  loop: boolean;
-  trackIds: EntityId[];
-}
-
-export type TrackProperty = "transform.position" | "transform.rotationQuat" | "transform.scale";
-export type KeyframeValue = number | Vec3 | Quaternion;
-
-export interface Track {
-  id: EntityId;
-  nodeId: EntityId;
-  property: TrackProperty;
-  keyframeIds: EntityId[];
-}
-
-export interface Keyframe {
-  id: EntityId;
-  timeSeconds: number;
-  value: KeyframeValue;
-  interpolation: "step" | "linear" | "bezier";
-}
+export function isMaterial(value: unknown): value is Material { return validateMaterial(value).length === 0; }
 </file>
 
 <file path="src/geometry/mesh-edit.ts">
@@ -15240,6 +15512,398 @@ export function extrudeEditableFace(source: EditableMeshSource, faceId: number, 
 export { primitiveGeometry } from "../geometry/primitive-geometry";
 </file>
 
+<file path="src/ui/MaterialInspector.tsx">
+import { useEffect, useRef, useState } from "react";
+import type { EditorState, EditorStore } from "../app/editor-store";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
+import type { BaseColorProjection } from "../domain/types";
+import { materialNodeReason } from "../app/material-actions";
+import { isJobActive } from "../app/job-controller";
+import { materialPresets } from "../materials/presets";
+import { linearToHex, parseHexColor } from "../materials/color";
+
+const format = (value: number) => String(Number(value.toPrecision(12)));
+const scalarFields = [
+  { key: "metalness", label: "Металличность", min: 0, max: 1, step: .001 },
+  { key: "roughness", label: "Шероховатость", min: 0, max: 1, step: .001 },
+  { key: "opacity", label: "Непрозрачность", min: 0, max: 1, step: .001 },
+  { key: "transmission", label: "Пропускание света", min: 0, max: 1, step: .001 },
+  { key: "ior", label: "Преломление (IOR)", min: 1, max: 2.333, step: .001 },
+  { key: "clearcoat", label: "Лаковое покрытие", min: 0, max: 1, step: .001 },
+  { key: "envIntensity", label: "Интенсивность окружения", min: 0, max: 5, step: .01 },
+] as const;
+
+export function MaterialInspector({ store, state }: { store: EditorStore; state: EditorState }) {
+  const [mode, setMode] = useState<MaterialEditMode>("unique");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const session = useRef<{ context: MaterialEditContext; groupId: string; changed: boolean; field: string } | null>(null);
+  const skipBlur = useRef(false);
+  const epoch = store.getProjectEpoch();
+  const selection = state.selection.ids.join("\0");
+  useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
+
+  const node = state.selection.ids.length === 1 ? state.document.project.nodes.find(item => item.id === state.selection.activeId) : null;
+  const slot = node?.kind === "mesh" && node.materialSlots.length === 1 ? node.materialSlots[0] : null;
+  const material = state.document.project.materials.find(item => item.id === slot?.materialId);
+  const users = material ? materialUsage(store, material.id) : [];
+  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId)).find(Boolean) : null;
+  const reason = !node ? state.selection.ids.length > 1 ? "Несколько объектов: массовое редактирование материалов пока недоступно." : "Выберите Mesh с материалом."
+    : node.kind !== "mesh" ? "У группы нет редактируемого материала."
+    : node.meshSource.kind === "asset" ? "Внутренние материалы GLB доступны только для просмотра до поддержки отдельных слотов."
+    : !slot ? "Назначьте материал из библиотеки слева."
+    : !material ? "Назначенный материал не найден."
+    : isJobActive(state.job.status) ? "Дождитесь завершения операции."
+    : state.tool.mode !== "model" ? "В режиме «Сцена» свойства модели доступны только для просмотра."
+    : materialNodeReason(store, node.id) || sharedBlock || "";
+  const preset = materialPresets.find(item => item.name === material?.name);
+  const canEdit = !!material && !reason;
+  const rasterAssets = state.document.project.assets.filter(asset => ["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType));
+  const selectedTexture = material?.textureSlots?.baseColor;
+  const selectedAsset = state.document.project.assets.find(asset => asset.id === selectedTexture);
+  const missingUv = node?.kind === "mesh" && node.meshSource.kind === "editable" && !node.meshSource.uv;
+  const projection: BaseColorProjection = material?.textureMappings?.baseColor ?? { mode: "uv" };
+  function setProjection(value: BaseColorProjection) {
+    if (!canEdit) return;
+    const context = captureMaterialEdit(store, mode);
+    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
+    const result = editBaseColorProjection(store, context, value);
+    setError(result.ok ? "" : result.message);
+  }
+  function projectionNumber(label: string, value: number, change: (number: number) => BaseColorProjection) {
+    return <label key={label}>{label}<input type="text" inputMode="decimal" aria-label={label} value={editing === label ? draft : format(value)} disabled={!canEdit} onFocus={() => { setEditing(label); setDraft(format(value)); setError(""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== label) return; const raw = draft.trim(); const number = Number(raw); if (raw && Number.isFinite(number)) setProjection(change(number)); else setError("Введите конечное число."); setEditing(null); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+  }
+  function setTexture(assetId?: string) {
+    if (!canEdit) return;
+    const context = captureMaterialEdit(store, mode);
+    if (!context) { setError("Выбор изменился. Повторите действие."); return; }
+    const result = editBaseColorTexture(store, context, assetId);
+    setError(result.ok ? "" : result.message);
+  }
+
+  function start(field: string) {
+    const context = captureMaterialEdit(store, mode);
+    session.current = context ? { context, groupId: crypto.randomUUID(), changed: false, field } : null;
+    setError("");
+  }
+  function apply(field: MaterialField, value: number | readonly number[], grouped = false) {
+    if (!canEdit) return;
+    if (!session.current || session.current.field !== field) start(field);
+    const active = session.current;
+    if (!active) return;
+    const result = editMaterial(store, active.context, field, value, grouped ? active.groupId : undefined);
+    if (!result.ok) { setError(result.message); return; }
+    if (result.changed) {
+      active.changed = true;
+      active.context.revision = result.revision;
+      const updated = store.getSnapshot().document.project.nodes.find(item => item.id === active.context.nodeId);
+      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots[0]?.materialId ?? active.context.materialId;
+    }
+    setError("");
+    if (!grouped) session.current = null;
+  }
+  function finish() { session.current = null; setEditing(null); }
+  function escapeInput(target: HTMLInputElement) { skipBlur.current = true; finish(); target.blur(); }
+  function shouldSkipBlur() { if (!skipBlur.current) return false; skipBlur.current = false; return true; }
+  function cancel() {
+    const active = session.current;
+    if (active?.changed) {
+      const current = store.getSnapshot();
+      const result = store.cancelGesture(active.groupId, current.document.revision);
+      if (!result.ok) setError(result.message);
+    }
+    finish();
+  }
+  function commitNumber(field: MaterialField) {
+    const raw = draft.trim();
+    const value = Number(raw);
+    if (!raw || !Number.isFinite(value)) { setError("Введите конечное число."); finish(); return; }
+    apply(field, value);
+    finish();
+  }
+  function reset(field: MaterialField) {
+    if (!preset) return;
+    start(field);
+    apply(field, preset.material[field]);
+  }
+  function colorRow(field: "baseColor" | "emissive", label: string) {
+    if (!material) return null;
+    const color = material[field];
+    const hex = linearToHex(color);
+    const colorKey = `${field}-hex`;
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-color-line"><input type="color" aria-label={`${label}: палитра sRGB`} value={hex ?? "#ffffff"} disabled={!canEdit} onChange={event => { const parsed = parseHexColor(event.target.value); if (parsed) apply(field, parsed); }} />
+        <label>HEX sRGB<input type="text" aria-label={`${label}: HEX sRGB`} value={editing === colorKey ? draft : hex ?? ""} placeholder={hex ? undefined : "HDR"} disabled={!canEdit} onFocus={() => { start(field); setEditing(colorKey); setDraft(hex ?? ""); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur() || editing !== colorKey) return; const parsed = parseHexColor(draft); if (parsed) apply(field, parsed); else if (draft !== (hex ?? "")) setError("HEX должен содержать # и шесть цифр."); finish(); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+      {!hex && <p className="panel-hint">Цвет содержит HDR-компоненты. Палитра sRGB не показывает их точно; используйте числовые поля.</p>}
+      <div className="inspector-vector">{(["R", "G", "B"] as const).map((channel, index) => {
+        const key = `${field}-${index}`;
+        return <label key={key}>{channel} · linear<input type="text" inputMode="decimal" aria-label={`${label} ${channel} Linear-sRGB`} value={editing === key ? draft : format(color[index]!)} disabled={!canEdit} onFocus={() => { start(field); setEditing(key); setDraft(format(color[index]!)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === key) { const raw = draft.trim(); const value = Number(raw); if (raw && Number.isFinite(value)) apply(field, color.map((entry, i) => i === index ? value : entry)); else setError("Введите конечное число."); finish(); } }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
+      })}</div>
+    </div>;
+  }
+  function scalarRow(spec: typeof scalarFields[number]) {
+    if (!material) return null;
+    const field = spec.key;
+    const value = material[field];
+    return <div className="material-field" key={field}>
+      <div className="inspector-group-heading"><strong>{spec.label}</strong><button type="button" disabled={!canEdit || !preset} title={preset ? `Значение пресета «${preset.name}»` : "Пресет по имени не определён"} onClick={() => reset(field)}>Сбросить</button></div>
+      <div className="material-scalar-line"><input type="range" aria-label={`${spec.label}: слайдер`} min={spec.min} max={spec.max} step={spec.step} value={Math.min(spec.max, value)} disabled={!canEdit} onPointerDown={() => start(field)} onChange={event => apply(field, Number(event.target.value), true)} onPointerUp={finish} onKeyDown={event => { event.stopPropagation(); if (event.key === "Escape") { event.preventDefault(); cancel(); } else if (!session.current) start(field); }} onKeyUp={finish} />
+        <label><span className="sr-only">{spec.label}: точное значение</span><input type="text" inputMode="decimal" aria-label={`${spec.label}: точное значение`} value={editing === field ? draft : format(value)} disabled={!canEdit} onFocus={() => { start(field); setEditing(field); setDraft(format(value)); }} onChange={event => setDraft(event.target.value)} onBlur={() => { if (shouldSkipBlur()) return; if (editing === field) commitNumber(field); }} onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label></div>
+    </div>;
+  }
+  return <section className="material-inspector" aria-label="Материал"><h4>Материал</h4>
+    {material && <strong>{material.name}</strong>}
+    {users.length > 1 && <><p className="panel-hint">Материал используется несколькими объектами ({users.length} слотов).</p><fieldset className="material-mode"><legend>Редактировать</legend><label><input type="radio" checked={mode === "unique"} onChange={() => { setMode("unique"); finish(); }} /> Только выбранный объект</label><label><input type="radio" checked={mode === "shared"} onChange={() => { setMode("shared"); finish(); }} /> Все объекты с этим материалом</label></fieldset></>}
+    {reason && <p className="panel-hint">{reason}</p>}
+    {material && <>
+      <div className="material-fields"><h4>Основные</h4>{colorRow("baseColor", "Базовый цвет")}{scalarFields.slice(0, 3).map(scalarRow)}</div>
+      <div className="material-fields"><h4>Текстуры</h4><label>Основной цвет
+        <select aria-label="Текстура основного цвета" value={selectedTexture ?? ""} disabled={!canEdit} title={reason || undefined} onChange={event => setTexture(event.target.value || undefined)}>
+          <option value="">Не назначено</option>
+          {rasterAssets.map(asset => <option key={asset.id} value={asset.id}>{asset.path} · {asset.id}</option>)}
+          {selectedTexture && !selectedAsset && <option value={selectedTexture}>Недоступный ресурс · {selectedTexture}</option>}
+        </select></label>
+        {selectedAsset && <p className="panel-hint">{selectedAsset.path} · {selectedAsset.id}</p>}
+        <button type="button" disabled={!canEdit || !selectedTexture} title={reason || undefined} onClick={() => setTexture()}>Снять текстуру</button>
+        <label>Проекция текстуры<select aria-label="Проекция текстуры" value={projection.mode} disabled={!canEdit} onChange={event => setProjection(event.target.value === "planar" ? { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0] } : { mode: "uv" })}><option value="uv">UV</option><option value="planar">Плоскость</option></select></label>
+        {projection.mode === "planar" && <><label>Ось проекции<select aria-label="Ось проекции" value={projection.axis} disabled={!canEdit} onChange={event => setProjection({ ...projection, axis: event.target.value as "x" | "y" | "z" })}><option value="x">X</option><option value="y">Y</option><option value="z">Z</option></select></label>
+          <div className="inspector-vector">{projectionNumber("Повторение U", projection.tiling[0], number => ({ ...projection, tiling: [number, projection.tiling[1]] }))}{projectionNumber("Повторение V", projection.tiling[1], number => ({ ...projection, tiling: [projection.tiling[0], number] }))}{projectionNumber("Смещение U", projection.offset[0], number => ({ ...projection, offset: [number, projection.offset[1]] }))}{projectionNumber("Смещение V", projection.offset[1], number => ({ ...projection, offset: [projection.offset[0], number] }))}</div></>}
+        {missingUv && selectedTexture && projection.mode === "uv" && <p className="material-warning">У геометрии нет UV; текстура не отображается. Выберите «Плоскость» для проекции.</p>}
+        {selectedTexture && !store.readAssetBytes(selectedTexture) && <p className="material-warning">Байты текстуры недоступны в памяти.</p>}
+      </div>
+      <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
+      {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
+      {material.textureAssetIds.length > 0 && <p className="material-warning">У сохранённых legacy-ссылок на текстуры канал не определён.</p>}
+      {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}
+      {preset && <p className="panel-hint">Сброс использует одноимённый встроенный пресет как ориентир, без подтверждения происхождения материала.</p>}
+    </>}
+    {error && <p className="primitive-error" role="alert">{error}</p>}
+  </section>;
+}
+</file>
+
+<file path="tests/app/material-edit.test.ts">
+import { describe, expect, it } from "vitest";
+import { createEditorStore } from "../../src/app/editor-store";
+import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection } from "../../src/app/material-edit";
+import { materialPresets } from "../../src/materials/presets";
+import { linearToHex, parseHexColor } from "../../src/materials/color";
+import { serializeProjectDocument, deserializeProjectDocument } from "../../src/domain/project-serialization";
+import { createNativeProjectArchive, openNativeProjectArchive } from "../../src/assets/native-project-archive";
+import { AssetBytes } from "../../src/assets/asset-bytes";
+import { SceneSync } from "../../src/renderer/scene-sync";
+import * as T from "three";
+import { createNestedMeshProject } from "../fixtures/projects";
+
+function setup() {
+  const project = createNestedMeshProject();
+  const first = project.nodes.find(node => node.id === "mesh-node")!;
+  const second = structuredClone(first);
+  second.id = "second-mesh";
+  project.nodes.push(second);
+  project.nodes.find(node => node.id === "nested-group")!.children.push(second.id);
+  const preset = materialPresets[0]!;
+  project.materials.push({ ...structuredClone(preset.material), id: "shared-material", textureAssetIds: [] });
+  if (first.kind !== "mesh" || second.kind !== "mesh") throw new Error("fixture");
+  first.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
+  second.materialSlots = [{ name: "Основной", materialId: "shared-material" }];
+  const store = createEditorStore(project);
+  store.setSelection([first.id], first.id);
+  return store;
+}
+
+describe("material editing", () => {
+  it("changes projection atomically with copy-on-write, no-op, undo and native round-trip", async () => {
+    const store = setup();
+    const planar = { mode: "planar" as const, axis: "y" as const, tiling: [2, 3] as const, offset: [-.5, 1] as const };
+    const before = store.getSnapshot();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, { ...planar, tiling: [0, 1] }).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, planar)).toMatchObject({ ok: true, changed: true });
+    const project = store.captureDocument().project;
+    const id = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(id).not.toBe("shared-material");
+    expect(project.materials.find(material => material.id === id)?.textureMappings?.baseColor).toEqual(planar);
+    expect(project.materials.find(material => material.id === "shared-material")?.textureMappings).toBeUndefined();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, planar)).toMatchObject({ ok: true, changed: false });
+    const archive = await createNativeProjectArchive(project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const reopened = await openNativeProjectArchive(archive.value);
+      expect(reopened.ok).toBe(true);
+      if (reopened.ok) expect(reopened.value.project.materials.find(material => material.id === id)?.textureMappings?.baseColor).toEqual(planar);
+    }
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, { mode: "uv" })).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials.find(material => material.id === id)?.textureMappings).toBeUndefined();
+  });
+  it("assigns, replaces and removes a raster map with copy-on-write and native round-trip", async () => {
+    const store = setup();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(value => value.toString(16).padStart(2, "0")).join("");
+    const context = store.captureImportContext();
+    const asset = { id: "raster", hash, path: `assets/${hash}.png`, mediaType: "image/png", colorSpace: "srgb" as const };
+    expect((await store.addAsset({ commandId: crypto.randomUUID(), type: "ADD_ASSET", targetIds: [asset.id], payload: { asset } }, bytes, context.revision, context.identity)).ok).toBe(true);
+    const edit = captureMaterialEdit(store)!;
+    expect(editBaseColorTexture(store, edit, asset.id)).toMatchObject({ ok: true, changed: true });
+    const project = store.captureDocument().project;
+    const assignedId = project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(assignedId).not.toBe("shared-material");
+    expect(project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id);
+    expect(project.materials.find(item => item.id === "shared-material")?.textureSlots).toBeUndefined();
+    const saved = await createNativeProjectArchive(project, store.getAssetBytes(), "0.1.0");
+    expect(saved.ok).toBe(true);
+    if (saved.ok) {
+      const opened = await openNativeProjectArchive(saved.value);
+      expect(opened.ok).toBe(true);
+      if (opened.ok) { expect(opened.value.project.materials.find(item => item.id === assignedId)?.textureSlots?.baseColor).toBe(asset.id); expect(opened.value.assets.get(asset.id)).toEqual(bytes); }
+    }
+    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, asset.id)).toMatchObject({ ok: true, changed: false });
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(editBaseColorTexture(store, captureMaterialEdit(store)!, undefined)).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials.find(item => item.id === assignedId)?.textureSlots).toBeUndefined();
+  });
+  it("clones on unique edit, preserves other fields and links, and supports undo/redo and serialization", async () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    expect(editMaterial(store, context, "roughness", .123456789).ok).toBe(true);
+    const state = store.getSnapshot();
+    const firstId = state.document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(firstId).not.toBe("shared-material");
+    expect(state.document.project.nodes.find(node => node.id === "second-mesh")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(state.document.project.materials.find(item => item.id === firstId)).toMatchObject({ roughness: .123456789, metalness: 1, textureAssetIds: [] });
+    expect(state.document.project.materials.find(item => item.id === "shared-material")?.roughness).toBe(.07);
+    expect(state.history.entries).toHaveLength(1);
+    const saved = serializeProjectDocument(store.captureDocument().project);
+    expect(saved.ok).toBe(true);
+    if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: store.captureDocument().project });
+    const archive = await createNativeProjectArchive(store.captureDocument().project, new AssetBytes(), "0.1.0");
+    expect(archive.ok).toBe(true);
+    if (archive.ok) {
+      const reopened = await openNativeProjectArchive(archive.value);
+      expect(reopened.ok).toBe(true);
+      if (reopened.ok) expect(reopened.value.project).toEqual(store.captureDocument().project);
+    }
+    expect(store.undo(state.document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe("shared-material");
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId).toBe(firstId);
+  });
+
+  it("updates all references only in explicit shared mode and rejects hidden users", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store, "shared")!;
+    expect(editMaterial(store, context, "metalness", .4).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().document.project.materials[0]?.metalness).toBe(.4);
+    const revision = store.getSnapshot().document.revision;
+    expect(store.executeCommand({ commandId: "hide", type: "SET_NODE_FLAGS", targetIds: ["second-mesh"], payload: { nodeId: "second-mesh", visible: false } }, revision).ok).toBe(true);
+    const before = store.getSnapshot();
+    const denied = editMaterial(store, captureMaterialEdit(store, "shared")!, "roughness", .2);
+    expect(denied.ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(true);
+  });
+
+  it("updates SceneSync material without replacing mesh geometry", () => {
+    const store = setup();
+    const sync = new SceneSync(() => {});
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    const first = sync.objects.get("mesh-node")!.content as T.Mesh;
+    const second = sync.objects.get("second-mesh")!.content as T.Mesh;
+    const geometry = first.geometry;
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .21).ok).toBe(true);
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    expect(sync.objects.get("mesh-node")!.content).toBe(first);
+    expect(first.geometry).toBe(geometry);
+    expect((first.material as T.MeshPhysicalMaterial).roughness).toBe(.21);
+    expect((second.material as T.MeshPhysicalMaterial).roughness).toBe(.07);
+    store.setSelection(["second-mesh"], "second-mesh");
+    expect(editMaterial(store, captureMaterialEdit(store, "shared")!, "metalness", .4).ok).toBe(true);
+    sync.sync(store.getSnapshot().document.project, () => undefined);
+    expect((second.material as T.MeshPhysicalMaterial).metalness).toBe(.4);
+    sync.dispose();
+  });
+
+  it("rejects invalid values, transmission conflicts and stale context without mutations", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    const before = store.getSnapshot();
+    expect(editMaterial(store, context, "ior", Number.NaN).ok).toBe(false);
+    expect(editMaterial(store, context, "envIntensity", Infinity).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editMaterial(store, context, "transmission", .6).ok).toBe(true);
+    const updated = captureMaterialEdit(store)!;
+    const material = store.getSnapshot().document.project.materials.find(item => item.id === updated.materialId)!;
+    expect(material.transmission).toBe(.6);
+    expect(material.opacity).toBe(1);
+    const unchanged = store.getSnapshot();
+    expect(editMaterial(store, updated, "opacity", .5).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(unchanged);
+    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
+    store.setSelection(["second-mesh"], "second-mesh");
+    expect(editMaterial(store, updated, "roughness", .2).ok).toBe(false);
+  });
+
+  it("groups a unique slider gesture into one undo and cancels it", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    const group = "gesture";
+    const first = editMaterial(store, context, "roughness", .2, group);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    context.revision = first.revision;
+    context.materialId = store.getSnapshot().document.project.nodes.find(node => node.id === "mesh-node")!.materialSlots[0]!.materialId;
+    expect(editMaterial(store, context, "roughness", .3, group).ok).toBe(true);
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.cancelGesture(group, store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+  });
+
+  it("keeps no-ops out of history and converts colors without changing the document", () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    expect(editMaterial(store, context, "roughness", .07)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(0);
+    expect(store.getSnapshot().document.dirty).toBe(false);
+    expect(linearToHex(parseHexColor("#808080")!)).toBe("#808080");
+    expect(linearToHex([2, 0, 0])).toBeNull();
+    expect(parseHexColor("#bad")).toBeNull();
+  });
+
+  it("rejects scene mode, locked parent, active job and replaced project", async () => {
+    const store = setup();
+    const context = captureMaterialEdit(store)!;
+    store.setTool({ mode: "scene" });
+    expect(editMaterial(store, context, "roughness", .2).ok).toBe(false);
+    store.setTool({ mode: "model" });
+    expect(store.executeCommand({ commandId: "lock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: true } }, 0).ok).toBe(true);
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
+    expect(store.executeCommand({ commandId: "unlock-parent", type: "SET_NODE_FLAGS", targetIds: ["nested-group"], payload: { nodeId: "nested-group", locked: false } }, 1).ok).toBe(true);
+    let release!: () => void;
+    const pending = store.jobs.run({ id: "busy", name: "Проверка", cancellable: true, validate: () => null,
+      compute: () => new Promise<{ ok: true; value: string }>(resolve => { release = () => resolve({ ok: true, value: "done" }); }) });
+    await Promise.resolve();
+    expect(editMaterial(store, captureMaterialEdit(store)!, "roughness", .2).ok).toBe(false);
+    release();
+    await pending;
+    const old = captureMaterialEdit(store)!;
+    const captured = store.captureDocument();
+    expect(store.replaceProject({ project: createNestedMeshProject(), assets: captured.assets }, captured.identity)).toBe(true);
+    expect(editMaterial(store, old, "roughness", .2).ok).toBe(false);
+  });
+});
+</file>
+
 <file path="tests/assets/native-project-archive.test.ts">
 import { describe, expect, it } from "vitest";
 import { BlobReader, BlobWriter, TextReader, TextWriter, ZipReader, ZipWriter } from "@zip.js/zip.js";
@@ -15481,6 +16145,66 @@ describe("TASK-004 TSX export spike", () => {
 }
 </file>
 
+<file path="src/domain/create-project.ts">
+import type { EntityId, Project } from "./types";
+
+export type IdFactory = () => EntityId;
+
+export function createProject(idFactory: IdFactory = () => crypto.randomUUID()): Project {
+  const projectId = idFactory();
+  const modelId = idFactory();
+  const sceneId = idFactory();
+  const rootId = idFactory();
+  const lightId = idFactory();
+
+  return {
+    schemaVersion: "1.3.0",
+    id: projectId,
+    name: "Новый проект",
+    model: { id: modelId, rootNodeId: rootId, revision: 0 },
+    scene: {
+      id: sceneId,
+      camera: {
+        projection: "perspective",
+        position: [4, 3, 5],
+        target: [0, 0, 0],
+        fovDegrees: 45,
+        near: 0.1,
+        far: 1000,
+      },
+      background: { color: [0.12, 0.12, 0.12], intensity: 1 },
+      lights: [{
+        id: lightId,
+        kind: "ambient",
+        color: [1, 1, 1],
+        intensity: 0.8,
+        position: [0, 0, 0],
+        target: [0, 0, 0],
+      }],
+      instances: [],
+    },
+    nodes: [{
+      id: rootId,
+      kind: "group",
+      name: "Модель",
+      parentId: null,
+      children: [],
+      transform: { position: [0, 0, 0], rotationQuat: [0, 0, 0, 1], scale: [1, 1, 1] },
+      visible: true,
+      locked: false,
+      materialSlots: [],
+      modifierIds: [],
+    }],
+    modifiers: [],
+    materials: [],
+    assets: [],
+    animations: [],
+    tracks: [],
+    keyframes: [],
+  };
+}
+</file>
+
 <file path="src/domain/index.ts">
 export { createProject } from "./create-project";
 export type { IdFactory } from "./create-project";
@@ -15492,6 +16216,382 @@ export { serializeProjectDocument, deserializeProjectDocument, validateNativeMan
 export type { Result, SerializationError, SerializationErrorCode, NativeManifest, DocumentMigration } from "./project-serialization";
 export { applyProjectPatch, createCommandBus, CommandErrorCode } from "./command-bus";
 export type { CommandBus, CommandErrorCode as CommandFailureCode, CommandResult, PatchChange, ProjectCommand, ProjectPatch } from "./command-bus";
+</file>
+
+<file path="src/domain/project-serialization.ts">
+import Ajv2020 from "ajv/dist/2020.js";
+import documentSchema from "./schemas/document-v1.3.schema.json";
+import v12DocumentSchema from "./schemas/document-v1.2.schema.json";
+import previousDocumentSchema from "./schemas/document-v1.1.schema.json";
+import oldDocumentSchema from "./schemas/document-v1.schema.json";
+import manifestSchema from "./schemas/manifest-v1.schema.json";
+import type { Project } from "./types";
+import { validateProject } from "./validate-project";
+
+export const DOCUMENT_SCHEMA_VERSION = "1.3.0";
+export const NATIVE_FORMAT_VERSION = "1.0.0";
+export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
+
+export type SerializationErrorCode = "FILE_INVALID" | "SCHEMA_UNSUPPORTED";
+export interface SerializationError {
+  code: SerializationErrorCode;
+  message: string;
+  path?: string;
+  details?: string;
+}
+export type Result<T> = { ok: true; value: T } | { ok: false; error: SerializationError };
+
+export interface NativeManifest {
+  formatVersion: string;
+  appVersion: string;
+  document: { path: "document.json"; sha256: string };
+  assets: { id: string; path: string; sha256: string }[];
+}
+
+export interface DocumentMigration {
+  readonly from: string;
+  readonly to: string;
+  migrate(input: unknown): unknown;
+}
+
+const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
+const documentValidator = ajv.compile(documentSchema);
+const v12DocumentValidator = ajv.compile(v12DocumentSchema);
+const previousDocumentValidator = ajv.compile(previousDocumentSchema);
+const oldDocumentValidator = ajv.compile(oldDocumentSchema);
+const manifestValidator = ajv.compile(manifestSchema);
+const fail = (code: SerializationErrorCode, message: string, path?: string, details?: string): Result<never> => ({
+  ok: false, error: { code, message, ...(path === undefined ? {} : { path }), ...(details === undefined ? {} : { details }) },
+});
+
+function schemaError(errors: typeof documentValidator.errors): Result<never> {
+  const first = errors?.[0];
+  const path = first?.keyword === "required" && typeof first.params.missingProperty === "string"
+    ? `${first.instancePath}/${first.params.missingProperty}`
+    : first?.keyword === "additionalProperties" && typeof first.params.additionalProperty === "string"
+      ? `${first.instancePath}/${first.params.additionalProperty}` : first?.instancePath;
+  return fail("FILE_INVALID", "Структура документа не соответствует схеме.", path || "/", first?.message);
+}
+
+function inspect(value: unknown): Result<true> {
+  const active = new WeakSet<object>();
+  const stack: { value: unknown; depth: number; path: string; exit?: boolean }[] = [{ value, depth: 0, path: "/" }];
+  let count = 0;
+  while (stack.length) {
+    const item = stack.pop();
+    if (!item) break;
+    if (item.exit) {
+      active.delete(item.value as object);
+      continue;
+    }
+    if (++count > SERIALIZATION_LIMITS.maxValues) return fail("FILE_INVALID", "Превышен лимит элементов документа.", item.path);
+    if (item.depth > SERIALIZATION_LIMITS.maxDepth) return fail("FILE_INVALID", "Превышена глубина документа.", item.path);
+    if (typeof item.value === "number" && !Number.isFinite(item.value)) return fail("FILE_INVALID", "Число должно быть конечным.", item.path);
+    if (item.value && typeof item.value === "object") {
+      if (active.has(item.value)) return fail("FILE_INVALID", "Цикл в документе.", item.path);
+      active.add(item.value);
+      stack.push({ ...item, exit: true });
+      for (const key of Object.keys(item.value)) {
+        stack.push({ value: (item.value as Record<string, unknown>)[key], depth: item.depth + 1, path: `${item.path === "/" ? "" : item.path}/${key}` });
+      }
+    }
+  }
+  return { ok: true, value: true };
+}
+
+function isProject(value: unknown): value is Project {
+  return documentValidator(value);
+}
+
+function isNativeManifest(value: unknown): value is NativeManifest {
+  return manifestValidator(value);
+}
+
+function validateDocument(value: unknown): Result<Project> {
+  const safety = inspect(value);
+  if (!safety.ok) return safety;
+  if (!isProject(value)) return schemaError(documentValidator.errors);
+  const issues = validateProject(value);
+  if (issues.length) {
+    const issue = issues[0];
+    return fail("FILE_INVALID", "Нарушена целостность проекта.", issue?.path, issue?.code);
+  }
+  return { ok: true, value };
+}
+
+function versionOf(value: unknown): Result<string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект проекта.", "/");
+  const version = (value as Record<string, unknown>).schemaVersion;
+  if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия документа.", "/schemaVersion");
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) return fail("SCHEMA_UNSUPPORTED", "Неверный формат версии документа.", "/schemaVersion");
+  return { ok: true, value: version };
+}
+
+const builtinMigrations: readonly DocumentMigration[] = [{ from: "1.0.0", to: "1.1.0", migrate(input) {
+  if (!oldDocumentValidator(input)) throw new Error("Invalid v1 document");
+  return { ...(input as Record<string, unknown>), schemaVersion: "1.1.0" };
+} }, { from: "1.1.0", to: "1.2.0", migrate(input) {
+  if (!previousDocumentValidator(input)) throw new Error("Invalid v1.1 document");
+  return { ...(input as Record<string, unknown>), schemaVersion: "1.2.0" };
+} }, { from: "1.2.0", to: "1.3.0", migrate(input) {
+  if (!v12DocumentValidator(input)) throw new Error("Invalid v1.2 document");
+  return { ...(input as Record<string, unknown>), schemaVersion: "1.3.0" };
+} }];
+
+export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {
+  const initial = versionOf(value);
+  if (!initial.ok) return initial;
+  let version = initial.value;
+  let current = value;
+  const visited = new Set<string>();
+  while (version !== DOCUMENT_SCHEMA_VERSION) {
+    if (visited.has(version) || visited.size >= 32) return fail("SCHEMA_UNSUPPORTED", "Цикл или слишком длинная цепочка миграций.", "/schemaVersion");
+    visited.add(version);
+    const migration = [...migrations, ...builtinMigrations].find((entry) => entry.from === version);
+    if (!migration) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version} не поддерживается.`, "/schemaVersion");
+    try {
+      // Migration code is trusted application code; each step receives an isolated copy.
+      current = migration.migrate(JSON.parse(JSON.stringify(current)));
+    } catch {
+      return fail("FILE_INVALID", "Миграция документа завершилась ошибкой.", "/schemaVersion");
+    }
+    const next = versionOf(current);
+    if (!next.ok) return next;
+    if (next.value !== migration.to) return fail("FILE_INVALID", "Миграция вернула неожиданную версию.", "/schemaVersion");
+    version = next.value;
+  }
+  return { ok: true, value: current };
+}
+
+export function serializeProjectDocument(project: Project): Result<string> {
+  try {
+    const version = versionOf(project);
+    if (!version.ok) return version;
+    if (version.value !== DOCUMENT_SCHEMA_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия документа ${version.value} не поддерживается.`, "/schemaVersion");
+    const checked = validateDocument(project);
+    if (!checked.ok) return checked;
+    const json = JSON.stringify(project);
+    if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
+    return { ok: true, value: json };
+  } catch {
+    return fail("FILE_INVALID", "Не удалось сериализовать документ.");
+  }
+}
+
+export function deserializeProjectDocument(json: string, migrations: readonly DocumentMigration[] = []): Result<Project> {
+  if (typeof json !== "string") return fail("FILE_INVALID", "Ожидается JSON-строка.");
+  if (new TextEncoder().encode(json).byteLength > SERIALIZATION_LIMITS.maxJsonBytes) return fail("FILE_INVALID", "Превышен лимит размера документа.");
+  let parsed: unknown;
+  try { parsed = JSON.parse(json); } catch { return fail("FILE_INVALID", "Некорректный JSON."); }
+  const safety = inspect(parsed);
+  if (!safety.ok) return safety;
+  const migrated = migrateProjectDocument(parsed, migrations);
+  if (!migrated.ok) return migrated;
+  const checked = validateDocument(migrated.value);
+  if (!checked.ok) return checked;
+  // A parsed JSON tree is already independent; migrations are checked again above.
+  return checked;
+}
+
+function safeArchivePath(path: string): boolean {
+  return path.length > 0 && path.length <= 1024 && !/[\\:%]/.test(path) &&
+    !Array.from(path).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) &&
+    !path.startsWith("/") && !path.endsWith("/") &&
+    path.split("/").every((part) => part !== "" && part !== "." && part !== ".." && !/[. ]$/.test(part) &&
+      !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part));
+}
+
+export function validateNativeManifest(value: unknown): Result<NativeManifest> {
+  try {
+    const safety = inspect(value);
+    if (!safety.ok) return safety;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return fail("FILE_INVALID", "Ожидается объект manifest.");
+    const version = (value as Record<string, unknown>).formatVersion;
+    if (typeof version !== "string") return fail("FILE_INVALID", "Не указана версия manifest.", "/formatVersion");
+    if (version !== NATIVE_FORMAT_VERSION) return fail("SCHEMA_UNSUPPORTED", `Версия контейнера ${version} не поддерживается.`, "/formatVersion");
+    if (!isNativeManifest(value)) return schemaError(manifestValidator.errors);
+    const manifest = value;
+    const paths = new Set<string>([manifest.document.path.toLowerCase()]);
+    const ids = new Set<string>();
+    for (const [index, asset] of manifest.assets.entries()) {
+      if (!safeArchivePath(asset.path)) return fail("FILE_INVALID", "Недопустимый путь ресурса.", `/assets/${index}/path`);
+      const folded = asset.path.toLowerCase();
+      if (paths.has(folded)) return fail("FILE_INVALID", "Пути в manifest конфликтуют.", `/assets/${index}/path`);
+      if (ids.has(asset.id)) return fail("FILE_INVALID", "ID ресурса повторяется.", `/assets/${index}/id`);
+      paths.add(folded);
+      ids.add(asset.id);
+    }
+    return { ok: true, value: manifest };
+  } catch {
+    return fail("FILE_INVALID", "Не удалось проверить manifest.");
+  }
+}
+</file>
+
+<file path="src/domain/types.ts">
+export type EntityId = string;
+export type Vec3 = readonly [number, number, number];
+export type Quaternion = readonly [number, number, number, number];
+export type ColorRgb = readonly [number, number, number];
+
+export interface Transform {
+  position: Vec3;
+  rotationQuat: Quaternion;
+  scale: Vec3;
+}
+
+export interface Project {
+  schemaVersion: string;
+  id: EntityId;
+  name: string;
+  model: Model;
+  scene: Scene;
+  nodes: Node[];
+  modifiers: Modifier[];
+  materials: Material[];
+  assets: Asset[];
+  animations: AnimationClip[];
+  tracks: Track[];
+  keyframes: Keyframe[];
+}
+
+export interface Model {
+  id: EntityId;
+  rootNodeId: EntityId;
+  revision: number;
+}
+
+export interface Scene {
+  id: EntityId;
+  camera: CameraState;
+  background: SceneBackground;
+  lights: Light[];
+  instances: Instance[];
+}
+
+export interface CameraState {
+  projection: "perspective";
+  position: Vec3;
+  target: Vec3;
+  fovDegrees: number;
+  near: number;
+  far: number;
+}
+
+export interface SceneBackground {
+  color: ColorRgb;
+  environmentAssetId?: EntityId;
+  intensity: number;
+}
+
+export interface Light {
+  id: EntityId;
+  kind: "ambient" | "directional" | "point" | "spot";
+  color: ColorRgb;
+  intensity: number;
+  position: Vec3;
+  target: Vec3;
+}
+
+export interface Instance {
+  id: EntityId;
+  modelId: EntityId;
+  transform: Transform;
+  visible: boolean;
+}
+
+export interface GroupNode {
+  id: EntityId;
+  kind: "group";
+  name: string;
+  parentId: EntityId | null;
+  children: EntityId[];
+  transform: Transform;
+  visible: boolean;
+  locked: boolean;
+  materialSlots: MaterialSlot[];
+  modifierIds: EntityId[];
+}
+
+export interface MeshNode extends Omit<GroupNode, "kind"> {
+  kind: "mesh";
+  meshSource: MeshSource;
+}
+
+export type Node = GroupNode | MeshNode;
+
+export interface MaterialSlot {
+  name: string;
+  materialId: EntityId;
+}
+
+export type MeshSource =
+  | { kind: "primitive"; primitive: "cube" | "sphere" | "torus" | "cylinder" | "cone" | "plane"; parameters: Record<string, number> }
+  | { kind: "editable"; positions: number[]; indices: number[]; uv?: number[] }
+  | { kind: "asset"; assetId: EntityId };
+
+export interface Modifier {
+  id: EntityId;
+  nodeId: EntityId;
+  kind: "boolean" | "mirror" | "array" | "bend" | "twist" | "taper" | "bevel";
+  order: number;
+  enabled: boolean;
+  version: number;
+  parameters: Record<string, number | string | boolean | readonly number[]>;
+}
+
+export interface Material {
+  id: EntityId;
+  name: string;
+  baseColor: ColorRgb;
+  metalness: number;
+  roughness: number;
+  emissive: ColorRgb;
+  opacity: number;
+  transmission: number;
+  ior: number;
+  clearcoat: number;
+  envIntensity: number;
+  textureAssetIds: EntityId[];
+  textureSlots?: MaterialTextureSlots;
+  textureMappings?: { baseColor?: BaseColorProjection };
+}
+
+export interface MaterialTextureSlots { baseColor?: EntityId }
+export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] };
+
+export interface Asset {
+  id: EntityId;
+  hash: string;
+  mediaType: string;
+  path: string;
+  colorSpace: "srgb" | "linear" | "none";
+}
+
+export interface AnimationClip {
+  id: EntityId;
+  name: string;
+  durationSeconds: number;
+  loop: boolean;
+  trackIds: EntityId[];
+}
+
+export type TrackProperty = "transform.position" | "transform.rotationQuat" | "transform.scale";
+export type KeyframeValue = number | Vec3 | Quaternion;
+
+export interface Track {
+  id: EntityId;
+  nodeId: EntityId;
+  property: TrackProperty;
+  keyframeIds: EntityId[];
+}
+
+export interface Keyframe {
+  id: EntityId;
+  timeSeconds: number;
+  value: KeyframeValue;
+  interpolation: "step" | "linear" | "bezier";
+}
 </file>
 
 <file path="src/renderer/modifier-preview.ts">
@@ -16660,6 +17760,7 @@ export class ModifierEvaluator {
 
 <file path="tests/domain/serialization.test.ts">
 import { describe, expect, it } from "vitest";
+import type { BaseColorProjection } from "../../src/domain/types";
 import {
   deserializeProjectDocument, migrateProjectDocument, serializeProjectDocument,
   validateNativeManifest, type NativeManifest,
@@ -16673,6 +17774,27 @@ const clone = <T>(value: T): T => structuredClone(value);
 const jsonOf = (value: unknown) => JSON.stringify(value);
 
 describe("project document schema v1", () => {
+  it("migrates 1.2 without adding projection and validates 1.3 projection bounds", () => {
+    const old = createMaterialAnimationProject(); old.schemaVersion = "1.2.0";
+    const migrated = deserializeProjectDocument(jsonOf(old));
+    expect(migrated.ok).toBe(true);
+    if (!migrated.ok) return;
+    expect(migrated.value.schemaVersion).toBe("1.3.0");
+    expect(migrated.value.materials[0]!.textureMappings).toBeUndefined();
+    const material = migrated.value.materials[0]!;
+    material.textureMappings = { baseColor: { mode: "planar", axis: "z", tiling: [1024, .01], offset: [-100000, 100000] } };
+    expect(serializeProjectDocument(migrated.value).ok).toBe(true);
+    for (const bad of [
+      { mode: "uv", axis: "z" }, { mode: "box" },
+      { mode: "planar", axis: "w", tiling: [1, 1], offset: [0, 0] },
+      { mode: "planar", axis: "z", tiling: [0, 1], offset: [0, 0] },
+      { mode: "planar", axis: "z", tiling: [1, 1], offset: [Infinity, 0] },
+      { mode: "planar", axis: "z", tiling: [1, 1], offset: [0, 0], extra: 1 },
+    ]) {
+      material.textureMappings = { baseColor: bad as BaseColorProjection };
+      expect(serializeProjectDocument(migrated.value).ok).toBe(false);
+    }
+  });
   it.each([emptyProject, createNestedMeshProject(), createMaterialAnimationProject()])("round-trips complete projects", (project) => {
     const before = clone(project);
     const serialized = serializeProjectDocument(project);
@@ -16736,7 +17858,7 @@ describe("project document schema v1", () => {
     if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
   });
 
-  it.each(["2.0.0", "1.3.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+  it.each(["2.0.0", "1.4.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
     const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
@@ -16778,7 +17900,7 @@ describe("project document schema v1", () => {
     const result = deserializeProjectDocument(jsonOf(old));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.value.schemaVersion).toBe("1.2.0");
+      expect(result.value.schemaVersion).toBe("1.3.0");
       expect(result.value.materials[0]!.textureAssetIds).toEqual(["legacy-image"]);
       expect(result.value.materials[0]!.textureSlots).toBeUndefined();
     }
@@ -16820,7 +17942,7 @@ describe("native manifest v1", () => {
 
 ## Native `.triad3d` container (TASK-010A)
 
-The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. New documents use `schemaVersion: "1.2.0"`; the unchanged ZIP container uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
+The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. New documents use `schemaVersion: "1.3.0"`; the unchanged ZIP container uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
 
 The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
 
@@ -16860,7 +17982,7 @@ A confirmed static GLB 2.0 is stored unchanged as `assets/<sha256>.glb` with `me
 
 ## JSON document v1.2 and native manifest v1
 
-- `document.json` uses the current `Project` shape and `schemaVersion: "1.2.0"`. Its authoritative machine-readable contract is [`document-v1.2.schema.json`](../src/domain/schemas/document-v1.2.schema.json). Strict [v1.0](../src/domain/schemas/document-v1.schema.json) and [v1.1](../src/domain/schemas/document-v1.1.schema.json) schemas validate old documents before sequential in-memory migrations change only `schemaVersion`. `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
+- `document.json` uses the current `Project` shape and `schemaVersion: "1.3.0"`. Its authoritative machine-readable contract is [`document-v1.3.schema.json`](../src/domain/schemas/document-v1.3.schema.json). Strict [v1.0](../src/domain/schemas/document-v1.schema.json), [v1.1](../src/domain/schemas/document-v1.1.schema.json), and [v1.2](../src/domain/schemas/document-v1.2.schema.json) schemas validate old documents before sequential in-memory migrations change only `schemaVersion`. Optional `Material.textureMappings.baseColor` selects historical UV or local-space Planar projection (X=Z/Y, Y=X/Z, Z=X/Y), with positive tiling and finite offset; it does not change `MeshSource`. `model.revision` is persisted; session transaction revision, UI state, history, derived meshes, and asset bytes are omitted.
 - `manifest.json` uses `formatVersion: "1.0.0"`, `appVersion`, `document: { path: "document.json", sha256 }`, and `assets: [{ id, path, sha256 }]`. Its schema is [`manifest-v1.schema.json`](../src/domain/schemas/manifest-v1.schema.json). Hashes are 64 hexadecimal SHA-256 digits. Paths are relative POSIX archive paths; traversal, backslashes, encoded paths, control characters, duplicate IDs and case-insensitive path collisions are rejected. This stage validates syntax only; hashing bytes and checking archive contents belong to TASK-010.
 - Public pure API: `serializeProjectDocument(Project): Result<string>`, `deserializeProjectDocument(string, migrations?): Result<Project>`, `validateNativeManifest(unknown): Result<NativeManifest>`, and `migrateProjectDocument(unknown, migrations?): Result<unknown>`. Errors use `FILE_INVALID` or `SCHEMA_UNSUPPORTED`, with a field path where available. The v1.0 → v1.1 → v1.2 migrations are built in; unknown versions are rejected.
 - Engineering input guards: 16 MiB JSON, depth 64, and 250,000 traversed values. These are defensive limits, not approved scene performance limits. Strict schema validation does not coerce, remove, or default properties. All imports remain detached from EditorStore until TASK-010.
@@ -17926,6 +19048,7 @@ import { SurfaceQuery } from "../geometry/surface-query";
 import { validateMesh, type MeshData } from "../geometry/csg";
 import { createPhysicalMaterial } from "./pbr-material";
 import { BaseColorTextures } from "./base-color-textures";
+import { ProjectionGeometry } from "./planar-projection";
 
 export type RenderProject = DeepReadonly<Project>;
 export type AssetReader = (id: string) => Uint8Array | undefined;
@@ -17982,17 +19105,19 @@ export class SceneSync {
   private nodeMaterials = new Map<string, DeepReadonly<Material> | undefined>();
   private closed = false;
   private textures = new BaseColorTextures(() => this.emit());
+  private projection = new ProjectionGeometry();
   private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
   private readAsset: AssetReader = () => undefined;
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
-  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string): T.MeshPhysicalMaterial {
+  private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): T.MeshPhysicalMaterial {
     const material = ownedMaterial(value);
     const id = value?.textureSlots?.baseColor;
     if (!id) return material;
+    if (imported && value?.textureMappings?.baseColor?.mode === "planar") { this.diagnostics.push(`${name}: плоская проекция для импортированного GLB недоступна.`); return material; }
     if (!geometry.getAttribute("uv")) { this.diagnostics.push(`${name}: у геометрии нет UV; текстура основного цвета не отображается.`); return material; }
     const asset = this.assets.get(id);
     if (!asset || !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) { this.diagnostics.push(`${name}: ресурс основного цвета недоступен или имеет неподдерживаемый формат.`); return material; }
-    this.textures.bind(material, asset, this.readAsset);
+    this.textures.bind(material, asset, this.readAsset, value?.textureMappings?.baseColor?.mode === "planar");
     return material;
   }
   private disposeContent(content: T.Object3D): void { this.textures.releaseObject(content); disposeObject(content); }
@@ -18042,7 +19167,13 @@ export class SceneSync {
       if (key === entry.key) continue;
       const sourceKey = JSON.stringify([source, asset]);
       if (entry.content && entry.sourceKey === sourceKey && (source?.kind !== "asset" || materials.length > 0)) {
-        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
+        if (source?.kind !== "asset") entry.content.traverse(object => { if (object instanceof T.Mesh) this.projection.apply(object.geometry, materials[0]?.textureMappings?.baseColor); });
+        if (this.derived.has(node.id)) {
+          const warnings = (this.modifierDiagnostics.get(node.id) ?? []).filter(message => !message.includes("у результата модификатора нет UV"));
+          if (materials[0]?.textureSlots?.baseColor && entry.content instanceof T.Mesh && !entry.content.geometry.getAttribute("uv")) warnings.push(`${node.id}: у результата модификатора нет UV; текстура основного цвета не отображается.`);
+          if (warnings.length) this.modifierDiagnostics.set(node.id, warnings); else this.modifierDiagnostics.delete(node.id);
+        }
+        replaceMaterials(entry.content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, source?.kind === "asset"), material => this.textures.release(material));
         entry.key = key;
         continue;
       }
@@ -18058,6 +19189,7 @@ export class SceneSync {
       try {
         if (source.kind === "primitive" || source.kind === "editable") {
           const geometry = source.kind === "primitive" ? primitiveGeometry(source) : editableGeometry(source);
+          this.projection.apply(geometry, materials[0]?.textureMappings?.baseColor);
           assign(new T.Mesh(geometry, this.makeMaterial(materials[0], geometry, node.name)));
         }
         else {
@@ -18067,7 +19199,7 @@ export class SceneSync {
           next.loading = true;
           void this.decoder(bytes).then(content => {
             // Keep imported materials when there is no explicit domain slot assignment.
-            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name), material => this.textures.release(material));
+            if (materials.length && this.objects.get(node.id) === next && !this.closed) replaceMaterials(content, materials, (value, geometry) => this.makeMaterial(value, geometry, node.name, true), material => this.textures.release(material));
             assign(content);
           }).catch((error: unknown) => { if (!this.closed && this.objects.get(node.id) === next) { next.loading = false; next.error = error instanceof Error ? error.message : "Ошибка декодирования GLB."; this.emit(); } });
         }
@@ -18105,6 +19237,7 @@ export class SceneSync {
         geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
         geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
         geometry.computeVertexNormals();
+        this.projection.apply(geometry, this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor);
         content = new T.Mesh(geometry, this.makeMaterial(this.nodeMaterials.get(nodeId), geometry, nodeId));
       }
       if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); delete entry.content; }
@@ -20377,6 +21510,8 @@ function EditorShell() {
 - **CODEX-031A / TASK-031 / FR-029 (частично):** Карточки пресетов поддерживают нативный Drag & Drop на фактический Mesh под указателем через SurfaceQuery, без смены selection. Общий action назначает материал через одну атомарную транзакцию; кнопка «Назначить», повторное использование материала, Undo/Redo и no-op сохранены. Внутренний MIME принимает только ID из локального реестра и активную RAM drag-сессию с ревизией/эпохой; недопустимые цели и GLB отклоняются с сообщением. Schema/архив не менялись. Typecheck, lint, build и 28 целевых тестов PASS. Браузер открыл WebGPU и WebGL2, но визуальный drag/drop не удалось подтвердить: захват canvas показывал однородный фон и пробный drag не дал наблюдаемого изменения (UNVERIFIED). Material Inspector остаётся отдельной частью TASK-031.
 - **CODEX-031B / TASK-031 (реализовано, ручная приёмка не подтверждена):** Правый Inspector показывает действующий доменный PBR-материал, Basic/Advanced-поля, Linear-sRGB и HEX, точные числовые поля, слайдеры и сброс отдельных свойств по однозначному совпадению имени встроенного пресета. Первое изменение общего материала в безопасном режиме создаёт копию с новым ID и переназначает один Mesh атомарно; явный общий режим обновляет все ссылки и запрещён при недоступном связанном объекте. Записи проверяют эпоху, ревизию, выбор, слот, права и полную валидацию; слайдер объединяет Undo, Esc откатывает жест. Transmission автоматически устанавливает opacity=1 с пояснением. Текстуры сохраняются без редактирования и пока не отображаются renderer. Схема/архив не менялись. Typecheck, lint, build и 65 целевых тестов PASS. Ручной desktop smoke и аппаратное сравнение WebGPU/WebGL2 в этом задании не выполнены; визуальный критерий остаётся UNVERIFIED. Сборка сохраняет существующее предупреждение о крупном chunk.
 - **CODEX-032A / TASK-032 (частично):** Добавлена проверка и регистрация PNG/JPEG/WebP/HDR/EXR с лимитами 64 МиБ файла и 128 МиБ временного бюджета декодирования. Растры декодируются браузером, HDR/EXR — Three.js; исходные байты и SHA-256 сохраняются в RAM и нативном архиве. ADD_ASSET и EditorStore поддерживают дедупликацию, Undo/Redo, отсечение байтов недоступной ветки истории и проверку актуальности проекта. В библиотеке появились ресурсы и растровые превью с освобождением Blob URL. Typecheck, lint, build и 67 целевых тестов PASS; headless Chrome декодировал PNG/JPEG/WebP, полный ручной UI smoke UNVERIFIED. Назначение PBR-карт и HDRI остаётся следующим этапом. SchemaVersion, formatVersion и manifest не менялись.
+
+- **CODEX-033A / TASK-033 (частично):** Добавлена необязательная UV/Planar-проекция baseColor в домен и схему 1.3.0; старые документы 1.0–1.2 мигрируют с прежней UV-семантикой. Inspector управляет осью, повторением и смещением через material-edit и Undo/Redo. SceneSync строит UV только в renderer-owned геометрии, восстанавливает авторские UV и разделяет sampler для UV и Planar. Box/Triplanar остаются в TASK-033. Typecheck, lint, build и полный Vitest (49 файлов, 345 тестов) прошли; последующие целевые проверки (3 файла, 16 тестов) прошли. Ручной smoke в браузере подтвердил UV↔Planar с PNG на кубе в WebGPU и Planar в WebGL2; Editable Mesh без UV и save/reopen подтверждены автоматическими проверками, но ручной визуальный сценарий для них не выполнен.
 </file>
 
 </files>

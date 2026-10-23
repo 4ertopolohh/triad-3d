@@ -28,6 +28,21 @@ function setup() {
 }
 
 describe("material editing", () => {
+  it("edits Box through the existing transaction, rejects invalid input and restores it through undo", () => {
+    const store = setup();
+    const box = { mode: "box" as const, tiling: [2, 3] as const, offset: [4, -5] as const };
+    const before = store.getSnapshot();
+    expect(editBaseColorProjection(store, captureMaterialEdit(store)!, { ...box, tiling: [0, 3] }).ok).toBe(false);
+    expect(store.getSnapshot()).toBe(before);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store, "shared")!, box)).toMatchObject({ ok: true, changed: true });
+    expect(store.getSnapshot().document.project.materials).toHaveLength(1);
+    expect(editBaseColorProjection(store, captureMaterialEdit(store, "shared")!, box)).toMatchObject({ ok: true, changed: false });
+    expect(store.getSnapshot().history.entries).toHaveLength(1);
+    expect(store.undo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials[0]!.textureMappings).toBeUndefined();
+    expect(store.redo(store.getSnapshot().document.revision).ok).toBe(true);
+    expect(store.getSnapshot().document.project.materials[0]!.textureMappings?.baseColor).toEqual(box);
+  });
   it("changes projection atomically with copy-on-write, no-op, undo and native round-trip", async () => {
     const store = setup();
     const planar = { mode: "planar" as const, axis: "y" as const, tiling: [2, 3] as const, offset: [-.5, 1] as const };

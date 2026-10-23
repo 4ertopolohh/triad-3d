@@ -13,18 +13,39 @@ const clone = <T>(value: T): T => structuredClone(value);
 const jsonOf = (value: unknown) => JSON.stringify(value);
 
 describe("project document schema v1", () => {
+  it("migrates 1.3 without changing projection and rejects Box in historical documents", () => {
+    const old = createMaterialAnimationProject();
+    old.schemaVersion = "1.3.0";
+    old.materials[0]!.textureMappings = { baseColor: { mode: "planar", axis: "x", tiling: [2, 1], offset: [3, 4] } };
+    const migrated = deserializeProjectDocument(jsonOf(old));
+    expect(migrated.ok).toBe(true);
+    if (migrated.ok) {
+      expect(migrated.value.schemaVersion).toBe("1.4.0");
+      expect(migrated.value.materials[0]!.textureMappings).toEqual(old.materials[0]!.textureMappings);
+    }
+    old.materials[0]!.textureMappings = { baseColor: { mode: "box", tiling: [1, 1], offset: [0, 0] } };
+    expect(deserializeProjectDocument(jsonOf(old)).ok).toBe(false);
+  });
   it("migrates 1.2 without adding projection and validates 1.3 projection bounds", () => {
     const old = createMaterialAnimationProject(); old.schemaVersion = "1.2.0";
     const migrated = deserializeProjectDocument(jsonOf(old));
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
-    expect(migrated.value.schemaVersion).toBe("1.3.0");
+    expect(migrated.value.schemaVersion).toBe("1.4.0");
     expect(migrated.value.materials[0]!.textureMappings).toBeUndefined();
     const material = migrated.value.materials[0]!;
     material.textureMappings = { baseColor: { mode: "planar", axis: "z", tiling: [1024, .01], offset: [-100000, 100000] } };
     expect(serializeProjectDocument(migrated.value).ok).toBe(true);
+    material.textureMappings = { baseColor: { mode: "box", tiling: [2, 3], offset: [-1, 4] } };
+    const boxed = serializeProjectDocument(migrated.value);
+    expect(boxed.ok).toBe(true);
+    if (boxed.ok) expect(deserializeProjectDocument(boxed.value)).toEqual({ ok: true, value: migrated.value });
     for (const bad of [
       { mode: "uv", axis: "z" }, { mode: "box" },
+      { mode: "box", tiling: [0, 1], offset: [0, 0] },
+      { mode: "box", tiling: [1025, 1], offset: [0, 0] },
+      { mode: "box", tiling: [1, 1], offset: [100001, 0] },
+      { mode: "box", axis: "z", tiling: [1, 1], offset: [0, 0] },
       { mode: "planar", axis: "w", tiling: [1, 1], offset: [0, 0] },
       { mode: "planar", axis: "z", tiling: [0, 1], offset: [0, 0] },
       { mode: "planar", axis: "z", tiling: [1, 1], offset: [Infinity, 0] },
@@ -97,7 +118,7 @@ describe("project document schema v1", () => {
     if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
   });
 
-  it.each(["2.0.0", "1.4.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+  it.each(["2.0.0", "1.5.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
     const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
@@ -139,7 +160,7 @@ describe("project document schema v1", () => {
     const result = deserializeProjectDocument(jsonOf(old));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.value.schemaVersion).toBe("1.3.0");
+      expect(result.value.schemaVersion).toBe("1.4.0");
       expect(result.value.materials[0]!.textureAssetIds).toEqual(["legacy-image"]);
       expect(result.value.materials[0]!.textureSlots).toBeUndefined();
     }

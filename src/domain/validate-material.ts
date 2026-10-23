@@ -45,8 +45,9 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
         const config = projection as Record<string, unknown>;
         if (config.mode === "uv") {
           if (Object.keys(config).some(key => key !== "mode")) add("textureMappings.baseColor", "Режим UV не принимает параметры проекции.");
-        } else if (config.mode === "planar") {
-          if (Object.keys(config).some(key => !["mode", "axis", "tiling", "offset"].includes(key)) || !["x", "y", "z"].includes(config.axis as string)) add("textureMappings.baseColor", "Некорректная ось или поля проекции.");
+        } else if (config.mode === "planar" || config.mode === "box") {
+          if (Object.keys(config).some(key => !(config.mode === "planar" ? ["mode", "axis", "tiling", "offset"] : ["mode", "tiling", "offset"]).includes(key))
+            || config.mode === "planar" && !["x", "y", "z"].includes(config.axis as string)) add("textureMappings.baseColor", "Некорректная ось или поля проекции.");
           const pair = (value: unknown, positive: boolean) => Array.isArray(value) && value.length === 2 && value.every(number => typeof number === "number" && Number.isFinite(number) && (positive ? number > 0 && number <= 1024 : Math.abs(number) <= 100000));
           if (!pair(config.tiling, true)) add("textureMappings.baseColor.tiling", "Повторение должно содержать два конечных положительных числа не больше 1024.");
           if (!pair(config.offset, false)) add("textureMappings.baseColor.offset", "Смещение должно содержать два конечных числа по модулю не больше 100000.");

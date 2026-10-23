@@ -7,6 +7,7 @@ export function pickEditableVertex(hit: SurfaceHit, source: { readonly positions
   const geometry = hit.mesh.geometry;
   const positions = geometry.getAttribute("position");
   const index = geometry.index;
+  const sourceIndices = geometry.userData.sourceVertexIndices as Uint32Array | undefined;
   const face = hit.faceIndex;
   if (!positions || face === undefined || rect.width <= 0 || rect.height <= 0) return null;
   const representatives = new Map<string, number>();
@@ -19,13 +20,14 @@ export function pickEditableVertex(hit: SurfaceHit, source: { readonly positions
   let distance = tolerance * tolerance;
   for (let corner = 0; corner < 3; corner++) {
     const renderIndex = index ? index.getX(face * 3 + corner) : face * 3 + corner;
-    if (!Number.isSafeInteger(renderIndex) || renderIndex < 0 || renderIndex >= positions.count || renderIndex >= source.positions.length / 3) continue;
+    const sourceIndex = sourceIndices?.[renderIndex] ?? renderIndex;
+    if (!Number.isSafeInteger(renderIndex) || renderIndex < 0 || renderIndex >= positions.count || sourceIndex >= source.positions.length / 3) continue;
     const point = new T.Vector3().fromBufferAttribute(positions, renderIndex).applyMatrix4(hit.mesh.matrixWorld).project(camera);
     if (point.z < -1 || point.z > 1) continue;
     const x = rect.left + (point.x + 1) * rect.width / 2;
     const y = rect.top + (1 - point.y) * rect.height / 2;
     const squared = (x - clientX) ** 2 + (y - clientY) ** 2;
-    if (squared <= distance) { distance = squared; best = representatives.get(vertexKey(source.positions, renderIndex)) ?? null; }
+    if (squared <= distance) { distance = squared; best = representatives.get(vertexKey(source.positions, sourceIndex)) ?? null; }
   }
   return best;
 }
