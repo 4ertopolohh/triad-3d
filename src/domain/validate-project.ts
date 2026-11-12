@@ -6,7 +6,7 @@ import { parseMirrorParameters } from "../geometry/modifiers/mirror";
 import { parseBevelParameters } from "../geometry/modifiers/bevel";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
 import { validateMaterial } from "./validate-material";
-import { sceneSettings, sceneSettingsError } from "./scene-settings";
+import { sceneExtensionsError } from "./scene-settings";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -25,7 +25,7 @@ export interface ValidationIssue {
 
 export function validateProject(project: Project): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
-  const sceneError = sceneSettingsError(sceneSettings(project.scene));
+  const sceneError = sceneExtensionsError(project.scene);
   if (sceneError) issues.push({ code: "INVALID_STRUCTURE", path: "scene", message: sceneError });
   const entities = new Map<EntityId, string>();
   const register = (id: EntityId, path: string): void => {

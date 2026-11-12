@@ -6,13 +6,14 @@ import { linearToHex, parseHexColor as hexToLinear } from "../materials/color";
 
 /** A draft is bound to its source revision: blur can never overwrite a newer document. */
 function NumericField({ label, value, disabled, onChange }: { label: string; value: number; disabled: boolean; onChange: (value: number) => void }) {
-  const [draft, setDraft] = useState(String(Number(value.toPrecision(8))));
+  const [draft, setDraft] = useState(String(value));
   const [error, setError] = useState(false);
   const commit = useRef<((value: number) => void) | null>(null);
+  const touched = useRef(false);
   return <label>{label}<input type="number" step="any" aria-label={label} disabled={disabled} value={draft}
-    onFocus={() => { commit.current = onChange; }}
-    onChange={event => { setDraft(event.target.value); setError(false); }}
-    onBlur={() => { const apply = commit.current; commit.current = null; const n = Number(draft); if (!draft.trim() || !Number.isFinite(n)) { setError(true); return; } if (n !== value) apply?.(n); }}
+    onFocus={() => { commit.current = onChange; touched.current = false; }}
+    onChange={event => { touched.current = true; setDraft(event.target.value); setError(false); }}
+    onBlur={() => { const apply = commit.current; commit.current = null; if (!touched.current) return; const n = Number(draft); if (!draft.trim() || !Number.isFinite(n)) { setError(true); return; } if (n !== value) apply?.(n); }}
     onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { commit.current = null; setDraft(String(value)); setError(false); event.currentTarget.blur(); } }} aria-invalid={error} />{error && <small role="alert">Введите конечное число.</small>}</label>;
 }
 

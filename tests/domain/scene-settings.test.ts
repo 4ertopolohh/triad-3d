@@ -9,6 +9,7 @@ import { AssetBytes } from "../../src/assets/asset-bytes";
 describe("scene settings transactions", () => {
   it("migrates a 1.6 scene without changing its appearance defaults and rejects new fields in the old schema", async () => {
     const old = { ...createProject(), schemaVersion: "1.6.0" };
+    old.scene.lights.push({ id: "legacy-dark-light", kind: "directional", color: [1, 1, 1], intensity: 0, position: [0, 0, 0], target: [0, 0, 0] });
     const migrated = deserializeProjectDocument(JSON.stringify(old));
     expect(migrated).toMatchObject({ ok: true, value: { schemaVersion: "1.7.0", scene: old.scene } });
     expect(deserializeProjectDocument(JSON.stringify({ ...old, scene: { ...old.scene, renderSettings: { exposure: 2, toneMapping: "aces" } } })).ok).toBe(false);
@@ -46,6 +47,8 @@ describe("scene settings transactions", () => {
     const base = sceneSettings(before.project.scene);
     const invalid: SceneSettings[] = [
       { ...base, camera: { ...base.camera, far: .01 } },
+      { ...base, camera: { ...base.camera, fovDegrees: 1e-320 } },
+      { ...base, camera: { ...base.camera, position: [1e308, 0, 0], target: [-1e308, 0, 0] } },
       { ...base, background: { ...base.background, environmentAssetId: "missing" } },
       { ...base, background: { ...base.background, environmentIntensity: -1 } },
       { ...base, renderSettings: { exposure: NaN, toneMapping: "aces" } },
