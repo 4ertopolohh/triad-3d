@@ -151,7 +151,8 @@ function validCommand(value: unknown): value is ProjectCommand {
     && same(value.targetIds, [payload.sceneId]) && sceneSettingsError(payload.settings) === null;
   if (value.type === "ADD_ASSET") {
     const asset = payload.asset;
-    return ownKeys(payload, ["asset"]) && record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
+    return ownKeys(payload, ["asset"]) && record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace", "license"])
+      && (asset.license===undefined||typeof asset.license==="string"&&!!asset.license.trim()&&asset.license.length<=16384)
       && id(asset.id) && /^[a-f0-9]{64}$/.test(String(asset.hash))
       && /^(image\/(?:png|jpeg|webp|vnd\.radiance|x-exr))$/.test(String(asset.mediaType))
       && asset.path === `assets/${asset.hash}.${asset.mediaType === "image/jpeg" ? "jpg" : asset.mediaType === "image/vnd.radiance" ? "hdr" : asset.mediaType === "image/x-exr" ? "exr" : String(asset.mediaType).slice(6)}`

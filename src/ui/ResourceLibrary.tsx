@@ -35,7 +35,7 @@ export function ResourceLibrary({ store, state, blocked, onImport }: { store: Ed
     {!entries.length && <p className="panel-hint">Ресурсов пока нет.</p>}
     {entries.map(entry => <div className="resource-card" key={entry.id}>
       {entry.url ? <img src={entry.url} alt={`Превью ресурса ${entry.format}`} /> : <div className="resource-placeholder">{entry.format === "HDR" || entry.format === "EXR" ? "HDR-превью недоступно" : "Превью недоступно"}</div>}
-      <div><strong>{entry.format}</strong><p>{entry.size.toLocaleString("ru-RU")} байт · {entry.dimensions}</p></div>
+      <div><strong>{entry.format}</strong><p>{entry.size.toLocaleString("ru-RU")} байт · {entry.dimensions}</p>{assets.find(a=>a.id===entry.id)?.license&&<details><summary>Лицензия ресурса</summary><p style={{whiteSpace:"pre-wrap",overflowWrap:"anywhere"}}>{assets.find(a=>a.id===entry.id)!.license}</p></details>}</div>
     </div>)}
   </div>;
 }

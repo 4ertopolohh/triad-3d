@@ -45,6 +45,7 @@ export interface EditorStore {
   cancelGesture(groupId: string, expectedRevision: number): CommandResult;
   addMeshAsset(command: Extract<ProjectCommand, { type: "ADD_MESH_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object): CommandResult;
   addAsset(command: Extract<ProjectCommand, { type: "ADD_ASSET" }>, bytes: Uint8Array, expectedRevision: number, expectedIdentity: object, signal?: AbortSignal): Promise<CommandResult>;
+  addLibraryPack(commands:ProjectCommand[],bytes:Map<string,Uint8Array>,expectedRevision:number,expectedIdentity:object,signal?:AbortSignal):Promise<CommandResult>;
   setSelection(ids: readonly EntityId[], activeId?: EntityId | null): void;
   enterVertexMode(expectedRevision: number, expectedEpoch: object): string | null;
   exitVertexMode(): void;
@@ -323,6 +324,24 @@ export function createEditorStore(initialProject: Project): EditorStore {
       } catch {
         return { ok: false, id: command.commandId, code: CommandErrorCode.INTERNAL_ERROR, message: "Не удалось добавить ресурс в проект." };
       }
+    },
+    async addLibraryPack(input,bytes,expectedRevision,expectedIdentity,signal){
+      const transactionId=crypto.randomUUID();
+      const fail=(message:string):CommandResult=>({ok:false,id:transactionId,code:CommandErrorCode.INVALID_COMMAND,message});
+      const current=()=>identity===expectedIdentity&&state.document.revision===expectedRevision&&!signal?.aborted;
+      if(jobActive())return busy(transactionId);if(!current())return fail("Проект изменился или импорт отменён.");
+      if(!input.length||input.some(c=>c.type!=="ADD_ASSET"&&c.type!=="ADD_MATERIAL"))return fail("Пакет может добавлять только ресурсы и материалы.");
+      try{
+        const commands=structuredClone(input),assets=commands.filter((c):c is Extract<ProjectCommand,{type:"ADD_ASSET"}>=>c.type==="ADD_ASSET");
+        if(bytes.size!==assets.length)return fail("Байты пакета не соответствуют командам.");
+        let total=0;const copies=new Map<string,Uint8Array>();
+        for(const {payload:{asset}} of assets){const data=bytes.get(asset.id);if(!data?.length||data.length>ARCHIVE_LIMITS.asset||state.document.project.assets.some(a=>a.id===asset.id))return fail("Ресурс пакета отсутствует, слишком велик или ID занят.");total+=data.length;if(total>ARCHIVE_LIMITS.expanded)return fail("Пакет превышает бюджет ресурсов.");copies.set(asset.id,data.slice());}
+        for(const {payload:{asset}} of assets){const hash=[...new Uint8Array(await crypto.subtle.digest("SHA-256",copies.get(asset.id)! as BufferSource))].map(n=>n.toString(16).padStart(2,"0")).join("");if(hash!==asset.hash)return fail("SHA-256 ресурса пакета не совпадает.");}
+        if(jobActive())return busy(transactionId);if(!current())return fail("Проект изменился или импорт отменён.");
+        const nextAssets=assetBytes.fork();for(const [id,data] of copies)nextAssets.set(id,data);
+        const result=bus.executeTransaction(commands,expectedRevision,transactionId);if(!result.ok)return result;
+        assetBytes=nextAssets;return commit(result);
+      }catch{return fail("Не удалось атомарно добавить пакет.");}
     },
     getAssetBytes: () => assetBytes.clone(),
     readAssetBytes: (id) => assetBytes.get(id),

@@ -151,6 +151,7 @@ export interface Asset {
   mediaType: string;
   path: string;
   colorSpace: "srgb" | "linear" | "none";
+  license?: string;
 }
 
 export interface AnimationClip {

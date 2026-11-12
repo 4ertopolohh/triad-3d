@@ -1,4 +1,5 @@
 import { singleFileExport } from "../exporters/single-file";
+import { GlbExport } from "./GlbExport";
 import { useEffect, useMemo, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
 import type { Project } from "../domain/types";
@@ -47,6 +48,7 @@ export function ExportDialog({ store, onClose }: { store: EditorStore; onClose: 
     {result && <><ExportPreview prepared={result.prepared} parameters={parameters} /><SingleFile prepared={result.prepared} /><p role="status">Файлов: {result.prepared.files.size}; треугольников без GLB: {result.prepared.triangles}; ZIP: {(result.blob.size/1024/1024).toFixed(2)} MiB.</p>{result.prepared.diagnostics.map((d,i) => <p key={i}>{d}</p>)}<button disabled={result.revision !== state.document.revision} onClick={() => {
       const url = URL.createObjectURL(result.blob); const link = document.createElement("a"); link.href = url; link.download = "triad-model.zip"; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
     }}>Скачать ZIP</button></>}
+    {result && <GlbExport key={result.revision+profile} store={store} prepared={result.prepared} disabled={busy||result.revision!==state.document.revision} />}
     {error && <p role="alert">{error}</p>}
     {busy ? <button onClick={() => store.jobs.cancelJob()}>Отменить экспорт</button> : <button onClick={onClose}>Закрыть</button>}
   </section></div>;

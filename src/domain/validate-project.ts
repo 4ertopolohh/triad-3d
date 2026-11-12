@@ -26,6 +26,7 @@ export interface ValidationIssue {
 
 export function validateProject(project: Project): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
+  for(const asset of project.assets)if(asset.license!==undefined&&(typeof asset.license!=="string"||!asset.license.trim()||asset.license.length>16384))issues.push({code:"INVALID_STRUCTURE",path:`assets.${asset.id}.license`,message:"Лицензия ресурса должна содержать 1–16384 символа."});
   const animationError = timelineError(timelineOf(project));
   if (animationError) issues.push({ code: "INVALID_STRUCTURE", path: "animations", message: animationError });
   const sceneError = sceneExtensionsError(project.scene);

@@ -90,6 +90,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   if (single.code) add("src/StandaloneModel.tsx",single.code);
   add("licenses/React-MIT.txt",reactLicense);
   add("licenses/Three-MIT.txt",threeLicense);
+  for(const asset of project.assets)if(asset.license)add(`licenses/asset-${asset.hash}.txt`,asset.license);
   add("src/exporters/runtime.tsx",runtimeSource);
   add("src/exporters/export-types.ts",exportTypes);
   add("src/domain/types.ts",`${domainTypes}\nexport type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;\n`);

@@ -19,7 +19,7 @@ describe("project document schema v1", () => {
     const migrated = deserializeProjectDocument(jsonOf(old));
     expect(migrated.ok).toBe(true);
     if (migrated.ok) {
-      expect(migrated.value.schemaVersion).toBe("1.8.0");
+      expect(migrated.value.schemaVersion).toBe("1.9.0");
       expect(migrated.value.materials[0]!.proceduralMaps).toBeUndefined();
     }
     const config = { kind: "scratches" as const, seed: 4294967295, scale: .25, intensity: 1, resolution: 512 as const, directionRadians: Math.PI };
@@ -64,7 +64,7 @@ describe("project document schema v1", () => {
     const migrated = deserializeProjectDocument(jsonOf(old));
     expect(migrated.ok).toBe(true);
     if (migrated.ok) {
-      expect(migrated.value.schemaVersion).toBe("1.8.0");
+      expect(migrated.value.schemaVersion).toBe("1.9.0");
       expect(migrated.value.materials[0]!.textureMappings).toEqual(old.materials[0]!.textureMappings);
     }
     old.materials[0]!.textureMappings = { baseColor: { mode: "box", tiling: [1, 1], offset: [0, 0] } };
@@ -75,7 +75,7 @@ describe("project document schema v1", () => {
     const migrated = deserializeProjectDocument(jsonOf(old));
     expect(migrated.ok).toBe(true);
     if (!migrated.ok) return;
-    expect(migrated.value.schemaVersion).toBe("1.8.0");
+    expect(migrated.value.schemaVersion).toBe("1.9.0");
     expect(migrated.value.materials[0]!.textureMappings).toBeUndefined();
     const material = migrated.value.materials[0]!;
     material.textureMappings = { baseColor: { mode: "planar", axis: "z", tiling: [1024, .01], offset: [-100000, 100000] } };
@@ -162,7 +162,7 @@ describe("project document schema v1", () => {
     if (!result.ok) expect(result.error.code).toBe("FILE_INVALID");
   });
 
-  it.each(["2.0.0", "1.9.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
+  it.each(["2.0.0", "1.10.0", "1.0.1"])('rejects unsupported version %s', (schemaVersion) => {
     const result = deserializeProjectDocument(jsonOf({ ...emptyProject, schemaVersion }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("SCHEMA_UNSUPPORTED");
@@ -204,7 +204,7 @@ describe("project document schema v1", () => {
     const result = deserializeProjectDocument(jsonOf(old));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.value.schemaVersion).toBe("1.8.0");
+      expect(result.value.schemaVersion).toBe("1.9.0");
       expect(result.value.materials[0]!.textureAssetIds).toEqual(["legacy-image"]);
       expect(result.value.materials[0]!.textureSlots).toBeUndefined();
     }

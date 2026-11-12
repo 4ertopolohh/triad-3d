@@ -1,5 +1,11 @@
 # Implementation status
 
+## GLB export and material packs — TASK-056 / TASK-058
+
+Validation: lint, typecheck/build and full suite **67 files / 432 tests PASS**; targeted duplicate-JPEG regression also passed. Browser pack proof: `qa/material-pack.png`.
+
+GLB export uses domain-derived geometry, PBR, sampled clips and an explicit loss report, with cancellable Worker and embedded image resources. Browser downloads and texture orientation/repeat roundtrip passed; details in `glb-export.md`. Material packs use the protected native ZIP profile, image decode budgets, in-package and target deduplication, whole-pack transactions and licenses in schema 1.9. Browser export/open/apply/Undo/Redo passed without console errors; details in `material-packs.md`. Review fixes cover Float32 step boundaries, prototype-like geometry IDs, worker cleanup, safe resource decode, duplicate JPEG aliases and StrictMode cancellation lifecycle. This is a checkpoint, not completion of the remaining NEXT/release tasks.
+
 ## Static source import — TASK-054 subset
 
 TSX AST allowlist, terminable Worker, range diagnostics and explicit atomic application are implemented. No source execution, URL resolution or source attachment. Supported fragments and limitations are detailed in `source-import.md`; arbitrary HTML/imperative Three and replacement actions remain outside this subset. Browser cube/torus report/apply/Undo/Redo passed, no console errors. Lint/build and full suite **65 files / 424 tests passed**. Both review agents confirmed fixes for hidden groups, constructor defaults, conditional expressions, fragments and dialog/file-read lifecycle.

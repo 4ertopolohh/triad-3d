@@ -22,6 +22,11 @@ export function MaterialLibrary({ store, state, blocked, notice }: { store: Edit
     <label className="material-category">Категория<select value={category} onChange={event => setCategory(event.target.value as MaterialCategory | "all")}><option value="all">Все</option>{categories.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
     {(query || category !== "all") && <button type="button" className="material-reset" onClick={() => { setQuery(""); setCategory("all"); }}>Сбросить фильтр</button>}
     <p className="panel-hint" role="status">{reason ?? "Перетащите пресет на Mesh или назначьте его выделенному объекту кнопкой."}</p>
+    {state.document.project.materials.length>0&&<details open><summary>Материалы проекта и пакетов</summary>{state.document.project.materials.filter(m=>m.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())).map(material=><div className="material-field" key={material.id}><strong>{material.name}</strong><button disabled={!!reason||currentId===material.id} aria-label={`Назначить из проекта: ${material.name}`} onClick={()=>{
+      if(!selected||store.getProjectEpoch()!==projectEpoch)return;
+      const result=store.executeCommand({commandId:crypto.randomUUID(),type:"SET_MATERIAL_SLOT",targetIds:[selected.id,material.id],payload:{nodeId:selected.id,slotName:selected.materialSlots[0]?.name??"Основной",materialId:material.id}},state.document.revision);
+      notice(result.ok?"success":"error",result.ok?`${material.name} назначен как общий материал.`:result.message);
+    }}>{currentId===material.id?"Назначен":"Назначить общий материал"}</button></div>)}</details>}
     {previews?.warning && <p className="material-warning" role="status">{previews.warning}</p>}
     {!results.length && <p role="status">Материалы не найдены.</p>}
     <div className="material-cards">{results.map(preset => {

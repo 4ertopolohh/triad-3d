@@ -1,5 +1,6 @@
 import { ExportDialog } from "./ExportDialog";
 import { SourceImportDialog } from "./SourceImportDialog";
+import { MaterialPackDialog } from "./MaterialPackDialog";
 import { Timeline, type AnimationPreview } from "./Timeline";
 import { SceneInspector } from "./SceneInspector";
 import { Viewport } from "../renderer/Viewport";
@@ -65,6 +66,7 @@ function EditorShell() {
   const [fileBusy, setFileBusy] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [sourceImportOpen,setSourceImportOpen] = useState(false);
+  const [packOpen,setPackOpen] = useState(false);
   const [animationPreview, setAnimationPreview] = useState<AnimationPreview>(null);
   const [fileStatus, setFileStatus] = useState<Notice | null>(null);
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
@@ -78,7 +80,7 @@ function EditorShell() {
   const canRedo = selectCanRedo(state);
   const jobBlocked = isJobActive(state.job.status);
   const operationsBlocked = fileBusy || !!pendingGlb || jobBlocked;
-  const blocked = operationsBlocked || sourceImportOpen || (animationPreview !== null && !animationPreview.recording);
+  const blocked = operationsBlocked || sourceImportOpen || packOpen || (animationPreview !== null && !animationPreview.recording);
   const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
   useEffect(() => () => { dragCleanup.current?.(); importAbort.current?.abort(); }, []);
@@ -271,7 +273,7 @@ function EditorShell() {
   }
   return (
     <div className="app-shell">
-      <div className="app-content" inert={jobBlocked || sourceImportOpen}>
+      <div className="app-content" inert={jobBlocked || sourceImportOpen || packOpen}>
       <header className="topbar">
         <div className="brand"><span className="brand-mark" aria-hidden="true">◇</span><strong>TRIAD-3D</strong><span className="project-title" title={project.name}>{project.name}</span><span className={`dirty-indicator ${dirty ? "is-dirty" : ""}`} title={dirty ? "Есть несохранённые изменения" : "Нет несохранённых изменений"}>{dirty ? "● Не сохранено" : "Сохранено"}</span></div>
         <div className="mode-switch" role="group" aria-label="Режим редактора">
@@ -287,6 +289,7 @@ function EditorShell() {
           <button type="button" disabled={blocked} onClick={() => fileInput.current?.click()}>Открыть проект</button>
           <button type="button" disabled={blocked} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
           <button type="button" disabled={blocked} onClick={() => setSourceImportOpen(true)}>Импорт кода</button>
+          <button type="button" disabled={blocked} onClick={() => setPackOpen(true)}>Пакеты</button>
           <button type="button" disabled={blocked} onClick={() => setExportOpen(true)}>Экспорт</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
           <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
@@ -324,6 +327,7 @@ function EditorShell() {
       <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
       </div>
       {sourceImportOpen && <SourceImportDialog store={editorStore} onClose={() => setSourceImportOpen(false)} />}
+      {packOpen && <MaterialPackDialog store={editorStore} onClose={() => setPackOpen(false)} />}
       <JobOverlay job={state.job} cancel={() => editorStore.jobs.cancelJob()} />
     </div>
   );
