@@ -23,9 +23,12 @@ npm run lint
 npm test
 npm run build
 npm run export:check
+npm run export:production-check
 ```
 
 `export:check` собирает **прототип** генератора в отдельном React/Vite-проекте. Это не приёмка production TSX-экспорта. `npm test` включает этот стенд; для установки зависимостей стенда нужна сеть.
+
+`export:production-check` генерирует актуальный пакет и отдельный статический TSX-компонент, устанавливает зависимости в чистую временную папку и собирает её. Эта проверка обязательна в CI и перед публикацией Pages. Результаты ручных проверок и их ограничения: [release verification](docs/qa/release-verification.md).
 
 Для подпути статического сайта задайте `VITE_BASE_PATH` перед сборкой (например, `/triad-3d/`). Публикация и проверка GitHub Pages ещё не завершены.
 

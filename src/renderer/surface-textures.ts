@@ -45,7 +45,7 @@ export class SurfaceTextures {
         if (!result.ok) return;
         const rgba = new Uint8Array(result.value.pixels.length * 4);
         result.value.pixels.forEach((v, i) => { rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = 255; });
-        const texture = new T.DataTexture(rgba, height.resolution, height.resolution); texture.colorSpace = T.NoColorSpace; texture.needsUpdate = true; texture.userData.triadSharedTexture = true;
+        const texture = new T.DataTexture(rgba, height.resolution, height.resolution); texture.magFilter=T.LinearFilter;texture.minFilter=T.LinearMipmapLinearFilter;texture.generateMipmaps=true; texture.colorSpace = T.NoColorSpace; texture.needsUpdate = true; texture.userData.triadSharedTexture = true;
         entry = { texture, users: new Map() }; this.entries.set(key, entry);
       }
       entry.users.set(owner, new Set(["bump"])); owner.bumpMap = entry.texture!; owner.bumpScale = height.strength; owner.needsUpdate = true;

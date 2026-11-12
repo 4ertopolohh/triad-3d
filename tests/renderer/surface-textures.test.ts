@@ -15,6 +15,9 @@ it("shares deterministic relief and disposes it only after its last user", () =>
   expect(a.bumpMap).toBe(b.bumpMap);
   expect(a.bumpScale).toBe(.2);
   expect(a.bumpMap!.colorSpace).toBe(T.NoColorSpace);
+  const raster = new T.Texture();
+  expect([a.bumpMap!.magFilter,a.bumpMap!.minFilter,a.bumpMap!.generateMipmaps]).toEqual([raster.magFilter,raster.minFilter,raster.generateMipmaps]);
+  raster.dispose();
   const dispose = vi.spyOn(a.bumpMap!, "dispose");
   cache.release(a); expect(dispose).not.toHaveBeenCalled();
   cache.release(b); expect(dispose).toHaveBeenCalledOnce();

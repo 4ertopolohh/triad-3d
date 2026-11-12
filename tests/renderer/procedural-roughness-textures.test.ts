@@ -18,6 +18,9 @@ describe("derived roughness texture", () => {
     expect(first.color.getHex()).toBe(0xff0000);
     const map = first.roughnessMap as T.DataTexture;
     expect(map.colorSpace).toBe(T.NoColorSpace);
+    expect(map.magFilter).toBe(T.LinearFilter);
+    expect(map.minFilter).toBe(T.LinearMipmapLinearFilter);
+    expect(map.generateMipmaps).toBe(true);
     const generated = generateProceduralMap({ kind: config.kind, seed: config.seed, scale: config.scale, intensity: config.intensity, width: 128, height: 128 });
     if (!generated.ok) throw new Error(generated.error.message);
     const data = map.image.data as Uint8Array;

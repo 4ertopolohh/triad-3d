@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "export:check": "node scripts/check-export-harness.mjs"
+    "export:check": "node scripts/check-export-harness.mjs",
+    "export:production-check": "node scripts/check-production-export.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -28,6 +28,7 @@ export class ProceduralRoughnessTextures {
           rgb[i * 4 + 3] = 255;
         }
         const texture = new T.DataTexture(rgb, config.resolution, config.resolution, T.RGBAFormat);
+        texture.magFilter=T.LinearFilter;texture.minFilter=T.LinearMipmapLinearFilter;texture.generateMipmaps=true;
         texture.colorSpace = T.NoColorSpace;
         texture.needsUpdate = true;
         texture.userData.triadSharedTexture = true;

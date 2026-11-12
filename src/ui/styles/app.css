@@ -1,5 +1,5 @@
 body { margin: 0; }
-#root { min-height: 100vh; }
+#root { position: fixed; inset: 0; overflow: hidden; }
 .app-shell { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; background: var(--color-surface-background); }
 .app-content { height: 100%; min-height: 0; display: flex; flex-direction: column; }
 .app-content > :not(.workspace-grid) { flex-shrink: 0; }
@@ -22,7 +22,7 @@ body { margin: 0; }
 .file-actions button { min-height: 32px; padding: 0 var(--space-3); border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); cursor: pointer; }
 .file-actions button:disabled { opacity: .5; cursor: wait; }
 .file-actions button:focus-visible { outline: 2px solid var(--color-primary-accent-strong); outline-offset: 2px; }
-.file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-input { position: fixed; top: 0; left: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .file-status { padding: var(--space-2) var(--space-4); background: var(--color-state-info-surface); color: var(--color-text-primary); font-size: var(--font-size-sm); }
 .import-confirm { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--color-state-info-surface); font-size: var(--font-size-sm); }
 .import-confirm span { flex: 1; }
@@ -220,3 +220,14 @@ button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 .export-dialog p { overflow-wrap: anywhere; line-height: 1.5; }
 .export-dialog label { display: inline-flex; align-items: center; gap: 6px; margin: 4px; }
 .export-dialog input:not([type="checkbox"]):not([type="range"]):not([type="color"]) { max-width: 170px; }
+
+html, body { height: 100%; overflow: hidden; }
+.material-advanced fieldset { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 10px 0; border: 0; }
+.material-advanced fieldset label { display: grid; gap: 4px; min-width: 0; }
+.material-advanced fieldset label:has(input[type="checkbox"]) { display: flex; align-items: center; }
+.material-advanced fieldset input:not([type="checkbox"]), .material-advanced fieldset select { box-sizing: border-box; width: 100%; min-width: 0; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
+
+.material-advanced, .material-inspector { min-width: 0; }
+.material-inspector section { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.material-inspector select { width: 100%; min-width: 0; box-sizing: border-box; }
+.material-advanced fieldset label:has(input[type="checkbox"]) input { flex: 0 0 auto; }

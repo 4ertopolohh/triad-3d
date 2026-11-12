@@ -1,0 +1,49 @@
+{
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+  "backend": "WebGPU",
+  "devicePixelRatio": 1.25,
+  "canvas": [
+    1000,
+    562
+  ],
+  "frames": 120,
+  "cpuSubmissionMs": {
+    "mean": 8.719999999180436,
+    "p95": 13.799999997019768
+  },
+  "frameIntervalMs": {
+    "mean": 17.046666666616996,
+    "p95": 21.900000005960464
+  },
+  "render": {
+    "calls": 300,
+    "frameCalls": 2,
+    "drawCalls": 101,
+    "triangles": 96001,
+    "points": 0,
+    "lines": 0,
+    "timestamp": 0
+  },
+  "memory": {
+    "attributes": 201,
+    "attributesSize": 1346436,
+    "geometries": 101,
+    "indexAttributes": 100,
+    "indexAttributesSize": 1152000,
+    "indirectStorageAttributes": 0,
+    "indirectStorageAttributesSize": 0,
+    "programs": 4,
+    "programsSize": 18608,
+    "readbackBuffers": 0,
+    "readbackBuffersSize": 0,
+    "renderTargets": 1,
+    "storageAttributes": 0,
+    "storageAttributesSize": 0,
+    "textures": 3,
+    "texturesSize": 6745024,
+    "uniformBuffers": 103,
+    "uniformBuffersSize": 19552,
+    "total": 9281620
+  },
+  "notes": "Renderer accounting, not total GPU allocation; intervals may include background throttling. Single run."
+}
