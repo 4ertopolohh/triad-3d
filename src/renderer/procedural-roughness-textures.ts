@@ -13,12 +13,12 @@ export class ProceduralRoughnessTextures {
 
   bind(material: Owner, config: Readonly<ProceduralRoughnessConfig>, baseRoughness: number): string | undefined {
     if (config.intensity === 0) return;
-    const key = JSON.stringify([config.kind, config.seed, config.scale, config.intensity, config.resolution, config.kind === "scratches" ? config.directionRadians : null, baseRoughness]);
+    const key = JSON.stringify([config.kind, config.seed, config.scale, config.intensity, config.resolution, "directionRadians" in config ? config.directionRadians : null, baseRoughness]);
     let entry = this.entries.get(key);
     if (!entry) {
       const result = generateProceduralMap({ kind: config.kind, width: config.resolution, height: config.resolution,
         seed: config.seed, scale: config.scale, intensity: config.intensity,
-        ...(config.kind === "scratches" ? { directionRadians: config.directionRadians } : {}) });
+        ...("directionRadians" in config ? { directionRadians: config.directionRadians } : {}) });
       if (!result.ok) return result.error.message;
       try {
         const pixels = result.value.pixels;

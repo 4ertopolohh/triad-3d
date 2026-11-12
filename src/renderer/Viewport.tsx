@@ -1,3 +1,7 @@
+import { Color } from "three";
+import { evaluateClip } from "../animation/timeline";
+import { applyTransform } from "./scene-sync";
+import type { AnimationPreview } from "../ui/Timeline";
 import { useEffect, useRef, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
@@ -9,7 +13,7 @@ import { ModifierPreview } from "./modifier-preview";
 import { applyMaterialPresetToNode, materialNodeReason } from "../app/material-actions";
 import { endMaterialDrag, materialDragActive, MATERIAL_PRESET_MIME, resolveMaterialDrop } from "../app/material-drag";
 
-export function Viewport({ store, mode, blocked, notice }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean; notice: (kind: "info" | "success" | "error", text: string) => void }) {
+export function Viewport({ store, mode, blocked, notice, animationPreview = null }: { animationPreview?: AnimationPreview; store: EditorStore; mode: "model" | "scene"; blocked: boolean; notice: (kind: "info" | "success" | "error", text: string) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const interactions = useRef<ViewportInteractions | null>(null);
   const rendererAdapter = useRef<ThreeRendererAdapter | null>(null);
@@ -19,9 +23,16 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
   const [snap, setSnap] = useState(false);
   const [radiusText, setRadiusText] = useState("0.35");
   const [strengthText, setStrengthText] = useState("0.06");
+  const [brushMode,setBrushMode] = useState<"displace" | "paint" | "material">("displace");
+  const [brushColor,setBrushColor] = useState("#e56040");
+  const [brushShape,setBrushShape] = useState<"round" | "box">("round");
+  const [brushFill,setBrushFill] = useState(false);
+  const [brushSlot,setBrushSlot] = useState(0);
   const [symmetry, setSymmetry] = useState<BrushSymmetry>("off");
   const brushRadius = Number(radiusText), brushStrength = Number(strengthText);
   const validBrush = radiusText.trim() !== "" && strengthText.trim() !== "" && brushParameters(brushRadius, brushStrength);
+  const brushConfig = useRef({validBrush,brushRadius,brushStrength,symmetry,brushMode,brushColor,brushShape,brushFill,brushSlot});
+  brushConfig.current = {validBrush,brushRadius,brushStrength,symmetry,brushMode,brushColor,brushShape,brushFill,brushSlot};
   const blockedRef = useRef(blocked);
   const snapRef = useRef(snap);
   blockedRef.current = blocked;
@@ -65,7 +76,10 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
       const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
       controller.setSnap(snapRef.current);
       interactions.current = controller;
-      controller.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry);
+      const config = brushConfig.current;
+      controller.setBrush(config.validBrush ? config.brushRadius : NaN,config.brushStrength,config.symmetry);
+      controller.setFootprint({shape:config.brushShape,fill:config.brushFill});
+      controller.setSurfaceBrush(config.brushMode === "displace" ? null : {mode:config.brushMode,color:new Color(config.brushColor).toArray() as [number,number,number],shape:config.brushShape,fill:config.brushFill,materialSlot:config.brushSlot});
       adapter.setFrameHook(() => controller.frame());
     });
     sync();
@@ -73,6 +87,17 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
     return () => { disposed = true; unsubscribe(); preview.dispose(); interactions.current?.dispose(); interactions.current = null;
       rendererAdapter.current = null; adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
+  useEffect(() => {
+    const graph = rendererAdapter.current?.graph;
+    if (!graph) return;
+    const project = store.getSnapshot().document.project;
+    const pose = animationPreview && project.animations.some(c => c.id === animationPreview.clipId) ? evaluateClip(project, animationPreview.clipId, animationPreview.time, false) : new Map();
+    for (const node of project.nodes) {
+      const object = graph.objects.get(node.id)?.object;
+      if (object) applyTransform(object, pose.get(node.id) ?? node.transform);
+    }
+    graph.scene.updateMatrixWorld(true);
+  }, [animationPreview, store, state.document.revision, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => rendererAdapter.current?.setQuality(quality), [quality]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
@@ -80,6 +105,11 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
   const canTransform = editable(state, state.selection.activeId, blocked);
   const subMode = state.meshEdit.mode !== "object";
   const activeNode = state.document.project.nodes.find(node => node.id === state.selection.activeId);
+  useEffect(() => {
+    interactions.current?.setFootprint({shape:brushShape,fill:brushFill});
+    interactions.current?.setSurfaceBrush(brushMode === "displace" ? null : {mode:brushMode,color:new Color(brushColor).toArray() as [number,number,number],shape:brushShape,fill:brushFill,materialSlot:brushSlot});
+  },[brushMode,brushColor,brushShape,brushFill,brushSlot,backendMode,attempt]);
+  const brushNode = state.document.project.nodes.find(n => n.id === state.selection.activeId);
   const brushReason = brushUnavailable(state, blocked);
   return <section className={`renderer-viewport ${materialHover ? `material-drop-${materialHover}` : ""}`} aria-label="3D-предпросмотр модели"
     onDragOver={event => {
@@ -122,8 +152,19 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
       </div>
       <div className="viewport-tools" role="group" aria-label="Кисть рельефа">
         <button type="button" aria-pressed={state.tool.active === "displace"} disabled={!!brushReason || !validBrush}
-          title={brushReason ?? "Смещение вершин вдоль нормалей"} onClick={() => store.setTool({ active: "displace" })}>Кисть: рельеф</button>
+          title={brushReason ?? "Смещение вершин вдоль нормалей"} onClick={() => store.setTool({ active: "displace" })}>Кисть поверхности</button>
         {state.tool.active === "displace" && <span className="brush-settings">
+          <label>Тип<select aria-label="Тип кисти" value={brushMode} onChange={e => setBrushMode(e.target.value as typeof brushMode)}><option value="displace">Рельеф</option><option value="paint">Цвет вершин</option><option value="material">Материал граней</option></select></label>
+          {<><label>Форма<select value={brushShape} onChange={e => setBrushShape(e.target.value as typeof brushShape)}><option value="round">Круглая</option><option value="box">Кубическая</option></select></label><label><input type="checkbox" checked={brushFill} onChange={e => setBrushFill(e.target.checked)} />Заливка всего объекта</label></>}
+          {brushMode === "paint" && <input type="color" aria-label="Цвет кисти" value={brushColor} onChange={e => setBrushColor(e.target.value)} />}
+          {brushMode === "material" && <><label>Слот<select aria-label="Материал кисти" value={brushSlot} onChange={e => setBrushSlot(Number(e.target.value))}>{brushNode?.materialSlots.map((slot,i) => <option key={slot.name} value={i}>{slot.name}</option>)}</select></label><select aria-label="Добавить материал в слоты" value="" disabled={blocked} onChange={e => {
+            if (!brushNode || !e.target.value) return;
+            const material = state.document.project.materials.find(m => m.id === e.target.value)!;
+            const index = brushNode.materialSlots.length;
+            const result = store.executeCommand({commandId:crypto.randomUUID(),type:"SET_MATERIAL_SLOT",targetIds:[brushNode.id,material.id],payload:{nodeId:brushNode.id,slotName:`Кисть ${index+1}: ${material.name}`,materialId:material.id}},state.document.revision);
+            if (result.ok) setBrushSlot(index); else setInteractionError(result.message);
+          }}><option value="">Добавить слот…</option>{state.document.project.materials.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></>}
+
           <label>Радиус <input type="number" min="0.01" max="10" step="0.01" value={radiusText} onChange={event => setRadiusText(event.target.value)} /></label>
           <label>Сила <input type="number" min="-0.5" max="0.5" step="0.01" value={strengthText} onChange={event => setStrengthText(event.target.value)} /></label>
           <label>Симметрия <select value={symmetry} onChange={event => setSymmetry(event.target.value as BrushSymmetry)}
@@ -132,7 +173,7 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
             <option value="y">Y · плоскость XZ</option><option value="z">Z · плоскость XY</option>
           </select></label>
           <span title="Плоскость проходит через локальное начало координат объекта">Через локальное начало объекта.</span>
-          <span>Положительная сила — выступ, отрицательная — углубление.</span>
+          <span>{brushMode === "displace" ? "Положительная сила — выступ, отрицательная — углубление." : "Цвет умножается на цвет материала. Модуль силы 0,5 — полная заливка; материал назначается треугольникам в области кисти."}</span>
           {!validBrush && <span role="alert">Радиус: 0,01–10; сила: −0,5…0,5.</span>}
         </span>}
       </div>

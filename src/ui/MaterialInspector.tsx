@@ -1,3 +1,4 @@
+import { SurfaceMaterialEditor } from "./SurfaceMaterialEditor";
 import { useEffect, useRef, useState } from "react";
 import type { EditorState, EditorStore } from "../app/editor-store";
 import { captureMaterialEdit, editMaterial, editBaseColorTexture, editBaseColorProjection, editProceduralRoughness, materialUsage, type MaterialEditContext, type MaterialEditMode, type MaterialField } from "../app/material-edit";
@@ -19,6 +20,7 @@ const scalarFields = [
 ] as const;
 
 export function MaterialInspector({ store, state }: { store: EditorStore; state: EditorState }) {
+  const [selectedSlot,setSelectedSlot] = useState("");
   const [mode, setMode] = useState<MaterialEditMode>("unique");
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -31,10 +33,10 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   useEffect(() => { setMode("unique"); setEditing(null); setError(""); session.current = null; }, [epoch, selection, state.tool.mode]);
 
   const node = state.selection.ids.length === 1 ? state.document.project.nodes.find(item => item.id === state.selection.activeId) : null;
-  const slot = node?.kind === "mesh" && node.materialSlots.length === 1 ? node.materialSlots[0] : null;
+  const slot = node?.kind === "mesh" ? node.materialSlots.find(s => s.name === selectedSlot) ?? node.materialSlots[0] : null;
   const material = state.document.project.materials.find(item => item.id === slot?.materialId);
   const users = material ? materialUsage(store, material.id) : [];
-  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId)).find(Boolean) : null;
+  const sharedBlock = mode === "shared" ? users.map(user => materialNodeReason(store, user.nodeId,true)).find(Boolean) : null;
   const reason = !node ? state.selection.ids.length > 1 ? "Несколько объектов: массовое редактирование материалов пока недоступно." : "Выберите Mesh с материалом."
     : node.kind !== "mesh" ? "У группы нет редактируемого материала."
     : node.meshSource.kind === "asset" ? "Внутренние материалы GLB доступны только для просмотра до поддержки отдельных слотов."
@@ -42,7 +44,7 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
     : !material ? "Назначенный материал не найден."
     : isJobActive(state.job.status) ? "Дождитесь завершения операции."
     : state.tool.mode !== "model" ? "В режиме «Сцена» свойства модели доступны только для просмотра."
-    : materialNodeReason(store, node.id) || sharedBlock || "";
+    : materialNodeReason(store, node.id,true) || sharedBlock || "";
   const preset = materialPresets.find(item => item.name === material?.name);
   const canEdit = !!material && !reason;
   const rasterAssets = state.document.project.assets.filter(asset => ["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType));
@@ -53,27 +55,27 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   const procedural = material?.proceduralMaps?.roughness;
   function setProcedural(config?: ProceduralRoughnessConfig, captured?: MaterialEditContext | null) {
     if (!canEdit) return;
-    const context = captured === undefined ? captureMaterialEdit(store, mode) : captured;
+    const context = captured === undefined ? captureMaterialEdit(store, mode,slot?.name) : captured;
     if (!context) { setError("Выбор изменился. Повторите действие."); return; }
     const result = editProceduralRoughness(store, context, config);
     setError(result.ok ? "" : result.message);
   }
   function proceduralNumber(field: "seed" | "scale" | "intensity" | "directionRadians", label: string) {
     if (!procedural) return null;
-    const value = field === "directionRadians" ? procedural.kind === "scratches" ? procedural.directionRadians : 0 : procedural[field];
+    const value = field === "directionRadians" ? "directionRadians" in procedural ? procedural.directionRadians : 0 : procedural[field];
     const key = `procedural-${field}`;
     return <label key={key}>{label}<input type="text" inputMode="decimal" aria-label={label} value={editing === key ? draft : format(value)} disabled={!canEdit}
-      onFocus={() => { proceduralContext.current = captureMaterialEdit(store, mode); setEditing(key); setDraft(format(value)); setError(""); }}
+      onFocus={() => { proceduralContext.current = captureMaterialEdit(store, mode,slot?.name); setEditing(key); setDraft(format(value)); setError(""); }}
       onChange={event => setDraft(event.target.value)}
       onBlur={() => { if (shouldSkipBlur() || editing !== key) return; const raw = draft.trim(); const number = Number(raw); if (raw && Number.isFinite(number)) {
-        if (field === "directionRadians" && procedural.kind === "scratches") setProcedural({ ...procedural, directionRadians: number }, proceduralContext.current);
+        if (field === "directionRadians" && "directionRadians" in procedural) setProcedural({ ...procedural, directionRadians: number }, proceduralContext.current);
         else if (field !== "directionRadians") setProcedural({ ...procedural, [field]: number }, proceduralContext.current);
       } else setError("Введите конечное число."); proceduralContext.current = null; setEditing(null); }}
       onKeyDown={event => { event.stopPropagation(); if (event.key === "Enter") (event.target as HTMLInputElement).blur(); if (event.key === "Escape") { event.preventDefault(); escapeInput(event.target as HTMLInputElement); } }} /></label>;
   }
   function setProjection(value: BaseColorProjection) {
     if (!canEdit) return;
-    const context = captureMaterialEdit(store, mode);
+    const context = captureMaterialEdit(store, mode,slot?.name);
     if (!context) { setError("Выбор изменился. Повторите действие."); return; }
     const result = editBaseColorProjection(store, context, value);
     setError(result.ok ? "" : result.message);
@@ -83,14 +85,14 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
   }
   function setTexture(assetId?: string) {
     if (!canEdit) return;
-    const context = captureMaterialEdit(store, mode);
+    const context = captureMaterialEdit(store, mode,slot?.name);
     if (!context) { setError("Выбор изменился. Повторите действие."); return; }
     const result = editBaseColorTexture(store, context, assetId);
     setError(result.ok ? "" : result.message);
   }
 
   function start(field: string) {
-    const context = captureMaterialEdit(store, mode);
+    const context = captureMaterialEdit(store, mode,slot?.name);
     session.current = context ? { context, groupId: crypto.randomUUID(), changed: false, field } : null;
     setError("");
   }
@@ -105,7 +107,7 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
       active.changed = true;
       active.context.revision = result.revision;
       const updated = store.getSnapshot().document.project.nodes.find(item => item.id === active.context.nodeId);
-      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots[0]?.materialId ?? active.context.materialId;
+      if (updated?.kind === "mesh") active.context.materialId = updated.materialSlots.find(s => s.name === active.context.slotName)?.materialId ?? active.context.materialId;
     }
     setError("");
     if (!grouped) session.current = null;
@@ -161,6 +163,7 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
     </div>;
   }
   return <section className="material-inspector" aria-label="Материал"><h4>Материал</h4>
+    {node?.kind === "mesh" && node.materialSlots.length > 1 && <label>Редактируемый слот<select value={slot?.name ?? ""} onChange={e => {setSelectedSlot(e.target.value);setEditing(null);session.current=null;setError("");}}>{node.materialSlots.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}</select><button disabled={!canEdit} onClick={() => {if (!slot) return; const result = store.executeCommand({commandId:crypto.randomUUID(),type:"SET_MATERIAL_SLOT",targetIds:[node.id],payload:{nodeId:node.id,slotName:slot.name,materialId:null}},state.document.revision); setError(result.ok ? "" : result.message);}}>Удалить неиспользуемый слот</button></label>}
     {material && <strong>{material.name}</strong>}
     {users.length > 1 && <><p className="panel-hint">Материал используется несколькими объектами ({users.length} слотов).</p><fieldset className="material-mode"><legend>Редактировать</legend><label><input type="radio" checked={mode === "unique"} onChange={() => { setMode("unique"); finish(); }} /> Только выбранный объект</label><label><input type="radio" checked={mode === "shared"} onChange={() => { setMode("shared"); finish(); }} /> Все объекты с этим материалом</label></fieldset></>}
     {reason && <p className="panel-hint">{reason}</p>}
@@ -181,17 +184,17 @@ export function MaterialInspector({ store, state }: { store: EditorStore; state:
         {selectedTexture && !store.readAssetBytes(selectedTexture) && <p className="material-warning">Байты текстуры недоступны в памяти.</p>}
         <div className="material-field"><h4>Процедурная шероховатость</h4>
           <label>Режим<select aria-label="Режим процедурной шероховатости" value={procedural?.kind ?? "none"} disabled={!canEdit} onChange={event => {
-            const kind = event.target.value;
-            setProcedural(kind === "none" ? undefined : kind === "scratches" ? { kind: "scratches", seed: 1, scale: 4, intensity: .5, resolution: 256, directionRadians: 0 } : { kind: "grain", seed: 1, scale: 4, intensity: .5, resolution: 256 });
-          }}><option value="none">Нет</option><option value="grain">Зерно</option><option value="scratches">Царапины</option></select></label>
-          {procedural && <><div className="inspector-vector">{proceduralNumber("seed", "Seed")}{proceduralNumber("scale", "Масштаб")}{proceduralNumber("intensity", "Интенсивность")}{procedural.kind === "scratches" && proceduralNumber("directionRadians", "Направление царапин (радианы)")}</div>
+            const kind = event.target.value as "none" | ProceduralRoughnessConfig["kind"];
+            setProcedural(kind === "none" ? undefined : kind === "scratches" || kind === "brushed-metal" ? { kind, seed: 1, scale: 4, intensity: .5, resolution: 256, directionRadians: 0 } : { kind, seed: 1, scale: 4, intensity: .5, resolution: 256 });
+          }}><option value="none">Нет</option><option value="grain">Зерно</option><option value="scratches">Царапины</option><option value="noise">Шум</option><option value="brushed-metal">Шлифованный металл</option><option value="marble">Мраморный узор</option></select></label>
+          {procedural && <><div className="inspector-vector">{proceduralNumber("seed", "Seed")}{proceduralNumber("scale", "Масштаб")}{proceduralNumber("intensity", "Интенсивность")}{"directionRadians" in procedural && proceduralNumber("directionRadians", "Направление царапин (радианы)")}</div>
             <label>Разрешение карты<select aria-label="Разрешение карты" value={procedural.resolution} disabled={!canEdit} onChange={event => setProcedural({ ...procedural, resolution: Number(event.target.value) as 128 | 256 | 512 })}><option value="128">128</option><option value="256">256</option><option value="512">512</option></select></label></>}
           <p className="panel-hint">Визуальная шероховатость; геометрия не изменяется.</p>
           {procedural && missingUv && projection.mode === "uv" && <p className="material-warning">У геометрии нет UV; процедурная шероховатость не отображается.</p>}
           {procedural && projection.mode === "triplanar" && missingUv && <p className="material-warning">Трипланарная проекция основного цвета не создаёт UV для шероховатости.</p>}
         </div>
       </div>
-      <details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
+      <SurfaceMaterialEditor store={store} mode={mode} slotName={slot?.name ?? ""} disabled={!canEdit} /><details className="material-advanced"><summary>Дополнительно</summary><div className="material-fields">{colorRow("emissive", "Свечение")}{scalarFields.slice(3).map(scalarRow)}</div></details>
       {material.transmission > 0 && <p className="panel-hint">При пропускании света непрозрачность всегда 1. Включение пропускания устанавливает её автоматически.</p>}
       {material.textureAssetIds.length > 0 && <p className="material-warning">У сохранённых legacy-ссылок на текстуры канал не определён.</p>}
       {!preset && <p className="panel-hint">Пресет по имени не определён; сброс отдельных свойств недоступен.</p>}

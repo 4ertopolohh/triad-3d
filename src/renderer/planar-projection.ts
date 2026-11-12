@@ -1,6 +1,44 @@
 import * as T from "three";
 import type { BaseColorProjection } from "../domain/types";
 
+/** Per-slot mapping with split corners prevents adjacent materials from overwriting shared UVs. */
+export function materialProjectionGeometry(source: T.BufferGeometry, mappings: readonly (BaseColorProjection | undefined)[]): T.BufferGeometry {
+  const index = source.getIndex(), position = source.getAttribute("position");
+  const corners = index?.count ?? position.count;
+  const bytes = Object.values(source.attributes).reduce((sum,a) => sum+a.itemSize*4,12)+8;
+  if (corners*bytes > 64*1024*1024) throw new Error("Проекции материалов превышают лимит 64 MiB.");
+  const result = index ? source.toNonIndexed() : source.clone();
+  try {
+    result.userData.sourceVertexIndices = Uint32Array.from({length:corners},(_,i) => index ? index.getX(i) : i);
+    const points = result.getAttribute("position"), original = result.getAttribute("uv");
+    const uv = original ? Float32Array.from(original.array) : new Float32Array(corners*2);
+    result.userData.missingUvSlots = original ? [] : mappings.flatMap((m,i) => m?.mode === "planar" || m?.mode === "box" ? [] : [i]);
+    let generated = false;
+    for (const group of result.groups) {
+      const mapping = mappings[group.materialIndex ?? 0];
+      if (!mapping || mapping.mode === "uv" || mapping.mode === "triplanar") continue;
+      generated = true;
+      for (let i=group.start; i<group.start+group.count; i+=3) {
+        const a = new T.Vector3().fromBufferAttribute(points,i), b = new T.Vector3().fromBufferAttribute(points,i+1), c = new T.Vector3().fromBufferAttribute(points,i+2);
+        const normal = b.clone().sub(a).cross(c.clone().sub(a));
+        const absolute = [Math.abs(normal.x),Math.abs(normal.y),Math.abs(normal.z)];
+        const axis = mapping.mode === "planar" ? {x:0,y:1,z:2}[mapping.axis] : absolute.indexOf(Math.max(...absolute));
+        const sign = normal.getComponent(axis) >= 0 ? 1 : -1;
+        for (let corner=0; corner<3; corner++) {
+          const point = [a,b,c][corner]!;
+          const u = mapping.mode === "planar" ? axis === 0 ? point.z : point.x : axis === 0 ? -sign*point.z : axis === 1 ? point.x : sign*point.x;
+          const v = mapping.mode === "planar" ? axis === 1 ? point.z : point.y : axis === 1 ? -sign*point.z : point.y;
+          uv[2*(i+corner)] = u*mapping.tiling[0]+mapping.offset[0];
+          uv[2*(i+corner)+1] = v*mapping.tiling[1]+mapping.offset[1];
+        }
+      }
+    }
+    if (!uv.every(Number.isFinite)) throw new Error("UV материалов вне диапазона Float32.");
+    if (original || generated) result.setAttribute("uv",new T.BufferAttribute(uv,2));
+    return result;
+  } catch (error) { result.dispose(); throw error; }
+}
+
 /** Local coordinates, fixed orientation: X => Z/Y, Y => X/Z, Z => X/Y. */
 export function planarUv(positions: ArrayLike<number>, projection: Extract<BaseColorProjection, { mode: "planar" }>): Float32Array {
   const result = new Float32Array(positions.length / 3 * 2);

@@ -1,3 +1,6 @@
+import type { SurfaceStroke } from "../geometry/surface-brush";
+import { recordingPose } from "../app/recording-pose";
+import { checkedTransform, transformNeedsEvaluation } from "../app/checked-transform";
 import * as T from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
@@ -8,7 +11,7 @@ import { vertexRepresentatives } from "../geometry/vertex-selection";
 import { pickEditableVertex } from "./vertex-picking";
 import { buildMeshTopology, type MeshTopology } from "../geometry/mesh-topology";
 import { pickEditableEdge } from "./sub-element-picking";
-import { brushAffectedVertices, brushCenters, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES, type BrushSymmetry } from "../geometry/displace-brush";
+import { brushAffectedVertices, brushCenters, brushParameters, MAX_BRUSH_SAMPLES, MAX_BRUSH_VERTICES, type BrushSymmetry, type BrushFootprint } from "../geometry/displace-brush";
 import type { SurfaceHit } from "../geometry/surface-query";
 
 export function brushUnavailable(state: EditorState, blocked: boolean): string | null {
@@ -28,8 +31,8 @@ export function brushUnavailable(state: EditorState, blocked: boolean): string |
   return null;
 }
 
-type Drag = { id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
-type Stroke = { id: string; revision: number; epoch: object; pointerId: number; radius: number; strength: number; symmetry: BrushSymmetry; samples: [number, number, number][] };
+type Drag = { recordingKey: string; id: string; object: T.Object3D; start: Transform; revision: number; epoch: object; tool: string; space: string };
+type Stroke = { footprint: BrushFootprint; surface: Omit<SurfaceStroke,"samples" | "radius" | "strength" | "symmetry"> | null; id: string; revision: number; epoch: object; pointerId: number; radius: number; strength: number; symmetry: BrushSymmetry; samples: [number, number, number][] };
 const EPS = 1e-6;
 
 export function editable(state: EditorState, id: string | null, blocked: boolean): boolean {
@@ -95,6 +98,12 @@ export class ViewportInteractions {
   private topologySource: object | null = null;
   private topology: MeshTopology | null = null;
   private stroke: Stroke | null = null;
+  private footprint: BrushFootprint = {shape:"round",fill:false};
+  setFootprint(value: BrushFootprint): void { if (JSON.stringify(value) !== JSON.stringify(this.footprint)) { if (this.stroke) this.cancel("Форма кисти изменена."); this.footprint = value; } }
+  private surfaceBrush: Stroke["surface"] = null;
+  setSurfaceBrush(value: Stroke["surface"]): void {
+    if (JSON.stringify(value) !== JSON.stringify(this.surfaceBrush)) { if (this.stroke) this.cancel("Параметры кисти изменились."); this.surfaceBrush = value; }
+  }
   private brushRadius = 0.35;
   private brushStrength = 0.06;
   private brushSymmetry: BrushSymmetry = "off";
@@ -133,7 +142,7 @@ export class ViewportInteractions {
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
     if (!id || !object || state.meshEdit.mode !== "object" || !editable(state, id, this.blocked)) { this.cancel("Объект недоступен для редактирования."); return; }
-    this.drag = { id, object, start: structuredClone(state.document.project.nodes.find(node => node.id === id)!.transform) as Transform,
+    this.drag = { recordingKey: JSON.stringify(this.store.getAnimationRecording()), id, object, start: localTransform(object)!,
       revision: state.document.revision, epoch: this.store.getProjectEpoch(), tool: state.tool.active, space: state.tool.space };
     this.report(null);
   };
@@ -142,7 +151,7 @@ export class ViewportInteractions {
     if (!drag) return;
     this.drag = null;
     const state = this.store.getSnapshot();
-    if (state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
+    if (drag.recordingKey !== JSON.stringify(this.store.getAnimationRecording()) || state.document.revision !== drag.revision || this.store.getProjectEpoch() !== drag.epoch
       || state.tool.active !== drag.tool || state.tool.space !== drag.space
       || state.selection.activeId !== drag.id || !editable(state, drag.id, this.blocked)
       || this.graph.objects.get(drag.id)?.object !== drag.object) {
@@ -151,13 +160,18 @@ export class ViewportInteractions {
     const transform = localTransform(drag.object);
     if (!transform) { this.restore(drag); this.report("Изменение отменено: недопустимое положение, вращение или масштаб."); return; }
     if (!transformChanged(drag.start, transform)) { this.restore(drag); return; }
+    if (transformNeedsEvaluation(this.store)) {
+      this.restore(drag);
+      void checkedTransform(this.store,[{commandId:crypto.randomUUID(),type:"SET_NODE_TRANSFORM",targetIds:[drag.id],payload:{nodeId:drag.id,transform}}],drag.revision).then(result => { if (!result.ok && !this.disposed) this.report(result.message); });
+      return;
+    }
     const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "SET_NODE_TRANSFORM", targetIds: [drag.id],
       payload: { nodeId: drag.id, transform } }, drag.revision);
     if (!result.ok) { this.restore(drag); this.report(`Изменение отменено: ${result.message}`); }
   };
   private onDraggingChanged = (event: { value: unknown }) => { this.orbit.enabled = event.value !== true; };
   private restore(drag: Drag): void {
-    const current = this.store.getSnapshot().document.project.nodes.find(node => node.id === drag.id);
+    const current = recordingPose(this.store).document.project.nodes.find(node => node.id === drag.id);
     if (current && this.graph.objects.get(drag.id)?.object === drag.object) applyTransform(drag.object, current.transform as Transform);
   }
   cancel(message: string | null = null): void {
@@ -176,7 +190,7 @@ export class ViewportInteractions {
       const state = this.store.getSnapshot();
       const hit = this.brushHit(event);
       if (brushUnavailable(state, this.blocked) || !hit) return;
-      this.stroke = { id: hit.nodeId, revision: state.document.revision, epoch: this.store.getProjectEpoch(), pointerId: event.pointerId,
+      this.stroke = { footprint: {...this.footprint}, surface: this.surfaceBrush ? structuredClone(this.surfaceBrush) : null, id: hit.nodeId, revision: state.document.revision, epoch: this.store.getProjectEpoch(), pointerId: event.pointerId,
         radius: this.brushRadius, strength: this.brushStrength, symmetry: this.brushSymmetry,
         samples: [hit.pointNodeLocal.toArray() as [number, number, number]] };
       this.orbit.enabled = false;
@@ -217,7 +231,15 @@ export class ViewportInteractions {
     const symmetry = this.stroke?.symmetry ?? this.brushSymmetry;
     const radius = this.stroke?.radius ?? this.brushRadius;
     const centers = brushCenters(hit.pointNodeLocal.toArray(), symmetry);
-    const affected = brushAffectedVertices(source, hit.pointNodeLocal.toArray(), radius, symmetry);
+    const footprint = this.stroke?.footprint ?? this.footprint;
+    const surface = this.stroke?.surface ?? this.surfaceBrush;
+    let affected = brushAffectedVertices(source,hit.pointNodeLocal.toArray(),radius,symmetry,footprint);
+    if (surface?.mode === "material") {
+      const centroids: number[] = [];
+      for (let i=0; i<source.indices.length; i+=3) for (let axis=0; axis<3; axis++) centroids.push((source.positions[3*source.indices[i]!+axis]!+source.positions[3*source.indices[i+1]!+axis]!+source.positions[3*source.indices[i+2]!+axis]!)/3);
+      const faces = brushAffectedVertices({kind:"editable",positions:centroids,indices:[]},hit.pointNodeLocal.toArray(),radius,symmetry,footprint);
+      affected = [...new Set(faces.flatMap(face => source.indices.slice(3*face,3*face+3)))];
+    }
     if (!this.brushPoints || this.brushPoints.parent !== wrapper) {
       this.clearBrushPreview();
       const geometry = new T.BufferGeometry();
@@ -271,9 +293,10 @@ export class ViewportInteractions {
         || state.selection.activeId !== stroke.id || state.tool.active !== "displace" || brushUnavailable(state, this.blocked)) {
         this.clearBrushPreview(); this.report("Мазок отменён: проект или объект изменился."); return;
       }
-      const result = this.store.executeCommand({ commandId: crypto.randomUUID(), type: "APPLY_DISPLACE_STROKE", targetIds: [stroke.id],
-        payload: { nodeId: stroke.id, samples: stroke.samples, radius: stroke.radius, strength: stroke.strength, symmetry: stroke.symmetry } }, stroke.revision);
-      this.clearBrushPreview(); this.report(result.ok ? result.changed ? "Рельеф применён." : "Мазок не изменил сетку." : result.message);
+      const result = this.store.executeCommand(stroke.surface
+        ? {commandId:crypto.randomUUID(),type:"APPLY_SURFACE_STROKE",targetIds:[stroke.id],payload:{nodeId:stroke.id,stroke:{...stroke.surface,samples:stroke.samples,radius:stroke.radius,strength:Math.abs(stroke.strength)*2,symmetry:stroke.symmetry}}}
+        : { commandId: crypto.randomUUID(), type: "APPLY_DISPLACE_STROKE", targetIds: [stroke.id], payload: { nodeId: stroke.id, samples: stroke.samples, radius: stroke.radius, strength: stroke.strength, symmetry: stroke.symmetry, footprint:stroke.footprint } }, stroke.revision);
+      this.clearBrushPreview(); this.report(result.ok ? result.changed ? "Мазок применён." : "Мазок не изменил сетку." : result.message);
       return;
     }
     const down = this.down; this.down = null;

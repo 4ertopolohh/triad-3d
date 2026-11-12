@@ -5,7 +5,7 @@ import { MAX_CSG_INPUT_BYTES, validateMesh, type MeshData } from "./csg/core";
 import { buildMeshTopology, MAX_TOPOLOGY_TRIANGLES } from "./mesh-topology";
 
 export type EditableMeshSource = Extract<MeshSource, { kind: "editable" }>;
-type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[] };
+type EditableInput = { readonly kind: "editable"; readonly positions: readonly number[]; readonly indices: readonly number[]; readonly uv?: readonly number[]; readonly colors?: readonly number[]; readonly faceMaterials?: readonly number[] };
 type PrimitiveSource = Extract<MeshSource, { kind: "primitive" }>;
 
 /** Absolute coordinate quantization at 1e-6 local units. Keys are never written to the Project. */
@@ -19,13 +19,15 @@ const invalid = (error: string): Checked => ({ error });
 function checkedEditableData(value: unknown): Checked {
   if (!value || typeof value !== "object" || Array.isArray(value)) return invalid("Редактируемая сетка должна быть объектом.");
   const source = value as Partial<EditableMeshSource>;
-  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv"].includes(k)) || source.kind !== "editable")
+  if (Object.keys(source).some(k => !["kind", "positions", "indices", "uv", "colors", "faceMaterials"].includes(k)) || source.kind !== "editable")
     return invalid("Некорректный тип или поле редактируемой сетки.");
   if (!Array.isArray(source.positions) || !Array.isArray(source.indices) || source.positions.length % 3 || source.indices.length % 3 || !source.indices.length)
     return invalid("Позиции и индексы должны задавать треугольники.");
-  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
+  if ((source.positions.length + source.indices.length + (Array.isArray(source.uv) ? source.uv.length : 0) + (Array.isArray(source.colors) ? source.colors.length : 0) + (Array.isArray(source.faceMaterials) ? source.faceMaterials.length : 0)) * 4 > MAX_CSG_INPUT_BYTES) return invalid("Сетка превышает лимит 64 MiB.");
   if (source.positions.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))) return invalid("Координаты должны быть конечными Float32 числами.");
   if (source.indices.some(n => !Number.isSafeInteger(n) || n < 0 || n >= source.positions!.length / 3 || n > 0xffffffff)) return invalid("Индекс вершины вне диапазона.");
+  if (source.colors !== undefined && (!Array.isArray(source.colors) || source.colors.length !== source.positions.length || source.colors.some(n => !Number.isFinite(n) || n < 0 || n > 1))) return invalid("Цвета должны задавать Linear RGB для каждой вершины.");
+  if (source.faceMaterials !== undefined && (!Array.isArray(source.faceMaterials) || source.faceMaterials.length !== source.indices.length/3 || source.faceMaterials.some(n => !Number.isInteger(n) || n < 0 || n > 255))) return invalid("Материалы должны задавать индекс слота для каждого треугольника.");
   if (source.uv !== undefined && (!Array.isArray(source.uv) || source.uv.length !== source.positions.length / 3 * 2 || source.uv.some(n => typeof n !== "number" || !Number.isFinite(n) || !Number.isFinite(Math.fround(n)))))
     return invalid("UV должны содержать две конечные координаты на render vertex.");
   const mesh = { positions: Float32Array.from(source.positions), indices: Uint32Array.from(source.indices) };
@@ -50,6 +52,13 @@ export function editableGeometry(source: EditableInput): T.BufferGeometry {
   geometry.setAttribute("position", new T.BufferAttribute(data.positions, 3));
   geometry.setIndex(new T.BufferAttribute(data.indices, 1));
   if (source.uv) geometry.setAttribute("uv", new T.Float32BufferAttribute(source.uv, 2));
+  if (source.colors) geometry.setAttribute("color",new T.Float32BufferAttribute(source.colors,3));
+  if (source.faceMaterials) {
+    let start = 0;
+    for (let i = 1; i <= source.faceMaterials.length; i++) if (i === source.faceMaterials.length || source.faceMaterials[i] !== source.faceMaterials[start]) {
+      geometry.addGroup(start*3,(i-start)*3,source.faceMaterials[start]); start = i;
+    }
+  }
   geometry.computeVertexNormals();
   return geometry;
 }
@@ -248,12 +257,13 @@ export function extrudeEditableFace(source: EditableMeshSource, faceId: number, 
   const prospectiveIndices = source.indices.length + loop.length * 6;
   if ((prospectiveVertices * (source.uv ? 5 : 3) + prospectiveIndices) * 4 > MAX_CSG_INPUT_BYTES)
     throw new Error("Результат превышает лимит 64 MiB.");
-  const positions = source.positions.slice(), uv = source.uv?.slice(), indices: number[] = [];
+  const positions = source.positions.slice(), uv = source.uv?.slice(), colors = source.colors?.slice(), faceMaterials = source.faceMaterials?.slice(), indices: number[] = [];
   const add = (i: number, top: boolean, tex?: [number, number]) => {
     const index = positions.length / 3;
     const base = point(i);
     if (top) base.addScaledVector(normal, distance);
     positions.push(Math.fround(base.x), Math.fround(base.y), Math.fround(base.z));
+    if (colors) colors.push(...source.colors!.slice(3*i,3*i+3));
     if (uv) uv.push(...(tex ?? [source.uv![2 * i]!, source.uv![2 * i + 1]!]));
     return index;
   };
@@ -273,13 +283,15 @@ export function extrudeEditableFace(source: EditableMeshSource, faceId: number, 
     const a = add(edge.renderFrom, false, [0, 0]), b = add(edge.renderTo, false, [length, 0]);
     const c = add(edge.renderTo, true, [length, distance]), d = add(edge.renderFrom, true, [0, distance]);
     indices.push(a, b, c, a, c, d);
+    if (faceMaterials) faceMaterials.push(source.faceMaterials![edge.triangle]!,source.faceMaterials![edge.triangle]!);
   }
   if (indices.length / 3 > MAX_TOPOLOGY_TRIANGLES) throw new Error("Результат превышает предел треугольников.");
   // Remove orphaned render vertices from the replaced face.
   const used = [...new Set(indices)].sort((a, b) => a - b);
   const compact = new Map(used.map((old, next) => [old, next]));
   const result: EditableMeshSource = { kind: "editable", positions: used.flatMap(i => positions.slice(3 * i, 3 * i + 3)), indices: indices.map(i => compact.get(i)!),
-    ...(uv ? { uv: used.flatMap(i => uv.slice(2 * i, 2 * i + 2)) } : {}) };
+    ...(uv ? { uv: used.flatMap(i => uv.slice(2 * i, 2 * i + 2)) } : {}),
+    ...(colors ? {colors:used.flatMap(i => colors.slice(3*i,3*i+3))} : {}), ...(faceMaterials ? {faceMaterials} : {}) };
   const resultError = validateEditableSource(result);
   if (resultError) throw new Error(resultError);
   const resultTopology = buildMeshTopology(result);

@@ -99,7 +99,7 @@ export interface MaterialSlot {
 
 export type MeshSource =
   | { kind: "primitive"; primitive: "cube" | "sphere" | "torus" | "cylinder" | "cone" | "plane"; parameters: Record<string, number> }
-  | { kind: "editable"; positions: number[]; indices: number[]; uv?: number[] }
+  | { kind: "editable"; positions: number[]; indices: number[]; uv?: number[]; colors?: number[]; faceMaterials?: number[] }
   | { kind: "asset"; assetId: EntityId };
 
 export interface Modifier {
@@ -127,7 +127,8 @@ export interface Material {
   textureAssetIds: EntityId[];
   textureSlots?: MaterialTextureSlots;
   textureMappings?: { baseColor?: BaseColorProjection };
-  proceduralMaps?: { roughness?: ProceduralRoughnessConfig };
+  proceduralMaps?: { roughness?: ProceduralRoughnessConfig; height?: ProceduralHeightConfig };
+  textureStrengths?: { normal?: number; bump?: number };
 }
 
 interface ProceduralRoughnessBase {
@@ -137,10 +138,11 @@ interface ProceduralRoughnessBase {
   resolution: 128 | 256 | 512;
 }
 export type ProceduralRoughnessConfig =
-  | (ProceduralRoughnessBase & { kind: "grain" })
-  | (ProceduralRoughnessBase & { kind: "scratches"; directionRadians: number });
+  | (ProceduralRoughnessBase & { kind: "grain" | "noise" | "marble" })
+  | (ProceduralRoughnessBase & { kind: "scratches" | "brushed-metal"; directionRadians: number });
 
-export interface MaterialTextureSlots { baseColor?: EntityId }
+export interface ProceduralHeightConfig { kind: "stone"; seed: number; scale: number; intensity: number; resolution: 128 | 256 | 512; strength: number }
+export interface MaterialTextureSlots { baseColor?: EntityId; normal?: EntityId; bump?: EntityId; roughness?: EntityId; metalness?: EntityId; emissive?: EntityId }
 export type BaseColorProjection = { mode: "uv" } | { mode: "planar"; axis: "x" | "y" | "z"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "box"; tiling: readonly [number, number]; offset: readonly [number, number] } | { mode: "triplanar"; tiling: readonly [number, number]; offset: readonly [number, number] };
 
 export interface Asset {
@@ -155,6 +157,9 @@ export interface AnimationClip {
   id: EntityId;
   name: string;
   durationSeconds: number;
+  fps?: number;
+  loopStartSeconds?: number;
+  loopEndSeconds?: number;
   loop: boolean;
   trackIds: EntityId[];
 }
@@ -166,6 +171,9 @@ export interface Track {
   id: EntityId;
   nodeId: EntityId;
   property: TrackProperty;
+  muted?: boolean;
+  solo?: boolean;
+  pivot?: Vec3;
   keyframeIds: EntityId[];
 }
 
@@ -174,4 +182,5 @@ export interface Keyframe {
   timeSeconds: number;
   value: KeyframeValue;
   interpolation: "step" | "linear" | "bezier";
+  easing?: readonly [number, number, number, number];
 }

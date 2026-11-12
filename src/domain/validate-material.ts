@@ -10,10 +10,14 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
   }
   const material = value as Record<string, unknown>;
   const keys = ["id", "name", "baseColor", "metalness", "roughness", "emissive", "opacity", "transmission", "ior", "clearcoat", "envIntensity", "textureAssetIds"];
-  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots" && key !== "textureMappings" && key !== "proceduralMaps")) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  if (keys.some(key => !(key in material)) || Object.keys(material).some(key => !keys.includes(key) && key !== "textureSlots" && key !== "textureMappings" && key !== "proceduralMaps" && key !== "textureStrengths")) add("", "Структура материала содержит отсутствующие или лишние поля.");
+  if (material.textureStrengths !== undefined) {
+    const strengths = material.textureStrengths;
+    if (!strengths || typeof strengths !== "object" || Array.isArray(strengths) || Object.entries(strengths).some(([key, v]) => !["normal", "bump"].includes(key) || typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 10)) add("textureStrengths", "Сила normal/bump должна быть от 0 до 10.");
+  }
   if (material.proceduralMaps !== undefined) {
     const maps = material.proceduralMaps;
-    if (!maps || typeof maps !== "object" || Array.isArray(maps) || Object.keys(maps).some(key => key !== "roughness")) add("proceduralMaps", "Неизвестный процедурный канал.");
+    if (!maps || typeof maps !== "object" || Array.isArray(maps) || Object.keys(maps).some(key => key !== "roughness" && key !== "height")) add("proceduralMaps", "Неизвестный процедурный канал.");
     else if ("roughness" in maps) {
       const value = (maps as Record<string, unknown>).roughness;
       if (!value || typeof value !== "object" || Array.isArray(value)) add("proceduralMaps.roughness", "Некорректная конфигурация шероховатости.");
@@ -21,14 +25,22 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
         const config = value as Record<string, unknown>;
         const allowed = ["kind", "seed", "scale", "intensity", "resolution", "directionRadians"];
         if (Object.keys(config).some(key => !allowed.includes(key))) add("proceduralMaps.roughness", "Неизвестный параметр шероховатости.");
-        if (config.kind !== "grain" && config.kind !== "scratches") add("proceduralMaps.roughness.kind", "Доступны только зерно и царапины.");
+        if (!["grain","scratches","noise","marble","brushed-metal"].includes(String(config.kind))) add("proceduralMaps.roughness.kind", "Неизвестный процедурный узор.");
         if (typeof config.seed !== "number" || !Number.isInteger(config.seed) || config.seed < 0 || config.seed > 0xffffffff) add("proceduralMaps.roughness.seed", "Seed должен быть uint32.");
         if (typeof config.scale !== "number" || !Number.isFinite(config.scale) || config.scale < .25 || config.scale > 64) add("proceduralMaps.roughness.scale", "Масштаб должен быть от 0,25 до 64.");
         if (typeof config.intensity !== "number" || !Number.isFinite(config.intensity) || config.intensity < 0 || config.intensity > 1) add("proceduralMaps.roughness.intensity", "Интенсивность должна быть от 0 до 1.");
         if (config.resolution !== 128 && config.resolution !== 256 && config.resolution !== 512) add("proceduralMaps.roughness.resolution", "Разрешение должно быть 128, 256 или 512.");
-        if (config.kind !== "scratches" && "directionRadians" in config || config.kind === "scratches" && (typeof config.directionRadians !== "number" || !Number.isFinite(config.directionRadians) || config.directionRadians < -Math.PI || config.directionRadians > Math.PI)) add("proceduralMaps.roughness.directionRadians", "Направление обязательно для царапин и должно быть от −π до π.");
+        if (!["scratches","brushed-metal"].includes(String(config.kind)) && "directionRadians" in config || ["scratches","brushed-metal"].includes(String(config.kind)) && (typeof config.directionRadians !== "number" || !Number.isFinite(config.directionRadians) || config.directionRadians < -Math.PI || config.directionRadians > Math.PI)) add("proceduralMaps.roughness.directionRadians", "Направление обязательно для царапин и должно быть от −π до π.");
       }
     }
+  }
+  const height = (material.proceduralMaps as Material["proceduralMaps"])?.height;
+  if (height !== undefined) {
+    if (!height || typeof height !== "object" || Array.isArray(height) || Object.keys(height).some(k => !["kind", "seed", "scale", "intensity", "resolution", "strength"].includes(k))
+      || height.kind !== "stone" || !Number.isInteger(height.seed) || height.seed < 0 || height.seed > 0xffffffff
+      || !Number.isFinite(height.scale) || height.scale < .25 || height.scale > 64 || !Number.isFinite(height.intensity) || height.intensity < 0 || height.intensity > 1
+      || ![128,256,512].includes(height.resolution) || !Number.isFinite(height.strength) || height.strength < 0 || height.strength > 10)
+      add("proceduralMaps.height", "Некорректные параметры рельефа камня.");
   }
   for (const field of ["id", "name"] as const) if (typeof material[field] !== "string" || !material[field].trim()) add(field, "Поле должно содержать непустую строку.");
   for (const field of ["baseColor", "emissive"] as const) {
@@ -51,8 +63,8 @@ export function validateMaterial(value: unknown, path = "material"): ValidationI
     add("textureAssetIds", "Ссылки на текстуры должны быть непустыми и уникальными ID.");
   if (material.textureSlots !== undefined) {
     const slots = material.textureSlots;
-    if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => key !== "baseColor")) add("textureSlots", "Неизвестный канал текстуры.");
-    else if ("baseColor" in slots && (typeof (slots as Record<string, unknown>).baseColor !== "string" || !(slots as { baseColor: string }).baseColor.trim())) add("textureSlots.baseColor", "ID текстуры должен быть непустой строкой.");
+    if (!slots || typeof slots !== "object" || Array.isArray(slots) || Object.keys(slots).some(key => !["baseColor", "normal", "bump", "roughness", "metalness", "emissive"].includes(key))) add("textureSlots", "Неизвестный канал текстуры.");
+    else for (const [channel, id] of Object.entries(slots)) if (typeof id !== "string" || !id.trim()) add(`textureSlots.${channel}`, "ID текстуры должен быть непустой строкой.");
   }
   if (material.textureMappings !== undefined) {
     const mappings = material.textureMappings;

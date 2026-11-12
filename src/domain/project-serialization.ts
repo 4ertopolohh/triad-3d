@@ -1,5 +1,6 @@
 import Ajv2020 from "ajv/dist/2020.js";
-import documentSchema from "./schemas/document-v1.7.schema.json";
+import documentSchema from "./schemas/document-v1.8.schema.json";
+import v17DocumentSchema from "./schemas/document-v1.7.schema.json";
 import v16DocumentSchema from "./schemas/document-v1.6.schema.json";
 import v15DocumentSchema from "./schemas/document-v1.5.schema.json";
 import v14DocumentSchema from "./schemas/document-v1.4.schema.json";
@@ -11,7 +12,7 @@ import manifestSchema from "./schemas/manifest-v1.schema.json";
 import type { Project } from "./types";
 import { validateProject } from "./validate-project";
 
-export const DOCUMENT_SCHEMA_VERSION = "1.7.0";
+export const DOCUMENT_SCHEMA_VERSION = "1.8.0";
 export const NATIVE_FORMAT_VERSION = "1.0.0";
 export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
 
@@ -39,6 +40,7 @@ export interface DocumentMigration {
 
 const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
 const documentValidator = ajv.compile(documentSchema);
+const v17DocumentValidator = ajv.compile(v17DocumentSchema);
 const v16DocumentValidator = ajv.compile(v16DocumentSchema);
 const v15DocumentValidator = ajv.compile(v15DocumentSchema);
 const v14DocumentValidator = ajv.compile(v14DocumentSchema);
@@ -135,6 +137,9 @@ const builtinMigrations: readonly DocumentMigration[] = [{ from: "1.0.0", to: "1
 } }, { from: "1.6.0", to: "1.7.0", migrate(input) {
   if (!v16DocumentValidator(input)) throw new Error("Invalid v1.6 document");
   return { ...(input as Record<string, unknown>), schemaVersion: "1.7.0" };
+} }, { from: "1.7.0", to: "1.8.0", migrate(input) {
+  if (!v17DocumentValidator(input)) throw new Error("Invalid v1.7 document");
+  return { ...(input as Record<string, unknown>), schemaVersion: "1.8.0" };
 } }];
 
 export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {

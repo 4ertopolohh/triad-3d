@@ -1,3 +1,4 @@
+import { bakePixels } from "../../src/materials/procedural/bake";
 import { describe, expect, it } from "vitest";
 import { generateProceduralMap } from "../../src/materials/procedural";
 import type { ProceduralMapRequest, ProceduralPatternKind } from "../../src/materials/procedural";
@@ -101,4 +102,18 @@ describe("procedural scalar maps", () => {
   it("keeps the reference byte checksum stable", () => {
     expect(kinds.map(kind => checksum(pixels(request(kind))))).toEqual(["37a033e6", "e973f075", "617e7edd"]);
   });
+});
+
+
+it("generates the additional seeded patterns and bakes neutral roughness without gamma conversion", () => {
+  for (const kind of ["noise","brushed-metal","marble"] as const) {
+    const input = request(kind);
+    expect(pixels(input)).toEqual(pixels(input));
+    expect(pixels(input)).not.toEqual(pixels({...input,seed:7}));
+  }
+  const result = bakePixels({kind:"noise",seed:1,scale:4,intensity:0,resolution:128},.2);
+  expect(result.rgba.slice(0,4)).toEqual(new Uint8ClampedArray([51,51,51,255]));
+  const config = {kind:"stone" as const,seed:1,scale:4,intensity:.5,resolution:128 as const,strength:.1};
+  const baked = bakePixels(config), source = pixels({kind:"stone",seed:1,scale:4,intensity:.5,width:128,height:128});
+  expect(baked.rgba[0]).toBe(source[127*128]);
 });

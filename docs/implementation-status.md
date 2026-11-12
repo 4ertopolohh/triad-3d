@@ -1,5 +1,20 @@
 # Implementation status
 
+## Continuation — materials, timeline, runtime package (in progress)
+
+- Schema 1.8: editable vertex colors and per-triangle material slots; surface map channels and strengths, procedural Stone bump; clip/key validation and Bezier easing, fps/loop markers, mute/solo. New surface cache owns and frees bitmap/GPU resources, with stale-load protection.
+- Brushes: vertex-color Paint and per-face Material, round/box footprints and fill, symmetry, one-stroke Undo, attribute-preserving extrusion. Multi-slot inspector and per-group Planar/Box UV mapping; modifier stacks on painted geometry explicitly rejected until attribute-preserving evaluation.
+- Timeline: reversible commands; absolute-time evaluation; playback/scrub/rate; keys, clip/track removal; numeric values and Bezier handles; presets; position/angular/scale loop differences. Transform recording preserves the base pose and replaces same-time keys. Track drag, frame snapping and zoom, configurable axes/amount/pivot-generated tracks added; acceptance remains ongoing.
+- Geometry: Inspector and gizmo transformations with active modifiers now evaluate an isolated candidate before a single history commit. Failure/cancel keeps document and history unchanged. Sub-element/primitive edits retain their existing restrictions on active dependent modifiers.
+- TSX ZIP: actual geometry and assets, PBR/procedural material modules, animation evaluator, scene/camera/light/HDRI, typed global and user-selected object scale/color props, profile comparison dialog, cancellable preparation. Static GLB allowlist applied again at export; external runtime GLB URIs denied. Modifiers are baked. Source project unchanged.
+- Validation checkpoint: 62 files / 418 tests passed after brushes, recording, export props and projection fixes. Typecheck/lint and production build passed; standalone generated runtime including custom props also built successfully. Procedural expansion, pivot metadata and single-file generation targeted tests also passed. Production package tests passed; exported files installed and built in a separate temporary Vite project (not the old cube spike). Targeted recording/store, material surface and geometry rollback tests passed. Latest full suite passed after these additions.
+- Procedural roughness now includes Noise, Brushed Metal and Marble; PNG baking writes linear scalar data with roundtrip row orientation. Track pivot metadata and oscillation/bounce key presets are persisted. Static asset-free export includes a self-contained copyable TSX file; more complex results use the ZIP runtime.
+- Review defects corrected: empty-track trap; unrelated lock guard; binary asset copying during key input; negative scale easing; loop derivative gaps; export extra light/default exposure; color override restoration; late renderer initialization disposal; GLB URI bypass. Further review follows final changes.
+- Browser smoke: paint fill → Undo/Redo → WebGPU/WebGL2 → exported Max/Balanced comparison passed without console errors. Evidence: `qa/paint-export-comparison.png`. Native ring+chrome+spin save/copy → reopen in fresh session → actual ZIP download → separate npm install/build passed.
+- Browser smoke: new clip → cube → move preset → play → restore base pose → loop diagnostics. Model controls lock during playback and unlock on restore. This is not full golden/release acceptance.
+- Still open: visual acceptance for procedural baking, remaining loop/pivot editing acceptance, all MVP E2E/golden/security/performance gates, then NEXT stages. Do not mark the master specification completed from this checkpoint.
+
+
 ## CODEX-035A — Освещение сцены и raster-профили (13 ноября 2026)
 
 - TASK-035: добавлены SET_SCENE_SETTINGS, строгая проверка параметров и ссылок, обратимые scene patches, русская панель света/фона/камеры/HDRI, exposure и tone mapping. Документ 1.7.0 мигрирует 1.6 без изменения исторических defaults; ZIP 1.0.0 сохранён.

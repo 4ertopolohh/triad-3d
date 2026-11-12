@@ -1,3 +1,5 @@
+import { surfaceStroke, validSurfaceStroke, type SurfaceStroke } from "../geometry/surface-brush";
+import { timelineError, timelineOf, type Timeline } from "../animation/timeline";
 import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import { validateMaterial } from "./validate-material";
@@ -13,10 +15,11 @@ import type { BendParameters, TwistParameters, TaperParameters, BevelParameters 
 import { validatePrimitiveSource, type PrimitiveSource } from "../geometry/primitives";
 import { convertPrimitiveToEditable, extrudeEditableFace, scaleEditableVertices, translateEditableVertices, validateEditableSource } from "../geometry/mesh-edit";
 import { Matrix4, Quaternion, Vector3 } from "three";
-import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, type BrushSymmetry } from "../geometry/displace-brush";
+import { displaceStroke, validFootprint, type BrushFootprint, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, type BrushSymmetry } from "../geometry/displace-brush";
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "SET_TIMELINE"; targetIds: [EntityId]; payload: { projectId: EntityId; timeline: Timeline } }
   | { commandId: string; type: "SET_SCENE_SETTINGS"; targetIds: [EntityId]; payload: { sceneId: EntityId; settings: SceneSettings } }
   | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
   | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
@@ -31,7 +34,8 @@ export type ProjectCommand =
   | { commandId: string; type: "SET_PRIMITIVE_PARAMETERS"; targetIds: [EntityId]; payload: { nodeId: EntityId; source: PrimitiveSource } }
   | { commandId: string; type: "CONVERT_PRIMITIVE_TO_EDITABLE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "TRANSLATE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; delta: Vec3 } }
-  | { commandId: string; type: "APPLY_DISPLACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; samples: Vec3[]; radius: number; strength: number; symmetry?: BrushSymmetry } }
+  | { commandId: string; type: "APPLY_SURFACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; stroke: SurfaceStroke } }
+  | { commandId: string; type: "APPLY_DISPLACE_STROKE"; targetIds: [EntityId]; payload: { nodeId: EntityId; samples: Vec3[]; radius: number; strength: number; symmetry?: BrushSymmetry; footprint?: BrushFootprint } }
   | { commandId: string; type: "SCALE_EDITABLE_VERTICES"; targetIds: [EntityId]; payload: { nodeId: EntityId; vertexIndices: number[]; factors: Vec3 } }
   | { commandId: string; type: "EXTRUDE_EDITABLE_FACE"; targetIds: [EntityId]; payload: { nodeId: EntityId; faceId: number; distance: number } }
   | { commandId: string; type: "MOVE_NODE"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; parentId: EntityId; index: number } }
@@ -63,6 +67,7 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | { kind: "setTimeline"; before: Timeline; after: Timeline }
   | { kind: "setScene"; before: Project["scene"]; after: Project["scene"] }
   | { kind: "addMaterial"; material: Material; index: number }
   | { kind: "removeMaterial"; material: Material; index: number }
@@ -141,6 +146,7 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "SET_TIMELINE") return ownKeys(payload, ["projectId", "timeline"]) && id(payload.projectId) && same(value.targetIds, [payload.projectId]) && timelineError(payload.timeline) === null;
   if (value.type === "SET_SCENE_SETTINGS") return ownKeys(payload, ["sceneId", "settings"]) && id(payload.sceneId)
     && same(value.targetIds, [payload.sceneId]) && sceneSettingsError(payload.settings) === null;
   if (value.type === "ADD_ASSET") {
@@ -220,7 +226,9 @@ function validCommand(value: unknown): value is ProjectCommand {
     || !ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   switch (value.type) {
     case "CONVERT_PRIMITIVE_TO_EDITABLE": return ownKeys(payload, ["nodeId"]);
-    case "APPLY_DISPLACE_STROKE": return ownKeys(payload, ["nodeId", "samples", "radius", "strength", "symmetry"])
+    case "APPLY_SURFACE_STROKE": return ownKeys(payload,["nodeId","stroke"]) && validSurfaceStroke(payload.stroke);
+    case "APPLY_DISPLACE_STROKE": return ownKeys(payload, ["nodeId", "samples", "radius", "strength", "symmetry", "footprint"])
+      && (!Object.hasOwn(payload,"footprint") || validFootprint(payload.footprint as BrushFootprint))
       && (!Object.hasOwn(payload, "symmetry") || isBrushSymmetry(payload.symmetry))
       && brushParameters(payload.radius as number, payload.strength as number)
       && Array.isArray(payload.samples) && payload.samples.length > 0 && payload.samples.length <= MAX_BRUSH_SAMPLES
@@ -333,6 +341,24 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "SET_TIMELINE") {
+    if (command.payload.projectId !== project.id) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Проект не найден.");
+    for (const track of [...project.tracks, ...command.payload.timeline.tracks]) {
+      const next = command.payload.timeline;
+      const beforeTrack = project.tracks.find(t => t.id === track.id);
+      const afterTrack = next.tracks.find(t => t.id === track.id);
+      const beforeKeys = project.keyframes.filter(k => beforeTrack?.keyframeIds.includes(k.id));
+      const afterKeys = next.keyframes.filter(k => afterTrack?.keyframeIds.includes(k.id));
+      const beforeClips = project.animations.filter(c => c.trackIds.includes(track.id)).map(c => ({ id: c.id, durationSeconds: c.durationSeconds, loop: c.loop, loopStartSeconds:c.loopStartSeconds, loopEndSeconds:c.loopEndSeconds }));
+      const afterClips = next.animations.filter(c => c.trackIds.includes(track.id)).map(c => ({ id: c.id, durationSeconds: c.durationSeconds, loop: c.loop, loopStartSeconds:c.loopStartSeconds, loopEndSeconds:c.loopEndSeconds }));
+      if (same(beforeTrack, afterTrack) && same(beforeKeys, afterKeys) && same(beforeClips, afterClips)) continue;
+      const node = nodeById(project, track.nodeId);
+      if (!node) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Объект дорожки не найден.");
+      const guard = guarded(project, node);
+      if (guard) return failure(command.commandId, guard, "Таймлайн содержит скрытые или заблокированные объекты.");
+    }
+    Object.assign(project, structuredClone(command.payload.timeline)); return null;
+  }
   if (command.type === "SET_SCENE_SETTINGS") {
     if (command.payload.sceneId !== project.scene.id) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Сцена не найдена.");
     const environmentId = command.payload.settings.background.environmentAssetId;
@@ -376,9 +402,16 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     const matches = node.materialSlots.filter(slot => slot.name === slotName);
     if (matches.length > 1) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Имя слота повторяется.");
     // Geometry without material groups has only one effective slot.
-    if (materialId !== null && matches.length === 0 && node.materialSlots.length > 0)
+    if (materialId !== null && matches.length === 0 && node.materialSlots.length > 0 && node.meshSource.kind !== "editable")
       return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Для этой геометрии доступен только один действующий слот.");
-    if (materialId === null) node.materialSlots = node.materialSlots.filter(slot => slot.name !== slotName);
+    if (materialId === null) {
+      const index = node.materialSlots.findIndex(slot => slot.name === slotName);
+      if (index >= 0 && node.meshSource.kind === "editable" && node.meshSource.faceMaterials) {
+        if (node.meshSource.faceMaterials.includes(index)) return failure(command.commandId,CommandErrorCode.INVALID_REFERENCE,"Слот используется гранями. Сначала назначьте им другой материал.");
+        node.meshSource.faceMaterials = node.meshSource.faceMaterials.map(value => value > index ? value-1 : value);
+      }
+      node.materialSlots = node.materialSlots.filter(slot => slot.name !== slotName);
+    }
     else if (matches.length) node.materialSlots = node.materialSlots.map(slot => slot.name === slotName ? { name: slotName, materialId } : slot);
     else node.materialSlots.push({ name: slotName, materialId });
     return null;
@@ -584,14 +617,18 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       catch (error) { return failure(command.commandId, CommandErrorCode.VALIDATION_FAILED, error instanceof Error ? error.message : "Геометрия недопустима."); }
       break;
     case "TRANSLATE_EDITABLE_VERTICES":
+    case "APPLY_SURFACE_STROKE":
     case "APPLY_DISPLACE_STROKE":
     case "SCALE_EDITABLE_VERTICES":
     case "EXTRUDE_EDITABLE_FACE":
       if (current.kind !== "mesh" || current.meshSource.kind !== "editable")
         return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Операция требует редактируемую сетку.");
       try {
-        const source = command.type === "APPLY_DISPLACE_STROKE"
-          ? displaceStroke(current.meshSource, command.payload.samples, command.payload.radius, command.payload.strength, command.payload.symmetry)
+        if (command.type === "APPLY_SURFACE_STROKE" && command.payload.stroke.mode === "material" && !current.materialSlots[command.payload.stroke.materialSlot])
+          return failure(command.commandId,CommandErrorCode.INVALID_COMMAND,"Выберите существующий слот материала.");
+        const source = command.type === "APPLY_SURFACE_STROKE" ? surfaceStroke(current.meshSource,command.payload.stroke)
+          : command.type === "APPLY_DISPLACE_STROKE"
+          ? displaceStroke(current.meshSource, command.payload.samples, command.payload.radius, command.payload.strength, command.payload.symmetry, command.payload.footprint)
           : command.type === "TRANSLATE_EDITABLE_VERTICES"
           ? translateEditableVertices(current.meshSource, command.payload.vertexIndices, command.payload.delta)
           : command.type === "SCALE_EDITABLE_VERTICES"
@@ -621,6 +658,7 @@ function entityIds(project: Project): Set<string> {
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
+  if (!same(timelineOf(before), timelineOf(after))) changes.push({ kind: "setTimeline", before: structuredClone(timelineOf(before)), after: structuredClone(timelineOf(after)) });
   if (!same(before.scene, after.scene)) changes.push({ kind: "setScene", before: structuredClone(before.scene), after: structuredClone(after.scene) });
   for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
   for (const [index, material] of [...before.materials.entries()].reverse()) if (!after.materials.some(item => item.id === material.id))
@@ -658,6 +696,7 @@ function diff(before: Project, after: Project): ProjectPatch {
 
 function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if (change.kind === "setTimeline") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setScene") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
@@ -681,6 +720,10 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
+    if (change.kind === "setTimeline") {
+      if (!same(timelineOf(result), change.before)) throw new Error("Patch timeline conflict");
+      Object.assign(result, structuredClone(change.after)); continue;
+    }
     if (change.kind === "setScene") {
       if (!same(result.scene, change.before) || change.before.id !== change.after.id || !same(change.before.instances, change.after.instances)) throw new Error("Patch scene conflict");
       result.scene = structuredClone(change.after);

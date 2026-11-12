@@ -4,7 +4,7 @@ import type { ProjectCommand } from "../domain/command-bus";
 import { validateMaterial } from "../domain/validate-material";
 import { materialNodeReason } from "./material-actions";
 
-export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings" | "proceduralMaps">;
+export type MaterialField = Exclude<keyof Material, "id" | "name" | "textureAssetIds" | "textureSlots" | "textureMappings" | "proceduralMaps" | "textureStrengths">;
 export type MaterialEditMode = "unique" | "shared";
 export interface MaterialEditContext {
   epoch: object; revision: number; nodeId: string; materialId: string; slotName: string; mode: MaterialEditMode;
@@ -15,13 +15,15 @@ export function materialUsage(store: EditorStore, materialId: string) {
   return store.getSnapshot().document.project.nodes.flatMap(node => node.materialSlots.filter(slot => slot.materialId === materialId).map(slot => ({ nodeId: node.id, slotName: slot.name })));
 }
 
-export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode = "unique"): MaterialEditContext | null {
+export function captureMaterialEdit(store: EditorStore, mode: MaterialEditMode = "unique", slotName?: string): MaterialEditContext | null {
   const state = store.getSnapshot();
   const nodeId = state.selection.activeId;
   if (!nodeId || state.selection.ids.length !== 1) return null;
   const node = state.document.project.nodes.find(item => item.id === nodeId);
-  if (node?.kind !== "mesh" || node.materialSlots.length !== 1) return null;
-  return { epoch: store.getProjectEpoch(), revision: state.document.revision, nodeId, materialId: node.materialSlots[0]!.materialId, slotName: node.materialSlots[0]!.name, mode };
+  if (node?.kind !== "mesh" || slotName === undefined && node.materialSlots.length !== 1) return null;
+  const slot = slotName === undefined ? node.materialSlots[0] : node.materialSlots.find(s => s.name === slotName);
+  if (!slot) return null;
+  return {epoch:store.getProjectEpoch(),revision:state.document.revision,nodeId,materialId:slot.materialId,slotName:slot.name,mode};
 }
 
 export function editMaterial(store: EditorStore, context: MaterialEditContext, field: MaterialField, value: number | readonly number[], groupId?: string): MaterialEditResult {
@@ -38,16 +40,19 @@ export function editProceduralRoughness(store: EditorStore, context: MaterialEdi
   return applyMaterialEdit(store, context, config ? { kind: "roughness", config } : { kind: "roughness" });
 }
 
-function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection } | { kind: "roughness"; config?: ProceduralRoughnessConfig }, groupId?: string): MaterialEditResult {
+export function editMaterialSurface(store: EditorStore, context: MaterialEditContext, surface: Pick<Material, "textureSlots" | "textureStrengths" | "proceduralMaps">): MaterialEditResult {
+  return applyMaterialEdit(store, context, { kind: "surface", surface });
+}
+function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, change: { kind: "surface"; surface: Pick<Material, "textureSlots" | "textureStrengths" | "proceduralMaps"> } | { kind: "field"; field: MaterialField; value: number | readonly number[] } | { kind: "texture"; assetId: string | undefined } | { kind: "projection"; projection: BaseColorProjection } | { kind: "roughness"; config?: ProceduralRoughnessConfig }, groupId?: string): MaterialEditResult {
   const state = store.getSnapshot();
   if (store.getProjectEpoch() !== context.epoch || state.document.revision !== context.revision
     || state.selection.ids.length !== 1 || state.selection.activeId !== context.nodeId)
     return { ok: false, message: "Проект или выбор изменился. Повторите действие." };
-  const reason = materialNodeReason(store, context.nodeId);
+  const reason = materialNodeReason(store, context.nodeId,true);
   if (reason) return { ok: false, message: reason };
   const project = state.document.project;
   const node = project.nodes.find(item => item.id === context.nodeId);
-  if (node?.kind !== "mesh" || node.materialSlots.length !== 1 || node.materialSlots[0]?.name !== context.slotName || node.materialSlots[0]?.materialId !== context.materialId)
+  if (node?.kind !== "mesh" || !node.materialSlots.some(slot => slot.name === context.slotName && slot.materialId === context.materialId))
     return { ok: false, message: "Назначение материала изменилось. Повторите действие." };
   const source = project.materials.find(item => item.id === context.materialId);
   if (!source) return { ok: false, message: "Материал больше не существует." };
@@ -57,13 +62,17 @@ function applyMaterialEdit(store: EditorStore, context: MaterialEditContext, cha
   }
   const users = materialUsage(store, source.id);
   if (context.mode === "shared") for (const user of users) {
-    const access = materialNodeReason(store, user.nodeId);
+    const access = materialNodeReason(store, user.nodeId,true);
     if (access) return { ok: false, message: `Общее редактирование недоступно: ${access}` };
   }
   if (change.kind === "projection" && change.projection.mode === "uv" && (!source.textureMappings?.baseColor || source.textureMappings.baseColor.mode === "uv"))
     return { ok: true, revision: context.revision, changed: false };
   const next = structuredClone(source) as Material;
-  if (change.kind === "roughness") {
+  if (change.kind === "surface") {
+    for (const id of Object.values(change.surface.textureSlots ?? {})) if (!store.readAssetBytes(id)) return { ok: false, message: "Байты карты отсутствуют в памяти." };
+    delete next.textureSlots; delete next.textureStrengths; delete next.proceduralMaps;
+    for (const key of ["textureSlots","textureStrengths","proceduralMaps"] as const) if (change.surface[key] !== undefined) Object.assign(next,{[key]:structuredClone(change.surface[key])});
+  } else if (change.kind === "roughness") {
     if (change.config) next.proceduralMaps = { ...next.proceduralMaps, roughness: structuredClone(change.config) };
     else if (next.proceduralMaps) {
       delete next.proceduralMaps.roughness;

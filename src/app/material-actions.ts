@@ -3,7 +3,7 @@ import type { ProjectCommand } from "../domain/command-bus";
 import { materialPresets, matchesPreset, type MaterialPreset } from "../materials/presets";
 import { isJobActive } from "./job-controller";
 
-export function materialNodeReason(store: EditorStore, nodeId: string): string | null {
+export function materialNodeReason(store: EditorStore, nodeId: string, allowMultiple = false): string | null {
   const state = store.getSnapshot();
   if (state.tool.mode !== "model") return "Переключитесь в режим «Модель».";
   const project = state.document.project;
@@ -11,7 +11,7 @@ export function materialNodeReason(store: EditorStore, nodeId: string): string |
   if (!node) return "Объект больше не существует.";
   if (node.kind !== "mesh") return "Выберите Mesh, а не группу.";
   if (node.meshSource.kind === "asset") return "Назначение материала импортированному GLB будет доступно при управлении слотами.";
-  if (node.materialSlots.length > 1) return "У объекта несколько слотов материала.";
+  if (!allowMultiple && node.materialSlots.length > 1) return "У объекта несколько слотов материала.";
   let current: typeof project.nodes[number] | undefined = node;
   while (current) {
     if (current.locked) return "Объект или его родитель заблокирован.";

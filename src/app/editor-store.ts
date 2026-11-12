@@ -1,4 +1,5 @@
 import { createCommandBus } from "../domain/command-bus";
+import { recordTransforms } from "../animation/record";
 import { CommandErrorCode } from "../domain/command-bus";
 import type { CommandResult, ProjectCommand, ProjectPatch } from "../domain/command-bus";
 import type { EntityId, Project } from "../domain/types";
@@ -31,6 +32,9 @@ export interface HistoryEntry {
 }
 
 export interface EditorStore {
+  setAnimationRecording(value: { clipId: string; time: number } | null): void;
+  isAnimationRecording(): boolean;
+  getAnimationRecording(): { clipId: string; time: number } | null;
   readonly jobs: JobController;
   getSnapshot(): EditorState;
   subscribe(listener: () => void): () => void;
@@ -69,6 +73,7 @@ function deepFreeze<T>(value: T): DeepReadonly<T> {
 }
 
 export function createEditorStore(initialProject: Project): EditorStore {
+  let recording: { clipId: string; time: number; epoch: object } | null = null;
   let bus = createCommandBus(initialProject);
   let assetBytes = new AssetBytes();
   let identity: object = {};
@@ -218,16 +223,31 @@ export function createEditorStore(initialProject: Project): EditorStore {
     },
   });
 
+  function execute(commands: ProjectCommand[], revision: number, transactionId?: string, groupId?: string): CommandResult {
+    if (jobActive()) return busy(transactionId ?? commands[0]?.commandId ?? "transaction");
+    if (recording && recording.epoch === projectEpoch && commands.length && commands.every(c => c.type === "SET_NODE_TRANSFORM")) {
+      const candidate = createCommandBus(structuredClone(state.document.project) as Project);
+      if (revision !== state.document.revision) return { ok:false,id:transactionId ?? "record",code:CommandErrorCode.REVISION_CONFLICT,message:"Проект изменился." };
+      const checked = candidate.executeTransaction(commands,0);
+      if (!checked.ok) return checked;
+      try { commands = [recordTransforms(structuredClone(state.document.project) as Project,recording.clipId,recording.time,commands.map(c => (c as Extract<ProjectCommand,{type:"SET_NODE_TRANSFORM"}>).payload))]; }
+      catch (error) { return {ok:false,id:transactionId ?? "record",code:CommandErrorCode.INVALID_COMMAND,message:error instanceof Error ? error.message : "Ошибка записи ключа."}; }
+    }
+    return commit(bus.executeTransaction(commands,revision,transactionId),groupId);
+  }
   return {
+    setAnimationRecording(value) { recording = value ? { ...value,epoch:projectEpoch } : null; },
+    isAnimationRecording: () => recording !== null && recording.epoch === projectEpoch,
+    getAnimationRecording: () => recording && recording.epoch === projectEpoch ? {clipId:recording.clipId,time:recording.time} : null,
     jobs,
     getSnapshot: () => state,
     subscribe(listener) {
       listeners.add(listener);
       return () => { listeners.delete(listener); };
     },
-    executeCommand: (command, expectedRevision, groupId) => jobActive() ? busy(command.commandId) : commit(bus.executeCommand(command, expectedRevision), groupId),
+    executeCommand: (command, expectedRevision, groupId) => execute([command],expectedRevision,command.commandId,groupId),
     executeTransaction: (commands, expectedRevision, transactionId, groupId) =>
-      jobActive() ? busy(transactionId ?? commands[0]?.commandId ?? "transaction") : commit(bus.executeTransaction(commands, expectedRevision, transactionId), groupId),
+      execute(commands,expectedRevision,transactionId,groupId),
     undo: (expectedRevision) => travel(-1, expectedRevision),
     redo: (expectedRevision) => travel(1, expectedRevision),
     cancelGesture(groupId, expectedRevision) {

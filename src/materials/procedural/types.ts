@@ -1,4 +1,4 @@
-export type ProceduralPatternKind = "grain" | "scratches" | "stone";
+export type ProceduralPatternKind = "grain" | "scratches" | "stone" | "noise" | "brushed-metal" | "marble";
 export type ProceduralMapChannel = "roughness" | "height";
 
 export interface ProceduralMapRequest {

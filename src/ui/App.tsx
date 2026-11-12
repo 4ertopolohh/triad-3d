@@ -1,3 +1,5 @@
+import { ExportDialog } from "./ExportDialog";
+import { Timeline, type AnimationPreview } from "./Timeline";
 import { SceneInspector } from "./SceneInspector";
 import { Viewport } from "../renderer/Viewport";
 import { createProject } from "../domain";
@@ -60,6 +62,8 @@ function EditorShell() {
   const workspace = useRef<HTMLDivElement>(null);
   const fileLock = useRef(false);
   const [fileBusy, setFileBusy] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [animationPreview, setAnimationPreview] = useState<AnimationPreview>(null);
   const [fileStatus, setFileStatus] = useState<Notice | null>(null);
   const [pendingGlb, setPendingGlb] = useState<{ prepared: PreparedGlb; revision: number; identity: object } | null>(null);
   const [dockWidths, setDockWidths] = useState<[number, number]>([280, 280]);
@@ -71,7 +75,8 @@ function EditorShell() {
   const canUndo = selectCanUndo(state);
   const canRedo = selectCanRedo(state);
   const jobBlocked = isJobActive(state.job.status);
-  const blocked = fileBusy || !!pendingGlb || jobBlocked;
+  const operationsBlocked = fileBusy || !!pendingGlb || jobBlocked;
+  const blocked = operationsBlocked || (animationPreview !== null && !animationPreview.recording);
   const notice = (kind: Notice["kind"], text: string) => setFileStatus({ kind, text });
   const stopDrag = useCallback(() => { dragCleanup.current?.(); dragCleanup.current = null; setDragging(false); }, []);
   useEffect(() => () => { dragCleanup.current?.(); importAbort.current?.abort(); }, []);
@@ -166,7 +171,7 @@ function EditorShell() {
     setPendingGlb(null);
     notice("success", "Новый проект создан.");
   }
-  async function saveProject() {
+  async function saveProject(downloadOnly = false) {
     if (blocked || fileLock.current) return;
     fileLock.current = true;
     setFileBusy(true);
@@ -176,7 +181,7 @@ function EditorShell() {
     const picker = (window as Window & { showSaveFilePicker?: (options: unknown) => Promise<{ createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }> }> }).showSaveFilePicker;
     try {
       // The picker needs the original click activation; acquire the handle before asynchronous hashing.
-      const handle = picker ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
+      const handle = picker && !downloadOnly ? await picker({ suggestedName: filename, types: [{ description: "Проект TRIAD-3D", accept: { "application/x-triad3d": [".triad3d"] } }] }) : null;
       const result = await createNativeProjectArchive(captured.project, captured.assets, packageInfo.version);
       if (!result.ok) { notice("error", result.error.message); return; }
       if (handle) {
@@ -275,10 +280,11 @@ function EditorShell() {
           <button type="button" disabled={blocked} onClick={newProject}>Новый проект</button>
           <button type="button" disabled={!canUndo || blocked} onClick={() => travel("undo")}>Отменить</button>
           <button type="button" disabled={!canRedo || blocked} onClick={() => travel("redo")}>Повторить</button>
-          <button type="button" disabled={blocked} onClick={saveProject}>Сохранить проект</button>
+          <button type="button" disabled={blocked} onClick={() => void saveProject()}>Сохранить проект</button>
+          <button type="button" disabled={blocked} onClick={() => void saveProject(true)}>Скачать копию</button>
           <button type="button" disabled={blocked} onClick={() => fileInput.current?.click()}>Открыть проект</button>
           <button type="button" disabled={blocked} onClick={() => glbInput.current?.click()}>Импорт GLB</button>
-          <button type="button" disabled title="Экспорт TSX/ZIP появится на отдельном этапе">Экспорт</button>
+          <button type="button" disabled={blocked} onClick={() => setExportOpen(true)}>Экспорт</button>
           <input ref={fileInput} className="file-input" type="file" accept=".triad3d" aria-label="Выбрать файл проекта TRIAD-3D" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void openProject(file); }} />
           <input ref={glbInput} className="file-input" type="file" accept=".glb,model/gltf-binary" aria-label="Выбрать файл GLB" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlb(file); }} />
           <input ref={resourceInput} className="file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.hdr,.exr,image/png,image/jpeg,image/webp" aria-label="Выбрать изображение, HDR или EXR" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importResource(file); }} />
@@ -302,7 +308,7 @@ function EditorShell() {
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину левой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[0]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[1])} onPointerDown={(event) => startDrag(event, "left")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("left", dockWidths[0] + (event.key === "ArrowRight" ? 16 : -16)); } }} />
         <main className="stage" aria-label="Рабочая область">
           <div className="stage-topline"><span>РАБОЧАЯ ОБЛАСТЬ · {state.tool.mode === "model" ? "МОДЕЛЬ" : "СЦЕНА"}</span><span>Проект только в памяти вкладки</span></div>
-          <Viewport store={editorStore} mode={state.tool.mode} blocked={blocked} notice={notice} />
+          <Viewport animationPreview={animationPreview} store={editorStore} mode={state.tool.mode} blocked={blocked} notice={notice} />
         </main>
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
         <aside className="dock right-dock" aria-label="Инспектор">
@@ -310,7 +316,8 @@ function EditorShell() {
           <div className="panel-content">{state.tool.mode === "scene" ? <SceneInspector store={editorStore} state={state} blocked={blocked} /> : <Inspector store={editorStore} state={state} blocked={blocked} />}</div>
         </aside>
       </div>
-      <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>
+      {exportOpen && <ExportDialog store={editorStore} onClose={() => setExportOpen(false)} />}
+      <Timeline store={editorStore} blocked={operationsBlocked} onPreview={setAnimationPreview} />
       <div className="narrow-screen" role="note"><strong>TRIAD-3D предназначен для настольного браузера</strong><p>Увеличьте ширину окна или откройте редактор на ПК. Текущий проект остаётся в памяти этой вкладки.</p></div>
       </div>
       <JobOverlay job={state.job} cancel={() => editorStore.jobs.cancelJob()} />

@@ -19,7 +19,7 @@ export interface PreparedGlb {
   materialCount: number;
 }
 
-function inspectContainer(bytes: Uint8Array): ImportResult<Record<string, unknown>> {
+export function inspectStaticGlb(bytes: Uint8Array): ImportResult<Record<string, unknown>> {
   if (bytes.byteLength < 20 || bytes.byteLength > ARCHIVE_LIMITS.asset) return fail("FILE_INVALID", "Размер GLB недопустим (максимум 64 МиБ).");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (view.getUint32(0, true) !== 0x46546c67) return fail("FILE_INVALID", "Файл не содержит сигнатуру GLB.");
@@ -111,7 +111,7 @@ export async function prepareGlb(file: File): Promise<ImportResult<PreparedGlb>>
 /** Same bounded, URI-free path for import and archive-backed viewport decoding. Caller owns root. */
 export async function decodeStaticGlb(bytes: Uint8Array): Promise<ImportResult<{ root: Object3D; triangles: number; materialCount: number }>> {
   try {
-    const preflight = inspectContainer(bytes);
+    const preflight = inspectStaticGlb(bytes);
     if (!preflight.ok) return preflight;
     const loader = new GLTFLoader();
     const input = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength

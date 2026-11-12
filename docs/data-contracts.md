@@ -2,7 +2,7 @@
 
 ## Native `.triad3d` container (TASK-010A)
 
-The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. New documents use `schemaVersion: "1.7.0"`; the unchanged ZIP container uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
+The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. New documents use `schemaVersion: "1.8.0"`; the unchanged ZIP container uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
 
 The loader rejects unknown entries, ambiguous paths, unsupported versions, mismatched hashes, and input beyond temporary security limits (128 MiB archive, 256 MiB expanded, 1024 entries, 64 MiB per asset, 16 MiB document, 1 MiB manifest). These limits are protective and require separate performance profiling before changes.
 
@@ -79,3 +79,22 @@ Enabled Boolean modifiers use `parameters: { operation: "subtract" | "union" | "
 New environment assignments accept existing HDR/EXR assets. Historical other-type references remain readable and produce a neutral-light diagnostic. Worker decoding checks dimensions and the existing 128 MiB decoded-image budget; cancellation terminates the Worker. Replacing a project discards late results and releases derived textures. Exposure and environment changes do not rewrite materials.
 
 Draft/Quality/Final are session-only raster resolution profiles: pixel-ratio caps 1/1.5/2 and maximum backing-buffer dimensions 2048/3072/4096, also capped by devicePixelRatio. They do not change Project, add postprocessing or enable path tracing. Both automatic WebGPU and forced WebGL2 use the existing WebGPURenderer.
+
+
+## Document 1.8 — surface maps and timeline
+
+Optional material channels: baseColor/normal/bump/roughness/metalness/emissive; each assigned channel references an existing raster asset (PNG/JPEG/WebP). Normal/bump strengths are finite 0..10. Stone height has deterministic seed, scale, intensity, resolution and strength. These are visual maps, not geometry displacement. Normal maps take precedence over height. Linear data maps and sRGB emissive/baseColor samplers remain separate. Existing 1.7 documents migrate without adding fields.
+
+`SET_TIMELINE` atomically replaces clips/tracks/keys with inverse history patches. Keys match channel arity; quaternions are normalized; scale keys remain positive. Duplicate channel/time pairs are rejected in generic edits; recording replaces same-time keys. Optional cubic easing is [x1,y1,x2,y2]; x stays 0..1, and scale y stays 0..1. Optional clip fps (1..240), loopStartSeconds/loopEndSeconds and track muted/solo serialize in 1.8. Absolute-time evaluation is derived and never writes authored transforms. Recording converts approved transform commands into key commands; camera navigation does not issue model transform commands. Playback/time/recording rate are session state.
+
+Production ZIP includes a separate Vite/React runtime, source geometry buffers (modifiers baked), textures, original verified static GLBs, materials, timeline and scene settings. It carries no editor store/history. Asset URLs are relative and overridable via assetBaseUrl. Every GLB passes static inspection before packaging; runtime loader denies external URIs. Max/Balanced/Lite currently change raster resolution and antialiasing, not mesh simplification. Runtime supports global width/height/scale/color/speed/playing/clipId/time props. User-selected per-object props and standalone single-file export remain open.
+
+
+Editable meshes in document 1.8 may carry `colors` (linear RGB, three components per render vertex, [0,1]) and `faceMaterials` (one slot index per triangle, 0–255). Mesh validation includes their byte budget. Paint uses maximum sample influence per stroke, Material assigns triangle centroids within the footprint, and fill applies to the whole selected mesh. Displace supports round/box/fill with its existing displacement guard. Extrusion propagates color and face slots, including side triangles. Removal of a referenced slot fails; unused-slot removal reindexes later slots. Active modifier stacks on painted meshes fail validation rather than silently dropping these attributes.
+
+Export profile preview uses the same standalone runtime and prepared geometry as ZIP, with RAM Blob URLs only in the editor preview. Generated object props have validated identifiers and positive scale / HEX color defaults. Dynamic IDs use dictionaries without prototypes and computed keys. Per-group Planar/Box projections preserve vertex paint and source-index correspondence; UV mapping is baked only in derived geometry.
+
+
+The 1.8 roughness pattern set includes grain, scratches, noise, marble and brushed-metal. Direction is mandatory for scratches/brushed-metal. Stone remains a height/bump pattern. PNG baking stores absolute roughness (use material roughness 1 when assigning) or scalar height, preserving row orientation and linear data. `Track.pivot` records a generated rotation center in parent coordinates; ordinary editable keys carry motion. Oscillate/bounce presets also generate ordinary keys and refuse existing channels.
+
+A static asset-free subset can additionally export `StandaloneModel.tsx`, with React/Three external imports only. Animation, procedural maps, external assets and code over 512 KiB require the full ZIP. This subset uses Max raster settings and global width/height/scale/color props; selected object props belong to the full runtime.

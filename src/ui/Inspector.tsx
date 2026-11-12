@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { checkedTransform, transformNeedsEvaluation } from "../app/checked-transform";
+import { recordingPose } from "../app/recording-pose";
 import type { DeepReadonly, EditorState, EditorStore } from "../app/editor-store";
 import type { Node } from "../domain/types";
 import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
@@ -9,10 +11,10 @@ import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, 
 const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
 const validSession = (store: EditorStore, session: EditSession) => sessionCurrent(store.getSnapshot(), store.getProjectEpoch(), session);
 const format = (value: number) => String(Number(value.toPrecision(12)));
-type TransformSession = EditSession & { groupId: string; applied?: string };
+type TransformSession = EditSession & { groupId: string; applied?: string; recordingKey: string };
 
 export function Inspector({ store, state, blocked }: { store: EditorStore; state: EditorState; blocked: boolean }) {
-  const project = state.document.project;
+  const project = recordingPose(store,state).document.project;
   const nodes = state.selection.ids.map(id => project.nodes.find(node => node.id === id)).filter((node): node is DeepReadonly<Node> => !!node);
   const [draft, setDraft] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
@@ -33,7 +35,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
   const displayReason = displays.find(item => !item.ok);
   const disabled = !!transformReason || !!displayReason;
   function begin(key: string, value: number | null) {
-    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, groupId: crypto.randomUUID() };
+    session.current = { revision: state.document.revision, epoch: store.getProjectEpoch(), ids: selectionKey(state), mode: state.tool.mode, space: state.tool.space, field: key, touched: false, recordingKey: JSON.stringify(store.getAnimationRecording()), groupId: crypto.randomUUID() };
     setEditing(key); setDraft(value === null ? "" : format(value)); setError(null);
   }
   function cancel(rollback = false) {
@@ -54,8 +56,15 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
     const parsed = parseNumber(raw);
     if (!parsed.ok) { if (final) { cancel(true); setError({ field: key, message: parsed.message }); } return; }
     if (captured.applied === raw || !captured.applied && currentValue !== null && Math.abs(parsed.value - currentValue) <= 1e-12) { if (final) cancel(); return; }
-    const prepared = prepareTransformCommands(store.getSnapshot(), { field, axis, value: parsed.value });
+    if (captured.recordingKey !== JSON.stringify(store.getAnimationRecording())) { cancel(); return; }
+    const prepared = prepareTransformCommands(recordingPose(store), { field, axis, value: parsed.value });
     if (!prepared.ok) { if (final) { cancel(true); setError({ field: key, message: prepared.message }); } return; }
+    if (transformNeedsEvaluation(store)) {
+      if (!final) return;
+      cancel();
+      void checkedTransform(store,prepared.value,captured.revision).then(result => { if (!result.ok) setError({field:key,message:result.message}); });
+      return;
+    }
     const result = store.executeTransaction(prepared.value, captured.revision, undefined, captured.groupId);
     if (!result.ok) { if (final) { cancel(); setError({ field: key, message: result.message }); } return; }
     captured.revision = result.revision;
@@ -74,8 +83,11 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
   function reset(field: TransformField) {
     if (disabled) return;
     const current = store.getSnapshot();
-    const prepared = prepareTransformCommands(current, { field, reset: true });
+    const prepared = prepareTransformCommands(recordingPose(store,current), { field, reset: true });
     if (!prepared.ok) { setError({ field, message: prepared.message }); return; }
+    if (transformNeedsEvaluation(store)) {
+      cancel(); void checkedTransform(store,prepared.value,current.document.revision).then(result => { if (!result.ok) setError({field,message:result.message}); }); return;
+    }
     const result = store.executeTransaction(prepared.value, current.document.revision);
     if (!result.ok) setError({ field, message: result.message }); else cancel();
   }

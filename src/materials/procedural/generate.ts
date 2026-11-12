@@ -12,7 +12,7 @@ function validate(input: unknown): ProceduralMapGeneration | ProceduralMapReques
   for (const key of Reflect.ownKeys(request)) {
     if (typeof key !== "string" || !keys.has(key)) return invalid(String(key), "Unknown request field.");
   }
-  if (request.kind !== "grain" && request.kind !== "scratches" && request.kind !== "stone") return invalid("kind", "Unknown pattern kind.");
+  if (!["grain","scratches","stone","noise","brushed-metal","marble"].includes(String(request.kind))) return invalid("kind", "Unknown pattern kind.");
   for (const field of ["width", "height"] as const) {
     const value = request[field];
     if (typeof value !== "number" || !Number.isInteger(value) || value < 16 || value > 512) return invalid(field, "Expected an integer from 16 to 512.");
@@ -20,7 +20,7 @@ function validate(input: unknown): ProceduralMapGeneration | ProceduralMapReques
   if (typeof request.seed !== "number" || !Number.isInteger(request.seed) || request.seed < 0 || request.seed > 0xffffffff) return invalid("seed", "Expected a uint32 seed.");
   if (typeof request.scale !== "number" || !Number.isFinite(request.scale) || request.scale < 0.25 || request.scale > 64) return invalid("scale", "Expected a finite number from 0.25 to 64.");
   if (typeof request.intensity !== "number" || !Number.isFinite(request.intensity) || request.intensity < 0 || request.intensity > 1) return invalid("intensity", "Expected a finite number from 0 to 1.");
-  if (request.kind !== "scratches" && "directionRadians" in request) return invalid("directionRadians", "Direction is only valid for scratches.");
+  if (request.kind !== "scratches" && request.kind !== "brushed-metal" && "directionRadians" in request) return invalid("directionRadians", "Direction is only valid for directional patterns.");
   if ("directionRadians" in request && (typeof request.directionRadians !== "number" || !Number.isFinite(request.directionRadians) || request.directionRadians < -Math.PI || request.directionRadians > Math.PI)) return invalid("directionRadians", "Expected a finite angle from -π to π.");
   return request as unknown as ProceduralMapRequest;
 }
@@ -82,6 +82,9 @@ export function generateProceduralMap(input: unknown): ProceduralMapGeneration {
       const y = (row + 0.5) / height;
       const variation = kind === "grain" ? grain(x, y, scale, seed)
         : kind === "stone" ? stone(x, y, scale, seed)
+          : kind === "noise" ? (valueNoise(x*scale,y*scale,seed)-.5)*2
+          : kind === "marble" ? Math.sin((x*scale+valueNoise(x*scale,y*scale,seed)*2)*Math.PI*2)*.8
+          : kind === "brushed-metal" ? (valueNoise((-x*Math.sin(direction)+y*Math.cos(direction))*scale*80,(x*Math.cos(direction)+y*Math.sin(direction))*scale*.25,seed)-.5)*2
           : scratches(x, y, scale, seed, direction);
       pixels[row * width + column] = Math.round(clamp01((128 / 255) + variation * intensity * 0.42) * 255);
     }

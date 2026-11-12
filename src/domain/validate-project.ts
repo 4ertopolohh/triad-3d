@@ -1,3 +1,4 @@
+import { timelineError, timelineOf } from "../animation/timeline";
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
 import { validateEditableSource } from "../geometry/mesh-edit";
@@ -25,6 +26,8 @@ export interface ValidationIssue {
 
 export function validateProject(project: Project): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
+  const animationError = timelineError(timelineOf(project));
+  if (animationError) issues.push({ code: "INVALID_STRUCTURE", path: "animations", message: animationError });
   const sceneError = sceneExtensionsError(project.scene);
   if (sceneError) issues.push({ code: "INVALID_STRUCTURE", path: "scene", message: sceneError });
   const entities = new Map<EntityId, string>();
@@ -97,6 +100,8 @@ export function validateProject(project: Project): ValidationIssue[] {
         const message = validatePrimitiveSource(node.meshSource);
         if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
       } else {
+        if (node.meshSource.faceMaterials?.some(index => index >= Math.max(1,node.materialSlots.length))) issues.push({code:"INVALID_STRUCTURE",path:`nodes.${node.id}.meshSource.faceMaterials`,message:"Индекс материала грани вне слотов объекта."});
+        if ((node.meshSource.colors || node.meshSource.faceMaterials) && node.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled)) issues.push({code:"INVALID_STRUCTURE",path:`nodes.${node.id}.modifierIds`,message:"Модификаторы окрашенной сетки требуют сохранения атрибутов; сначала отключите стек."});
         const message = validateEditableSource(node.meshSource);
         if (message) issues.push({ code: "INVALID_STRUCTURE", path: `nodes.${node.id}.meshSource`, message });
       }
@@ -245,12 +250,12 @@ export function validateProject(project: Project): ValidationIssue[] {
   for (const material of project.materials) {
     issues.push(...validateMaterial(material, `materials.${material.id}`));
     if (Array.isArray(material.textureAssetIds)) material.textureAssetIds.forEach((assetId, index) => reference(assetId, assetIds, `materials.${material.id}.textureAssetIds[${index}]`));
-    const baseColorId = material.textureSlots?.baseColor;
-    if (baseColorId) {
-      reference(baseColorId, assetIds, `materials.${material.id}.textureSlots.baseColor`);
-      const asset = project.assets.find(item => item.id === baseColorId);
-      if (asset && !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) issues.push({ code: "INVALID_STRUCTURE", path: `materials.${material.id}.textureSlots.baseColor`, message: "Основной цвет поддерживает только PNG, JPEG и WebP." });
+    for (const [channel, assetId] of Object.entries(material.textureSlots ?? {})) {
+      reference(assetId, assetIds, `materials.${material.id}.textureSlots.${channel}`);
+      const asset = project.assets.find(a => a.id === assetId);
+      if (asset && !["image/png", "image/jpeg", "image/webp"].includes(asset.mediaType)) issues.push({ code: "INVALID_STRUCTURE", path: `materials.${material.id}.textureSlots.${channel}`, message: "Карта материала должна быть PNG, JPEG или WebP." });
     }
+
   }
   for (const clip of project.animations) {
     finite(clip.durationSeconds, `animations.${clip.id}.durationSeconds`);

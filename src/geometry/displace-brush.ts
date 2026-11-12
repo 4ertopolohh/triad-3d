@@ -8,6 +8,8 @@ export const MAX_BRUSH_SAMPLES = 512;
 export const BRUSH_RADIUS_MIN = 0.01;
 export const BRUSH_RADIUS_MAX = 10;
 export const BRUSH_STRENGTH_MAX = 0.5;
+export interface BrushFootprint { shape: "round" | "box"; fill: boolean }
+export const validFootprint = (value: BrushFootprint) => value && (value.shape === "round" || value.shape === "box") && typeof value.fill === "boolean" && Object.keys(value).every(k => k === "shape" || k === "fill");
 export type BrushSymmetry = "off" | "x" | "y" | "z";
 export const isBrushSymmetry = (value: unknown): value is BrushSymmetry =>
   value === "off" || value === "x" || value === "y" || value === "z";
@@ -28,7 +30,7 @@ export function brushParameters(radius: number, strength: number): boolean {
 
 const vertexKey = (p: readonly number[], i: number) => [0, 1, 2].map(a => Math.round(p[3 * i + a]! / SEAM_TOLERANCE)).join(":");
 
-export function brushAffectedVertices(source: ReadonlyEditable, point: readonly number[], radius: number, symmetry: BrushSymmetry = "off"): number[] {
+export function brushAffectedVertices(source: ReadonlyEditable, point: readonly number[], radius: number, symmetry: BrushSymmetry = "off", footprint: BrushFootprint = {shape:"round",fill:false}): number[] {
   if (!Number.isFinite(radius) || radius <= 0 || point.length !== 3 || !point.every(Number.isFinite)) return [];
   const result: number[] = [];
   const centers = brushCenters(point, symmetry);
@@ -37,15 +39,15 @@ export function brushAffectedVertices(source: ReadonlyEditable, point: readonly 
       const x = source.positions[3 * i]! - center[0]!;
       const y = source.positions[3 * i + 1]! - center[1]!;
       const z = source.positions[3 * i + 2]! - center[2]!;
-      return x * x + y * y + z * z < radius * radius;
+      return footprint.fill || (footprint.shape === "box" ? Math.max(Math.abs(x),Math.abs(y),Math.abs(z)) < radius : x * x + y * y + z * z < radius * radius);
     })) result.push(i);
   }
   return result;
 }
 
 /** Pure local-space stroke. A canonical geometric vertex receives one displacement across UV seams. */
-export function displaceStroke(source: EditableMeshSource, samples: readonly (readonly number[])[], radius: number, strength: number, symmetry: BrushSymmetry = "off"): EditableMeshSource {
-  if (!brushParameters(radius, strength) || !samples.length || samples.length > MAX_BRUSH_SAMPLES
+export function displaceStroke(source: EditableMeshSource, samples: readonly (readonly number[])[], radius: number, strength: number, symmetry: BrushSymmetry = "off", footprint: BrushFootprint = {shape:"round",fill:false}): EditableMeshSource {
+  if (!validFootprint(footprint) || !brushParameters(radius, strength) || !samples.length || samples.length > MAX_BRUSH_SAMPLES
     || !isBrushSymmetry(symmetry) || samples.some(p => p.length !== 3 || !p.every(Number.isFinite))) throw new Error("Недопустимые параметры или точки мазка.");
   if (source.positions.length / 3 > MAX_BRUSH_VERTICES) throw new Error(`Кисть поддерживает не более ${MAX_BRUSH_VERTICES} вершин.`);
   const error = validateEditableSource(source);
@@ -99,9 +101,10 @@ export function displaceStroke(source: EditableMeshSource, samples: readonly (re
     const i = ids[0]!, n = normals.get(key) ?? [0, 0, 0];
     const length = Math.hypot(...n);
     if (length < 1e-12) continue;
-    let influence = 0;
+    let influence = footprint.fill ? 1 : 0;
     for (const point of centers) {
-      const d = Math.hypot(p[3 * i]! - point[0]!, p[3 * i + 1]! - point[1]!, p[3 * i + 2]! - point[2]!);
+      const delta = [0,1,2].map(a => Math.abs(p[3*i+a]! - point[a]!));
+      const d = footprint.shape === "box" ? Math.max(...delta) : Math.hypot(...delta);
       if (d < radius) influence = Math.max(influence, (1 - d / radius) ** 2);
     }
     const amount = Math.sign(strength) * Math.min(maxDisplacement, Math.abs(strength) * influence);
