@@ -1,5 +1,15 @@
 # Implementation status
 
+## CODEX-035A — Освещение сцены и raster-профили (13 ноября 2026)
+
+- TASK-035: добавлены SET_SCENE_SETTINGS, строгая проверка параметров и ссылок, обратимые scene patches, русская панель света/фона/камеры/HDRI, exposure и tone mapping. Документ 1.7.0 мигрирует 1.6 без изменения исторических defaults; ZIP 1.0.0 сохранён.
+- HDR/EXR декодируются в Worker с бюджетом изображения, правильной ориентацией, отменой при замене и освобождением поздних результатов. При ошибке — диагностика и нейтральный свет. Чистые проверки размеров вынесены из import/archive adapter, чтобы Worker не загружал доменные схемы и архиватор.
+- TASK-036 частично: Draft/Quality/Final управляют pixel ratio и предельным разрешением raster preview в RAM; source document не меняется. Дополнительные эффекты, shadows и path tracing не заявлены реализованными.
+- Исправлена компоновка workspace: длинные docks прокручиваются внутри окна, не растягивая canvas за пределы экрана.
+- Проверки: typecheck, lint, production build PASS; полный Vitest — **55 файлов / 390 тестов PASS**, включая независимый React/Vite spike export harness. Первый полный прогон обнаружил timeout холодной загрузки worker test; выделен чистый модуль image dimensions и установлен локальный timeout 15 s для decoder integration. Повторный полный прогон прошёл. Существующие Vite предупреждения о большом chunk и browser-external node:module в Manifold сохраняются.
+- Browser smoke PASS: свет и exposure с Undo/Redo, локальный HDRI на хромированной сфере, поворот окружения, WebGPU и forced WebGL2, Draft/Final, desktop/узкий guard и прокрутка панелей. **Golden chrome/glass/stone, полный ручной save/reopen и аппаратное профилирование остаются UNVERIFIED.** TASK-035/036 не объявлены полностью принятыми, остальные этапы не закрыты автоматически.
+- Полный аудит текущих этапов и зависимостей: `specification-audit.md`. Проект в целом не завершён: остаются кисти/материалы, анимация, production export, NEXT и release gate.
+
 ## CODEX-024B — Выбор и численное перемещение вершин (часть TASK-024)
 
 - Inspector явно преобразует поддерживаемый примитив в Editable Mesh через CommandBus. Object/Vertex mode и выбранные render vertex indices хранятся только в EditorStore и очищаются при потере допустимости или замене проекта.

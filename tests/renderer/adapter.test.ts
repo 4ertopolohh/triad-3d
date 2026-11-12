@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WebGPURenderer } from "three/webgpu";
 import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "../../src/renderer/adapter";
+import { createProject } from "../../src/domain/create-project";
+import { NeutralToneMapping } from "three";
 
 class Canvas extends EventTarget {
   parent: Host | null = null;
@@ -21,6 +23,23 @@ function factory(mode: BackendMode): WebGPURenderer {
 }
 afterEach(() => { vi.unstubAllGlobals(); created.length = 0; });
 describe("renderer lifecycle", () => {
+  it("applies document exposure across initialization and switches resolution profiles without document writes", async () => {
+    vi.stubGlobal("ResizeObserver", Observer); vi.stubGlobal("window", { devicePixelRatio: 2 });
+    vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1)); vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    let renderer!: WebGPURenderer;
+    const adapter = new ThreeRendererAdapter(() => {}, () => {}, mode => { renderer = factory(mode); return renderer; });
+    const project = createProject(); project.scene.renderSettings = { exposure: 2, toneMapping: "neutral" };
+    const before = structuredClone(project);
+    adapter.sync(project, () => undefined);
+    await adapter.initialize(new Host() as unknown as HTMLElement, "webgl2");
+    expect(renderer.toneMappingExposure).toBe(2); expect(renderer.toneMapping).toBe(NeutralToneMapping);
+    adapter.setQuality("draft"); expect(renderer.setPixelRatio).toHaveBeenLastCalledWith(1);
+    adapter.setQuality("quality"); expect(renderer.setPixelRatio).toHaveBeenLastCalledWith(1.5);
+    adapter.setQuality("final"); expect(renderer.setPixelRatio).toHaveBeenLastCalledWith(2);
+    adapter.resize(8192, 4096); expect(renderer.setPixelRatio).toHaveBeenLastCalledWith(.5);
+    expect(project).toEqual(before);
+    await adapter.dispose();
+  });
   it("does not attach a canvas when unmounted during asynchronous initialization", async () => {
     vi.stubGlobal("ResizeObserver", Observer); vi.stubGlobal("window", { devicePixelRatio: 1 });
     vi.stubGlobal("requestAnimationFrame", vi.fn(() => 1)); vi.stubGlobal("cancelAnimationFrame", vi.fn());

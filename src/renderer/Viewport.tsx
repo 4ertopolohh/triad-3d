@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
-import { ThreeRendererAdapter, type BackendMode, type RendererStatus } from "./adapter";
+import { ThreeRendererAdapter, PREVIEW_PROFILES, type PreviewQuality, type BackendMode, type RendererStatus } from "./adapter";
 import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
 import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
@@ -12,6 +12,9 @@ import { endMaterialDrag, materialDragActive, MATERIAL_PRESET_MIME, resolveMater
 export function Viewport({ store, mode, blocked, notice }: { store: EditorStore; mode: "model" | "scene"; blocked: boolean; notice: (kind: "info" | "success" | "error", text: string) => void }) {
   const host = useRef<HTMLDivElement>(null);
   const interactions = useRef<ViewportInteractions | null>(null);
+  const rendererAdapter = useRef<ThreeRendererAdapter | null>(null);
+  const [quality, setQuality] = useState<PreviewQuality>("final");
+  const qualityRef = useRef(quality); qualityRef.current = quality;
   const state = useEditorStore(store);
   const [snap, setSnap] = useState(false);
   const [radiusText, setRadiusText] = useState("0.35");
@@ -44,6 +47,8 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
         interactions.current?.dispose(); interactions.current = null;
       }
     }, setScene);
+    rendererAdapter.current = adapter;
+    adapter.setQuality(qualityRef.current);
     const preview = new ModifierPreview(store, adapter.graph);
     let generation = -1;
     const sync = () => {
@@ -66,9 +71,10 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
     sync();
     const unsubscribe = store.subscribe(sync);
     return () => { disposed = true; unsubscribe(); preview.dispose(); interactions.current?.dispose(); interactions.current = null;
-      adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
+      rendererAdapter.current = null; adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
+  useEffect(() => rendererAdapter.current?.setQuality(quality), [quality]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
   useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry); }, [validBrush, brushRadius, brushStrength, symmetry]);
   const canTransform = editable(state, state.selection.activeId, blocked);
@@ -141,11 +147,12 @@ export function Viewport({ store, mode, blocked, notice }: { store: EditorStore;
       <label>Графика <select aria-label="Режим графики" value={backendMode} onChange={event => setBackendMode(event.target.value as BackendMode)}>
         <option value="auto">Auto / WebGPU</option><option value="webgl2">WebGL2</option>
       </select></label><span>Backend: {status.backend}</span>
+      <label title="Профили меняют разрешение растрового предпросмотра. Path tracing и дополнительные эффекты не включаются.">Качество <select aria-label="Качество предпросмотра" value={quality} onChange={event => setQuality(event.target.value as PreviewQuality)}>{(Object.keys(PREVIEW_PROFILES) as PreviewQuality[]).map(key => <option key={key} value={key}>{PREVIEW_PROFILES[key].label}</option>)}</select></label>
       <button type="button" onClick={() => setAttempt(n => n + 1)}>Повторить запуск</button>
     </div>
     <div className="renderer-host" ref={host} />
     <div className="renderer-status" role={status.phase === "error" || status.phase === "lost" ? "alert" : "status"}>
-      <span>{status.message}{scene.loading > 0 ? " · Загрузка GLB…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
+      <span>{status.message}{scene.loading > 0 ? " · Загрузка ресурсов…" : scene.errors > 0 ? " · Ошибка геометрии или ресурса" : status.phase === "ready" && scene.empty ? " · Модель пуста — импортируйте GLB" : ""}</span>
       {state.tool.active === "displace" && brushReason && <span>{brushReason}</span>}
       {!subMode && state.tool.active !== "select" && state.tool.active !== "displace" && !canTransform && <span>Нет доступного для трансформации объекта.</span>}
       {subMode && <span>Выбор элементов: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}

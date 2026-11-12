@@ -53,6 +53,7 @@ export function generateSpikeTsx(project: Project): SpikeExport {
   if (project.scene.instances.length) errors.push({ code: "INSTANCES_UNSUPPORTED", path: "scene.instances", message: "Экземпляры сцены не поддерживаются в spike." });
   if (project.animations.length || project.tracks.length || project.keyframes.length) diagnostics.push({ code: "ANIMATION_OMITTED", path: "animations", message: "Экспортирована только статическая поза; анимация не включена." });
   if (project.scene.background.environmentAssetId) diagnostics.push({ code: "ENVIRONMENT_OMITTED", path: "scene.background.environmentAssetId", message: "HDRI окружение не включено." });
+  if (project.scene.renderSettings) diagnostics.push({ code: "RENDER_SETTINGS_OMITTED", path: "scene.renderSettings", message: "Экспозиция и тональное отображение сцены не включены в прототип экспорта." });
   if (project.scene.background.intensity !== 1) diagnostics.push({ code: "BACKGROUND_INTENSITY_OMITTED", path: "scene.background.intensity", message: "Интенсивность фона не включена." });
   if (project.assets.length) diagnostics.push({ code: "ASSETS_OMITTED", path: "assets", message: "Файлы ассетов не упакованы." });
 

@@ -1,3 +1,4 @@
+import { SceneInspector } from "./SceneInspector";
 import { Viewport } from "../renderer/Viewport";
 import { createProject } from "../domain";
 import { createEditorStore, selectCanRedo, selectCanUndo, selectDirty, selectProject } from "../app/editor-store";
@@ -306,7 +307,7 @@ function EditorShell() {
         <div className="dock-resizer" role="separator" tabIndex={0} aria-label="Изменить ширину правой панели" aria-orientation="vertical" aria-valuemin={DOCK_MIN} aria-valuenow={dockWidths[1]} aria-valuemax={Math.max(DOCK_MIN, (workspace.current?.clientWidth ?? 960) - STAGE_MIN - HANDLE_WIDTH * 2 - dockWidths[0])} onPointerDown={(event) => startDrag(event, "right")} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setDock("right", dockWidths[1] + (event.key === "ArrowLeft" ? 16 : -16)); } }} />
         <aside className="dock right-dock" aria-label="Инспектор">
           <div className="panel-heading"><h2>Инспектор</h2><span>—</span></div>
-          <div className="panel-content"><Inspector store={editorStore} state={state} blocked={blocked} /></div>
+          <div className="panel-content">{state.tool.mode === "scene" ? <SceneInspector store={editorStore} state={state} blocked={blocked} /> : <Inspector store={editorStore} state={state} blocked={blocked} />}</div>
         </aside>
       </div>
       <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации"><div className="panel-heading"><h2>Таймлайн</h2><button type="button" aria-expanded={state.view.timelineExpanded} aria-controls="timeline-body" onClick={() => editorStore.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div><div id="timeline-body" className="timeline-body" hidden={!state.view.timelineExpanded}>Дорожки анимации пока недоступны</div></section>

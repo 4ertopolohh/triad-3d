@@ -36,6 +36,7 @@ export interface Scene {
   background: SceneBackground;
   lights: Light[];
   instances: Instance[];
+  renderSettings?: { exposure: number; toneMapping: "aces" | "neutral" | "none" };
 }
 
 export interface CameraState {
@@ -51,6 +52,8 @@ export interface SceneBackground {
   color: ColorRgb;
   environmentAssetId?: EntityId;
   intensity: number;
+  environmentIntensity?: number;
+  environmentRotation?: number;
 }
 
 export interface Light {

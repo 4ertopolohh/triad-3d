@@ -1,6 +1,7 @@
 import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
 import { validateMaterial } from "./validate-material";
+import { sceneSettingsError, type SceneSettings } from "./scene-settings";
 import type { BooleanParameters } from "../geometry/modifiers/types";
 import type { ArrayParameters } from "../geometry/modifiers/types";
 import { parseArrayParameters } from "../geometry/modifiers/array";
@@ -16,6 +17,7 @@ import { displaceStroke, brushParameters, isBrushSymmetry, MAX_BRUSH_SAMPLES, ty
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | { commandId: string; type: "SET_SCENE_SETTINGS"; targetIds: [EntityId]; payload: { sceneId: EntityId; settings: SceneSettings } }
   | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
   | { commandId: string; type: "ADD_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
   | { commandId: string; type: "UPDATE_MATERIAL"; targetIds: [EntityId]; payload: { material: Material } }
@@ -61,6 +63,7 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | { kind: "setScene"; before: Project["scene"]; after: Project["scene"] }
   | { kind: "addMaterial"; material: Material; index: number }
   | { kind: "removeMaterial"; material: Material; index: number }
   | { kind: "setMaterial"; materialId: EntityId; before: Material; after: Material }
@@ -138,6 +141,8 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
+  if (value.type === "SET_SCENE_SETTINGS") return ownKeys(payload, ["sceneId", "settings"]) && id(payload.sceneId)
+    && same(value.targetIds, [payload.sceneId]) && sceneSettingsError(payload.settings) === null;
   if (value.type === "ADD_ASSET") {
     const asset = payload.asset;
     return ownKeys(payload, ["asset"]) && record(asset) && ownKeys(asset, ["id", "hash", "mediaType", "path", "colorSpace"])
@@ -328,6 +333,14 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if (command.type === "SET_SCENE_SETTINGS") {
+    if (command.payload.sceneId !== project.scene.id) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Сцена не найдена.");
+    const environmentId = command.payload.settings.background.environmentAssetId;
+    if (environmentId && environmentId !== project.scene.background.environmentAssetId && !project.assets.some(a => a.id === environmentId && ["image/vnd.radiance", "image/x-exr"].includes(a.mediaType)))
+      return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Выберите существующий ресурс HDR или EXR.");
+    project.scene = { id: project.scene.id, instances: project.scene.instances, ...structuredClone(command.payload.settings) };
+    return null;
+  }
   if (command.type === "ADD_ASSET") {
     const asset = command.payload.asset;
     if (entityIds(project).has(asset.id) || project.assets.some(item => item.path === asset.path))
@@ -608,6 +621,7 @@ function entityIds(project: Project): Set<string> {
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
+  if (!same(before.scene, after.scene)) changes.push({ kind: "setScene", before: structuredClone(before.scene), after: structuredClone(after.scene) });
   for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
   for (const [index, material] of [...before.materials.entries()].reverse()) if (!after.materials.some(item => item.id === material.id))
     changes.push({ kind: "removeMaterial", material: structuredClone(material), index });
@@ -644,6 +658,7 @@ function diff(before: Project, after: Project): ProjectPatch {
 
 function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if (change.kind === "setScene") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
     if (change.kind === "removeNode") return { kind: "addNode", node: structuredClone(change.node) };
     if (change.kind === "addAsset") return { kind: "removeAsset", asset: structuredClone(change.asset) };
@@ -666,6 +681,11 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
+    if (change.kind === "setScene") {
+      if (!same(result.scene, change.before) || change.before.id !== change.after.id || !same(change.before.instances, change.after.instances)) throw new Error("Patch scene conflict");
+      result.scene = structuredClone(change.after);
+      continue;
+    }
     if (change.kind === "addMaterial") {
       if (entityIds(result).has(change.material.id) || change.index < 0 || change.index > result.materials.length) throw new Error("Patch material conflict");
       result.materials.splice(change.index, 0, structuredClone(change.material));

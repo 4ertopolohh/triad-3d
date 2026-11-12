@@ -1,7 +1,13 @@
-import { WebGPURenderer, SRGBColorSpace, ACESFilmicToneMapping } from "three/webgpu";
+import { WebGPURenderer, SRGBColorSpace, ACESFilmicToneMapping, NeutralToneMapping, NoToneMapping } from "three/webgpu";
 import { SceneSync, type AssetReader, type RenderProject, type SceneStatus } from "./scene-sync";
 
 export type BackendMode = "auto" | "webgl2";
+export type PreviewQuality = "draft" | "quality" | "final";
+export const PREVIEW_PROFILES = {
+  draft: { label: "Черновик", pixelRatio: 1, maxDimension: 2048 },
+  quality: { label: "Качество", pixelRatio: 1.5, maxDimension: 3072 },
+  final: { label: "Финальный", pixelRatio: 2, maxDimension: 4096 },
+} as const;
 export type RendererStatus = { phase: "initializing" | "ready" | "error" | "lost"; backend: string; message: string };
 export interface RendererAdapter {
   initialize(container: HTMLElement, mode: BackendMode): Promise<void>;
@@ -24,6 +30,9 @@ export class ThreeRendererAdapter implements RendererAdapter {
   private cleanupJob: Promise<void> | undefined;
   private removeListeners = () => {};
   private frameHook: (() => void) | undefined;
+  private quality: PreviewQuality = "final";
+  private dimensions: [number, number] = [1, 1];
+  private rendering: { exposure: number; toneMapping: "aces" | "neutral" | "none" } = { exposure: 1.25, toneMapping: "aces" };
   constructor(private report: (state: RendererStatus) => void, sceneReport: (state: SceneStatus) => void,
     private factory: RendererFactory = mode => new WebGPURenderer({ antialias: true, forceWebGL: mode === "webgl2" })) {
     this.graph = new SceneSync(sceneReport);
@@ -37,6 +46,12 @@ export class ThreeRendererAdapter implements RendererAdapter {
   }
   get canvas(): HTMLCanvasElement | undefined { return this.initialized && !this.closed && !this.stopped ? this.renderer?.domElement : undefined; }
   setFrameHook(hook: (() => void) | undefined): void { this.frameHook = hook; }
+  setQuality(quality: PreviewQuality): void { this.quality = quality; this.resize(...this.dimensions); }
+  private applyRendering(): void {
+    if (!this.renderer) return;
+    this.renderer.toneMappingExposure = this.rendering.exposure;
+    this.renderer.toneMapping = this.rendering.toneMapping === "aces" ? ACESFilmicToneMapping : this.rendering.toneMapping === "neutral" ? NeutralToneMapping : NoToneMapping;
+  }
   private fail(phase: "error" | "lost", message: string): void {
     if (this.closed) return;
     this.stopped = true; cancelAnimationFrame(this.frame);
@@ -45,7 +60,7 @@ export class ThreeRendererAdapter implements RendererAdapter {
   private async start(container: HTMLElement, mode: BackendMode): Promise<void> {
     try {
       const renderer = this.factory(mode); this.renderer = renderer;
-      renderer.outputColorSpace = SRGBColorSpace; renderer.toneMapping = ACESFilmicToneMapping; renderer.toneMappingExposure = 1.25;
+      renderer.outputColorSpace = SRGBColorSpace; this.applyRendering();
       const reportLoss = () => { if (!this.stopped) this.fail("lost", "Графический контекст потерян. Проект сохранён в памяти. Нажмите «Повторить запуск»."); };
       renderer.onDeviceLost = reportLoss;
       const lost = (event: Event) => { event.preventDefault(); reportLoss(); };
@@ -93,6 +108,8 @@ export class ThreeRendererAdapter implements RendererAdapter {
   }
   sync(project: RenderProject, readAsset: AssetReader, epoch?: object): void {
     if (this.closed) return;
+    this.rendering = project.scene.renderSettings ?? { exposure: 1.25, toneMapping: "aces" };
+    this.applyRendering();
     try { this.graph.sync(project, readAsset, epoch); }
     catch { this.fail("error", "Некорректные данные предпросмотра. Исправьте документ или повторите запуск."); }
   }
@@ -100,8 +117,10 @@ export class ThreeRendererAdapter implements RendererAdapter {
     if (this.closed || this.stopped || !this.renderer) return;
     const w = Math.max(1, Math.floor(Number.isFinite(width) ? width : 1));
     const h = Math.max(1, Math.floor(Number.isFinite(height) ? height : 1));
+    this.dimensions = [w, h];
     this.graph.camera.aspect = w / h; this.graph.camera.updateProjectionMatrix();
-    this.renderer.setPixelRatio(Math.min(2, Math.max(1, window.devicePixelRatio || 1), 4096 / Math.max(w, h)));
+    const profile = PREVIEW_PROFILES[this.quality];
+    this.renderer.setPixelRatio(Math.min(profile.pixelRatio, Math.max(1, window.devicePixelRatio || 1), profile.maxDimension / Math.max(w, h)));
     this.renderer.setSize(w, h, false);
   }
   dispose(): Promise<void> {
