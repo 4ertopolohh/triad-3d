@@ -231,3 +231,5 @@ html, body { height: 100%; overflow: hidden; }
 .material-inspector section { grid-template-columns: minmax(0, 1fr); min-width: 0; }
 .material-inspector select { width: 100%; min-width: 0; box-sizing: border-box; }
 .material-advanced fieldset label:has(input[type="checkbox"]) input { flex: 0 0 auto; }
+.source-diagnostics { max-height: 200px; overflow: auto; padding-left: 22px; }
+.export-dialog textarea { box-sizing: border-box; width: 100%; resize: vertical; }

@@ -1,5 +1,15 @@
 # Implementation status
 
+## Static source import — TASK-054 subset
+
+TSX AST allowlist, terminable Worker, range diagnostics and explicit atomic application are implemented. No source execution, URL resolution or source attachment. Supported fragments and limitations are detailed in `source-import.md`; arbitrary HTML/imperative Three and replacement actions remain outside this subset. Browser cube/torus report/apply/Undo/Redo passed, no console errors. Lint/build and full suite **65 files / 424 tests passed**. Both review agents confirmed fixes for hidden groups, constructor defaults, conditional expressions, fragments and dialog/file-read lifecycle.
+
+## MVP integration gate — 13 November 2026
+
+Candidate `9f8117e`: main save/reopen/animation/production-export flow passed; full suite 64 files / 420 tests, lint and build passed. Independent generated production package and static TSX build passed. GitHub Actions passed on Windows and Ubuntu, and Pages deployment passed. Public smoke opened the ring/HDR archive and played its clip in WebGPU without console errors: https://4ertopolohh.github.io/triad-3d/ . Evidence: `docs/qa/release-verification.md`, `pages-ring.png`; Actions runs 43324886511 and 43324924038.
+
+This closes the integration gate for beginning NEXT; it does not declare all 64 tasks or every FR fully accepted. Remaining limitations include the restricted static GLB import subset, geometry attribute losses after CSG, exact active-GPU attribution and final expanded security/performance acceptance. NEXT instances, interactions/physics, source importer, stamps, GLB/video export, packs, path tracing experiment and optimizer remain unimplemented at this checkpoint.
+
 ## Continuation — materials, timeline, runtime package (in progress)
 
 - Schema 1.8: editable vertex colors and per-triangle material slots; surface map channels and strengths, procedural Stone bump; clip/key validation and Bezier easing, fps/loop markers, mute/solo. New surface cache owns and frees bitmap/GPU resources, with stale-load protection.

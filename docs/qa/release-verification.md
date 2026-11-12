@@ -29,4 +29,6 @@ Native archive tests cover malformed archives, path traversal, size limits, hash
 
 ## Remaining release gates
 
-Public deployed smoke, complete browser/version/GPU manifest, browser render/geometry performance profile and remaining NEXT tasks are still required. TASK-062/063 need extension to NEXT import/export/optimization paths after those exist. Do not mark those tasks complete using this CPU baseline alone.
+Public deployed smoke passed for candidate `9f8117e`: https://4ertopolohh.github.io/triad-3d/ . Opened ring archive with HDRI, WebGPU and playback; console error log empty. Proof: `pages-ring.png`. CI on Windows and Ubuntu and Pages workflow passed (runs 43324886511 and 43324924038).
+
+Exact active-GPU attribution, geometry performance profile and remaining NEXT tasks are still required. TASK-062/063 need extension to NEXT import/export/optimization paths after those exist. Do not mark those tasks complete using these baselines alone.
