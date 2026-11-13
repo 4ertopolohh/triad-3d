@@ -1,3 +1,4 @@
+import type { PhysicsActor } from "./physics-config";
 export type EntityId = string;
 export type Vec3 = readonly [number, number, number];
 export type Quaternion = readonly [number, number, number, number];
@@ -24,6 +25,7 @@ export interface Project {
   keyframes: Keyframe[];
   modelSnapshots?: ModelSnapshot[];
   interactions?: InteractionRule[];
+  physics?: PhysicsActor[];
 }
 
 export interface Model {
@@ -89,6 +91,7 @@ export interface ModelSnapshot {
   tracks: Track[];
   keyframes: Keyframe[];
   interactions?: InteractionRule[];
+  physics?: PhysicsActor[];
 }
 
 export interface InteractionRule {

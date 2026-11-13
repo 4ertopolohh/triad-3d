@@ -14,6 +14,7 @@ export async function exportGlb(bundle:RuntimeBundle,readAsset:(id:string)=>Uint
   const resources=new Set<T.BufferGeometry|T.Material|T.Texture>(),bitmaps=new Set<ImageBitmap>();
   const diagnostics=["GLB сохраняет геометрию, PBR и clip-анимации. React props, runtime-взаимодействия, редакторские данные и логика циклов не переносятся."];
   if(project.interactions?.length)diagnostics.push(`Не перенесено правил взаимодействия: ${project.interactions.length}. Для них используйте TSX/ZIP.`);
+  if(project.physics?.length)diagnostics.push(`Физические тела не перенесены: ${project.physics.length}. GLB сохраняет исходную позу; физика доступна в TSX/ZIP.`);
   if(project.scene.instances.length)throw new Error("Сначала подготовьте поддерживаемую геометрию экземпляров.");
   if(project.scene.background.environmentAssetId)diagnostics.push("HDRI окружение и его интенсивность не входят в glTF; настройте окружение в целевом viewer.");
   diagnostics.push("Камера, фон, tone mapping и свет сцены не включены: GLB экспортирует модель.");

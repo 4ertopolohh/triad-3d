@@ -46,6 +46,7 @@ it("does not retain duplicate editable arrays in the runtime document",async()=>
 
 it("packages actual geometry, surface runtime, animation and standalone sources deterministically", async () => {
   const project = createMaterialAnimationProject();
+  project.physics=[{nodeId:"mesh-node",enabled:true,body:"kinematic",collider:"box",size:[1,1,1],mass:1,restitution:.5,friction:.5}];
   project.interactions=[{id:"pulse",nodeId:"mesh-node",name:"Пульсация",enabled:true,priority:0,blend:"additive",weight:1,releaseSeconds:.1,event:"time",condition:{kind:"always"},action:{kind:"pulse",radius:3,strength:1,frequency:1}}];
   project.materials[0]!.proceduralMaps = { height: { kind: "stone",seed: 1,scale: 4,intensity: .5,resolution:128,strength:.1 } };
   const before = structuredClone(project);

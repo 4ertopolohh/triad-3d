@@ -1,7 +1,7 @@
 import type { ModelSnapshot, Project } from "./types";
 
 export function modelSource(project: Project): Omit<ModelSnapshot,"id"|"revision"> {
-  return {rootNodeId:project.model.rootNodeId,nodes:project.nodes,modifiers:project.modifiers,materials:project.materials,animations:project.animations,tracks:project.tracks,keyframes:project.keyframes,...(project.interactions?{interactions:project.interactions}:{})};
+  return {rootNodeId:project.model.rootNodeId,nodes:project.nodes,modifiers:project.modifiers,materials:project.materials,animations:project.animations,tracks:project.tracks,keyframes:project.keyframes,...(project.physics?{physics:project.physics}:{}),...(project.interactions?{interactions:project.interactions}:{})};
 }
 export function snapshotMatches(project:Project,snapshot:ModelSnapshot):boolean{
   const {id: _id,revision: _revision,...source}=snapshot;
@@ -16,6 +16,7 @@ export function snapshotChanges(project:Project,snapshot:ModelSnapshot):string[]
     changes.push(`${label}: добавлено ${added}, удалено ${removed}, изменено ${modified}.`);
   }
   if(JSON.stringify([snapshot.tracks,snapshot.keyframes])!==JSON.stringify([project.tracks,project.keyframes]))changes.push("Дорожки или ключи анимации изменены.");
+  if(JSON.stringify(snapshot.physics)!==JSON.stringify(project.physics))changes.push("Физические тела изменены.");
   if(JSON.stringify(snapshot.interactions)!==JSON.stringify(project.interactions))changes.push("Правила взаимодействия изменены.");
   return changes;
 }
@@ -32,5 +33,5 @@ export function pruneModelSnapshots(project:Project):void{
 }
 export function snapshotProject(project:Project,snapshot:ModelSnapshot):Project{
   const result:Project={...project,model:{...project.model,rootNodeId:snapshot.rootNodeId,revision:snapshot.revision},scene:{...project.scene,instances:[]},nodes:snapshot.nodes,modifiers:snapshot.modifiers,materials:snapshot.materials,animations:snapshot.animations,tracks:snapshot.tracks,keyframes:snapshot.keyframes};
-  delete result.modelSnapshots;if(snapshot.interactions)result.interactions=snapshot.interactions;else delete result.interactions;return result;
+  delete result.modelSnapshots;if(snapshot.physics)result.physics=snapshot.physics;else delete result.physics;if(snapshot.interactions)result.interactions=snapshot.interactions;else delete result.interactions;return result;
 }

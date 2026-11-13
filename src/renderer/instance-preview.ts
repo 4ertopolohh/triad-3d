@@ -92,6 +92,7 @@ export class InstancePreview {
     const root=this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
     if(root)root.visible=!!state.document.project.nodes.find(n=>n.id===state.document.project.model.rootNodeId)?.visible&&(!scene||!state.document.project.scene.instances.length);
   }
+  physicsScopes(){return [...this.copies].map(([id,copy])=>({id,actors:copy.source.project.physics??[],objects:copy.nodes}));}
   applyInteractions(controller:InteractionController,time:number,delta:number):void{for(const [id,copy]of this.copies)controller.apply(id,copy.source.project.interactions??[],copy.nodes,time,delta);}
   setAnimation(preview:{clipId:string;time:number;absoluteTime?:number;wrap?:boolean}|null):void{
     this.animation=preview;

@@ -1,3 +1,4 @@
+import { physicsError } from "./physics-config";
 import { timelineError, timelineOf } from "../animation/timeline";
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
 import { validatePrimitiveSource } from "../geometry/primitives";
@@ -29,7 +30,15 @@ export interface ValidationIssue {
 export function validateProject(project: Project): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const rulesError=interactionError(project.interactions??[],new Set(project.nodes.map(n=>n.id)));if(rulesError)issues.push({code:"INVALID_STRUCTURE",path:"interactions",message:rulesError});
+  const actorsError=physicsError(project.physics??[],new Set(project.nodes.map(n=>n.id)));if(actorsError)issues.push({code:"INVALID_STRUCTURE",path:"physics",message:actorsError});
   for(const asset of project.assets)if(asset.license!==undefined&&(typeof asset.license!=="string"||!asset.license.trim()||asset.license.length>16384))issues.push({code:"INVALID_STRUCTURE",path:`assets.${asset.id}.license`,message:"Лицензия ресурса должна содержать 1–16384 символа."});
+  const actorNodes=new Set((project.physics??[]).map(actor=>actor.nodeId));
+  for(const actor of project.physics??[]){
+    const node=project.nodes.find(n=>n.id===actor.nodeId);
+    if(!node||node.kind!=="mesh")issues.push({code:"INVALID_STRUCTURE",path:"physics",message:"Физическое тело должно ссылаться на mesh."});
+    const visited=new Set<string>();let parent=node?.parentId;
+    while(parent&&!visited.has(parent)){visited.add(parent);if(actorNodes.has(parent))issues.push({code:"INVALID_STRUCTURE",path:"physics",message:"Вложенные физические тела не поддерживаются."});parent=project.nodes.find(n=>n.id===parent)?.parentId;}
+  }
   const animationError = timelineError(timelineOf(project));
   if (animationError) issues.push({ code: "INVALID_STRUCTURE", path: "animations", message: animationError });
   const sceneError = sceneExtensionsError(project.scene);

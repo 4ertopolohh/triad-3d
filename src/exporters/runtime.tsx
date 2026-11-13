@@ -1,3 +1,4 @@
+import { PhysicsController } from "../animation/physics-controller";
 import { useEffect, useRef, useState } from "react";
 import * as T from "three";
 import { WebGPURenderer } from "three/webgpu";
@@ -19,17 +20,19 @@ export interface TriadModelProps {
   color?: string; playing?: boolean; clipId?: string; time?: number; assetBaseUrl?: string;
   nodeOverrides?: Record<string,{scale?: number; color?: string}>;
   onError?: (message: string) => void;
+  onCollision?: (event: { firstNodeId: string; secondNodeId: string; started: boolean }) => void;
 }
-export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, scale = 1, color, playing = true, clipId, time, assetBaseUrl = "./", onError, nodeOverrides, assetUrls }: TriadModelProps & { data: RuntimeBundle; assetUrls?: Record<string,string> }) {
+export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, scale = 1, color, playing = true, clipId, time, assetBaseUrl = "./", onError, onCollision, nodeOverrides, assetUrls }: TriadModelProps & { data: RuntimeBundle; assetUrls?: Record<string,string> }) {
   const mount = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
-  const controls = useRef({ speed, scale, color, playing, clipId, time, onError, nodeOverrides });
-  controls.current = { speed, scale, color, playing, clipId, time, onError, nodeOverrides };
+  const controls = useRef({ speed, scale, color, playing, clipId, time, onError, onCollision, nodeOverrides });
+  controls.current = { speed, scale, color, playing, clipId, time, onError, onCollision, nodeOverrides };
   useEffect(() => {
     const host = mount.current; if (!host) return;
     const project = data.project;
     const abort = new AbortController(); let disposed = false, elapsed = 0, last = 0;
     let interactions:InteractionController|undefined;
+    const physics=new PhysicsController(message=>fail(message));
     const renderer = new WebGPURenderer({ antialias: data.profile !== "lite", forceWebGL: true });
     const scene = new T.Scene(); const model = new T.Group(); scene.add(model);
     scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
@@ -138,11 +141,15 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
           });
         }
         scene.updateMatrixWorld(true);interactions!.beginFrame([model]);interactions!.apply("runtime",project.interactions??[],objects,seconds,delta);interactions!.endFrame();
+        // Controlled timeline scrubbing deliberately disables stateful physics.
+        if(controls.current.time!==undefined)physics.reset();
+        const collisions=controls.current.time!==undefined?[]:physics.apply([{id:"runtime",actors:project.physics??[],objects}],controls.current.playing?delta*Math.max(0,Math.min(4,Number.isFinite(controls.current.speed)?controls.current.speed:1)):0);
+        for(const event of collisions)controls.current.onCollision?.({firstNodeId:event.first.nodeId,secondNodeId:event.second.nodeId,started:event.started});
         renderer.render(scene,camera);
       });
     })().catch(error => { if (!disposed) fail(error instanceof Error ? error.message : String(error)); });
     function cleanupResources() { base.dispose(); surface.dispose(); roughness.dispose(); textures.forEach(t => t.dispose()); materials.forEach(m => m.dispose()); geometries.forEach(g => g.dispose()); textures.clear(); materials.clear(); geometries.clear(); }
-    return () => { disposed = true; abort.abort(); interactions?.dispose();observer.disconnect(); renderer.setAnimationLoop(null); cleanupResources(); renderer.domElement.remove(); void renderer.dispose(); };
+    return () => { disposed = true; abort.abort(); interactions?.dispose();physics.dispose();observer.disconnect(); renderer.setAnimationLoop(null); cleanupResources(); renderer.domElement.remove(); void renderer.dispose(); };
   }, [data,assetBaseUrl,assetUrls]);
   return <div style={{ width,height,position:"relative" }}><div ref={mount} style={{width:"100%",height:"100%"}} />{error && <p role="alert" style={{position:"absolute",top:0}}>{error}</p>}</div>;
 }

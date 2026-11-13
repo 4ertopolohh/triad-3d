@@ -34,5 +34,5 @@ it("keeps explicit material overrides independent and rejects missing animation 
 it("migrates legacy instances to a shared frozen snapshot",()=>{
   const old=fixture();old.schemaVersion="1.9.0";old.scene.instances=[{id:"old-instance",modelId:old.model.id,transform:identity,visible:true}];
   const loaded=deserializeProjectDocument(JSON.stringify(old));expect(loaded.ok).toBe(true);
-  if(loaded.ok){expect(loaded.value.schemaVersion).toBe("1.11.0");expect(loaded.value.modelSnapshots).toHaveLength(1);expect(loaded.value.scene.instances[0]!.snapshotId).toBe(loaded.value.modelSnapshots![0]!.id);}
+  if(loaded.ok){expect(loaded.value.schemaVersion).toBe("1.12.0");expect(loaded.value.modelSnapshots).toHaveLength(1);expect(loaded.value.scene.instances[0]!.snapshotId).toBe(loaded.value.modelSnapshots![0]!.id);}
 });

@@ -1,3 +1,4 @@
+import { PhysicsController } from "../animation/physics-controller";
 import { Color } from "three";
 import { evaluateClip } from "../animation/timeline";
 import { applyTransform } from "./scene-sync";
@@ -70,16 +71,17 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
     const preview = new ModifierPreview(store, adapter.graph);
     const instances = new InstancePreview(store, adapter.graph, setInteractionError);
     let ruleController:InteractionController|undefined;
+    const physicsController=new PhysicsController(setInteractionError);
     instancePreview.current = instances;
     let generation = -1;
     let interactionEpoch=store.getProjectEpoch();
     const sync = () => {
       const state = store.getSnapshot();
-      if(interactionEpoch!==store.getProjectEpoch()){interactionEpoch=store.getProjectEpoch();interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();}
+      if(interactionEpoch!==store.getProjectEpoch()){interactionEpoch=store.getProjectEpoch();interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();physicsController.reset();}
       if(interactiveRef.current&&(state.tool.active!=="select"||state.meshEdit.mode!=="object")){
         // This subscriber runs before ViewportInteractions attaches the new gizmo.
         // Temporary interaction transforms must never become a gesture's starting pose.
-        interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();
+        interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();physicsController.reset();
         const project=state.document.project,animation=animationRef.current;
         const pose=animation&&project.animations.some(c=>c.id===animation.clipId)?evaluateClip(project,animation.clipId,animation.time,false):new Map();
         for(const node of project.nodes){const object=adapter.graph.objects.get(node.id)?.object;if(object)applyTransform(object,pose.get(node.id)??node.transform);}
@@ -90,7 +92,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
       preview.sync();
       instances.sync();
-      ruleController?.reset();
+      ruleController?.reset();physicsController.reset();
     };
     let disposed = false;
     void adapter.initialize(host.current, backendMode).then(() => {
@@ -114,17 +116,19 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
           for(const node of project.nodes){const object=adapter.graph.objects.get(node.id)?.object;if(object)applyTransform(object,pose.get(node.id)??node.transform);}
           instances.setAnimation(animation);adapter.graph.scene.updateMatrixWorld(true);
           const seconds=animation?.absoluteTime??animation?.time??interactiveTime;
-          const root=state.tool.mode==="model"?adapter.graph.objects.get(project.model.rootNodeId)?.object:instances.layer;
+          const primary=state.tool.mode==="model"||!project.scene.instances.length;
+          const root=primary?adapter.graph.objects.get(project.model.rootNodeId)?.object:instances.layer;
           ruleController!.beginFrame(root?[root]:[]);
-          if(state.tool.mode==="model")ruleController!.apply("model",project.interactions??[],new Map([...adapter.graph.objects].map(([id,entry])=>[id,entry.object])),seconds,delta);
+          if(primary)ruleController!.apply("model",project.interactions??[],new Map([...adapter.graph.objects].map(([id,entry])=>[id,entry.object])),seconds,delta);
           else instances.applyInteractions(ruleController!,seconds,delta);
-        }else interactiveTime=0;
+          physicsController.apply(primary?[{id:"model",actors:project.physics??[],objects:new Map([...adapter.graph.objects].map(([id,entry])=>[id,entry.object]))}]:instances.physicsScopes(),delta);
+        }else {interactiveTime=0;physicsController.reset();}
         ruleController?.endFrame();controller.frame();
       });
     });
     sync();
     const unsubscribe = store.subscribe(sync);
-    return () => { disposed = true; unsubscribe(); ruleController?.dispose();preview.dispose(); instances.dispose(); instancePreview.current = null; interactions.current?.dispose(); interactions.current = null;
+    return () => { disposed = true; unsubscribe(); ruleController?.dispose();physicsController.dispose();preview.dispose(); instances.dispose(); instancePreview.current = null; interactions.current?.dispose(); interactions.current = null;
       rendererAdapter.current = null; adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
   useEffect(() => {

@@ -18,7 +18,7 @@ export async function createMaterialPack(project:Project,read:(id:string)=>Uint8
 export async function openMaterialPack(input:Blob,decoder=browserImageDecoder):Promise<LoadedProject>{
   const result=await openNativeProjectArchive(input);if(!result.ok)throw new Error(result.error.message);
   const p=result.value.project;
-  if(p.nodes.length!==1||p.nodes[0]!.kind!=="group"||p.nodes[0]!.children.length||p.modifiers.length||p.animations.length||p.tracks.length||p.keyframes.length||p.scene.instances.length||p.modelSnapshots?.length||p.interactions?.length||p.assets.some(a=>!image(a.mediaType)))throw new Error("Это не библиотечный пакет: геометрия, анимация и исполняемые/модельные ресурсы запрещены.");
+  if(p.nodes.length!==1||p.nodes[0]!.kind!=="group"||p.nodes[0]!.children.length||p.modifiers.length||p.animations.length||p.tracks.length||p.keyframes.length||p.scene.instances.length||p.modelSnapshots?.length||p.physics?.length||p.interactions?.length||p.assets.some(a=>!image(a.mediaType)))throw new Error("Это не библиотечный пакет: геометрия, анимация и исполняемые/модельные ресурсы запрещены.");
   if(!p.materials.length&&!p.assets.length)throw new Error("Библиотечный пакет пуст.");
   for(const [index,asset] of p.assets.entries()){
     const bytes=result.value.assets.get(asset.id);if(!bytes)throw new Error("Байты ресурса пакета отсутствуют.");

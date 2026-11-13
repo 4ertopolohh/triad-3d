@@ -1,5 +1,11 @@
 # Implementation status
 
+## Physics — TASK-053
+
+Schema 1.12 adds reversible validated actor configuration and frozen snapshot/export support. Lazy Rapier handles dynamic/static/kinematic bodies, fixed 60 Hz stepping, explicit colliders, mass/restitution/friction and scoped contact events. Editor restores authored poses before editing; TSX exposes onCollision and documents controlled-time behavior. Review findings (scene fallback, conflicting rules, parent scale and encoding) were fixed and re-reviewed. Browser floor/sphere simulation and edit restoration passed without console errors. Validation: lint/build, full suite **76 files / 459 tests PASS**, normal/compressed production harnesses PASS; an additional conflict regression is covered by the final targeted rerun. Details and limits: `physics.md`.
+
+Interaction checkpoint `462043d` passed CI 43345306478 and Pages 43345319945. Advanced stamps, video, remaining format compatibility and final release gates remain open.
+
 ## Layered interactions — TASK-051/052
 
 Document 1.11 adds validated event/condition/action rules, five presets, independent animation channels, priority/blending and smooth release. Inspector, frozen instances and TSX runtime share the same behavior; GLB reports omitted rules. One scene-wide hit test prevents clicks through occluders. Entering edit tools or replacing the project resets transient preview before editing. Two-axis review completed with fixes verified. Validation: lint/build, **73 files / 453 tests PASS**, normal/compressed production export harnesses and independently downloaded ZIP build PASS. Browser verified click toggle in the generated runtime and edit-mode restoration; see `interactions.md`.

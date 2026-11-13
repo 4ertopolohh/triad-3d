@@ -1,3 +1,8 @@
+import rapierLicense from "../../node_modules/@dimforge/rapier3d-compat/LICENSE?raw";
+import { physicsConflicts } from "../domain/physics-config";
+import physicsSource from "../animation/physics.ts?raw";
+import physicsControllerSource from "../animation/physics-controller.ts?raw";
+import physicsConfigSource from "../domain/physics-config.ts?raw";
 import { singleFileExport } from "./single-file";
 import * as T from "three";
 import { BlobWriter, Uint8ArrayReader, ZipWriter } from "@zip.js/zip.js";
@@ -48,7 +53,8 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   const expanded=expandInstances(project);project=expanded.project;
   const files = new Map<string,Uint8Array>();
   const exportedProject:RuntimeProject=structuredClone(project),referenceAssets=new Map<string,Uint8Array>();
-  const diagnostics: string[] = interactionConflicts(project.interactions??[]);
+  const diagnostics: string[] = [...interactionConflicts(project.interactions??[]),...physicsConflicts(project.physics??[],project.interactions??[],project.tracks)];
+  if(project.physics?.length)diagnostics.push("Физика: до 256 тел; ручные box/sphere коллайдеры, без joints/soft bodies. Произвольное движение kinematic может пересекать другие тела. Controlled time отключает физику; playing/speed управляют live simulation (speed 0–4). Изменение масштаба перезапускает мир. onCollision сообщает пары node ID и начало/конец контакта.");
   if ((project.animations.length||project.interactions?.length) && project.modifiers.some(m => m.enabled && m.kind === "boolean")) diagnostics.push("Boolean фиксируется при экспорте: анимация и взаимодействия резака не пересчитывают результат CSG.");
   const geometries: Record<string,ExportGeometry> = Object.create(null);
   const referenceGeometries: Record<string,ExportGeometry> = Object.create(null);
@@ -114,11 +120,15 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   if (single.code&&!compressed) add("src/StandaloneModel.tsx",single.code);
   add("licenses/React-MIT.txt",reactLicense);
   add("licenses/Three-MIT.txt",threeLicense);
+  add("licenses/Rapier-Apache-2.0.txt",rapierLicense);
   if(compressed)add("licenses/Meshoptimizer-MIT.txt",meshoptLicense);
   for(const asset of exportedProject.assets)if(asset.license)add(`licenses/asset-${asset.hash}.txt`,asset.license);
   add("src/exporters/runtime.tsx",runtimeSource);
   add("src/exporters/runtime-pose.ts",runtimePoseSource);
   add("src/animation/interactions.ts",interactionSource);
+  add("src/animation/physics.ts",physicsSource);
+  add("src/animation/physics-controller.ts",physicsControllerSource);
+  add("src/domain/physics-config.ts",physicsConfigSource);
   add("src/animation/interaction-controller.ts",interactionControllerSource);
   add("src/exporters/export-types.ts",exportTypes);
   add("src/domain/types.ts",`${domainTypes}\nexport type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;\n`);
@@ -134,9 +144,9 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   add("src/main.tsx",'import { createRoot } from "react-dom/client";\nimport TriadModel from "./TriadModel";\ncreateRoot(document.getElementById("root")!).render(<TriadModel />);\n');
   add("index.html",'<!doctype html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TRIAD-3D Export</title></head><body style="margin:0"><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>');
   add("vite.config.ts",'import { defineConfig } from "vite"; export default defineConfig({ base: "./" });\n');
-  add("package.json",json({ name:"triad-model-export",version:"1.0.0",private:true,type:"module",scripts:{dev:"vite",build:"tsc --noEmit && vite build"},dependencies:{react:"19.3.1","react-dom":"19.3.1",three:"0.186.1",...(compressed?{meshoptimizer:"1.1.1"}:{})},devDependencies:{typescript:"5.9.3",vite:"8.3.4","@types/react":"19.3.0","@types/react-dom":"19.3.0","@types/three":"0.186.0"} }));
+  add("package.json",json({ name:"triad-model-export",version:"1.0.0",private:true,type:"module",scripts:{dev:"vite",build:"tsc --noEmit && vite build"},dependencies:{"@dimforge/rapier3d-compat":"0.21.0",react:"19.3.1","react-dom":"19.3.1",three:"0.186.1",...(compressed?{meshoptimizer:"1.1.1"}:{})},devDependencies:{typescript:"5.9.3",vite:"8.3.4","@types/react":"19.3.0","@types/react-dom":"19.3.0","@types/three":"0.186.0"} }));
   add("tsconfig.json",json({ compilerOptions:{target:"ES2022",lib:["ES2022","DOM","DOM.Iterable"],module:"ESNext",moduleResolution:"Bundler",strict:true,skipLibCheck:true,jsx:"react-jsx",resolveJsonModule:true,allowSyntheticDefaultImports:true,noEmit:true},include:["src"] }));
-  add("README.md",`# TRIAD-3D export\n\nNode.js 22.12+; npm install; npm run build; npm run dev.\n\nImport src/TriadModel.tsx and retain its sibling runtime modules. Copy public/assets into the host public directory. assetBaseUrl must point to that directory; URLs are relative. Props: width, height, scale (>0), color (#RRGGBB), speed, playing, clipId, controlled time in seconds, onError.\n\nProfile: ${profile}. Profiles change raster resolution/antialiasing; they do not simplify source geometry. WebGL2 via Three WebGPURenderer. No editor, document history or persistence. First clip plays by default. Modifiers are baked at export time; changing animated cutters does not recompute CSG.\n\nDiagnostics:\n${diagnostics.map(d => `- ${d}`).join("\n") || "None."}\n\nThird-party packages React and Three.js use MIT licenses; see installed package LICENSE files. Rights to user-imported resources remain with their respective owners.\n`);
+  add("README.md",`# TRIAD-3D export\n\nNode.js 22.12+; npm install; npm run build; npm run dev.\n\nImport src/TriadModel.tsx and retain its sibling runtime modules. Copy public/assets into the host public directory. assetBaseUrl must point to that directory; URLs are relative. Props: width, height, scale (>0), color (#RRGGBB), speed, playing, clipId, controlled time in seconds, onError.\n\nProfile: ${profile}. Profiles change raster resolution/antialiasing; they do not simplify source geometry. WebGL2 via Three WebGPURenderer. No editor, document history or persistence. First clip plays by default. Modifiers are baked at export time; changing animated cutters does not recompute CSG.\n\nDiagnostics:\n${diagnostics.map(d => `- ${d}`).join("\n") || "None."}\n\nRapier uses Apache-2.0 (included); React and Three.js use MIT licenses; see installed package LICENSE files. Rights to user-imported resources remain with their respective owners.\n`);
   add("export-report.json",json({profile,triangles,diagnostics,schemaVersion:project.schemaVersion}));
   const bytes = [...files.values()].reduce((sum,b) => sum+b.byteLength,0);
   if (bytes > 256*1024*1024) throw new Error("Экспорт превышает лимит 256 MiB.");

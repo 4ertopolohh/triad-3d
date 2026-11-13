@@ -1,3 +1,4 @@
+import { PhysicsEditor } from "./PhysicsEditor";
 import { useEffect, useRef, useState } from "react";
 import { checkedTransform, transformNeedsEvaluation } from "../app/checked-transform";
 import { recordingPose } from "../app/recording-pose";
@@ -137,6 +138,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
         {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
       <MaterialInspector store={store} state={state} />
+      {nodes.length===1&&nodes[0]?.kind==="mesh"&&<PhysicsEditor store={store} state={state} nodeId={nodes[0].id} disabled={disabled}/>}
       {nodes.length===1&&nodes[0]&&<InteractionEditor store={store} state={state} nodeId={nodes[0].id} disabled={disabled}/>}
       {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}

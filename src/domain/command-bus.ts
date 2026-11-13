@@ -1,3 +1,4 @@
+import { physicsError } from "./physics-config";
 import { surfaceStroke, validSurfaceStroke, type SurfaceStroke } from "../geometry/surface-brush";
 import { interactionError } from "../animation/interactions";
 import { applyInstanceCommand, isInstanceCommand, validInstanceCommand, type InstanceCommand } from "./instance-commands";
@@ -22,6 +23,7 @@ import { displaceStroke, validFootprint, type BrushFootprint, brushParameters, i
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
   | InstanceCommand
+  | {commandId:string;type:"SET_PHYSICS";targetIds:[string];payload:{projectId:string;actors:NonNullable<Project["physics"]>}}
   | {commandId:string;type:"SET_INTERACTIONS";targetIds:[string];payload:{projectId:string;rules:NonNullable<Project["interactions"]>}}
   | { commandId: string; type: "SET_TIMELINE"; targetIds: [EntityId]; payload: { projectId: EntityId; timeline: Timeline } }
   | { commandId: string; type: "SET_SCENE_SETTINGS"; targetIds: [EntityId]; payload: { sceneId: EntityId; settings: SceneSettings } }
@@ -71,6 +73,7 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | {kind:"setPhysics";before:Project["physics"];after:Project["physics"]}
   | {kind:"setInteractions";before:Project["interactions"];after:Project["interactions"]}
   | {kind:"setInstances";before:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]};after:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]}}
   | { kind: "setTimeline"; before: Timeline; after: Timeline }
@@ -154,6 +157,7 @@ function validCommand(value: unknown): value is ProjectCommand {
   if(isInstanceCommand(value))return validInstanceCommand(value);
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   if (value.type === "SET_TIMELINE") return ownKeys(payload, ["projectId", "timeline"]) && id(payload.projectId) && same(value.targetIds, [payload.projectId]) && timelineError(payload.timeline) === null;
+  if(value.type==="SET_PHYSICS")return ownKeys(payload,["projectId","actors"])&&id(payload.projectId)&&same(value.targetIds,[payload.projectId])&&Array.isArray(payload.actors)&&physicsError(payload.actors,new Set(payload.actors.map((r:unknown)=>record(r)&&typeof r.nodeId==="string"?r.nodeId:"")))===null;
   if(value.type==="SET_INTERACTIONS")return ownKeys(payload,["projectId","rules"])&&id(payload.projectId)&&same(value.targetIds,[payload.projectId])&&Array.isArray(payload.rules)&&interactionError(payload.rules,new Set(payload.rules.map((r:unknown)=>record(r)&&typeof r.nodeId==="string"?r.nodeId:"")))===null;
   if (value.type === "SET_SCENE_SETTINGS") return ownKeys(payload, ["sceneId", "settings"]) && id(payload.sceneId)
     && same(value.targetIds, [payload.sceneId]) && sceneSettingsError(payload.settings) === null;
@@ -351,6 +355,16 @@ function activeDependents(project: Project, nodeId: string): boolean {
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
   if(validInstanceCommand(command)){const error=applyInstanceCommand(project,command);return error?failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error):null;}
+  if(command.type==="SET_PHYSICS"){
+    const error=physicsError(command.payload.actors,new Set(project.nodes.map(n=>n.id)));
+    if(command.payload.projectId!==project.id||error)return failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error??"Проект не совпадает.");
+    for(const nodeId of new Set([...(project.physics??[]),...command.payload.actors].map(a=>a.nodeId))){
+      const node=project.nodes.find(n=>n.id===nodeId);
+      if(node&&guarded(project,node)&&!same(project.physics?.find(a=>a.nodeId===nodeId),command.payload.actors.find(a=>a.nodeId===nodeId)))return failure(command.commandId,CommandErrorCode.INVALID_COMMAND,"Заблокированное тело нельзя изменять.");
+    }
+    if(command.payload.actors.length)project.physics=structuredClone(command.payload.actors);else delete project.physics;
+    return null;
+  }
   if(command.type==="SET_INTERACTIONS"){
     const error=interactionError(command.payload.rules,new Set(project.nodes.map(n=>n.id)));
     if(command.payload.projectId!==project.id||error)return failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error??"Проект не совпадает.");
@@ -674,6 +688,7 @@ function entityIds(project: Project): Set<string> {
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
+  if(!same(before.physics,after.physics))changes.push({kind:"setPhysics",before:structuredClone(before.physics),after:structuredClone(after.physics)});
   if(!same(before.interactions,after.interactions))changes.push({kind:"setInteractions",before:structuredClone(before.interactions),after:structuredClone(after.interactions)});
   if (!same(timelineOf(before), timelineOf(after))) changes.push({ kind: "setTimeline", before: structuredClone(timelineOf(before)), after: structuredClone(timelineOf(after)) });
   const sceneAfter={...after.scene,instances:before.scene.instances};
@@ -716,6 +731,7 @@ function diff(before: Project, after: Project): ProjectPatch {
 
 function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if(change.kind==="setPhysics")return {kind:"setPhysics",before:structuredClone(change.after),after:structuredClone(change.before)};
     if(change.kind==="setInteractions")return {kind:"setInteractions",before:structuredClone(change.after),after:structuredClone(change.before)};
     if(change.kind==="setInstances")return {kind:"setInstances",before:structuredClone(change.after),after:structuredClone(change.before)};
     if (change.kind === "setTimeline") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
@@ -742,6 +758,7 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
+    if(change.kind==="setPhysics"){if(!same(result.physics,change.before))throw new Error("Patch physics conflict");if(change.after)result.physics=structuredClone(change.after);else delete result.physics;continue;}
     if(change.kind==="setInteractions"){if(!same(result.interactions,change.before))throw new Error("Patch interaction conflict");if(change.after)result.interactions=structuredClone(change.after);else delete result.interactions;continue;}
     if(change.kind==="setInstances"){
       if(!same({instances:result.scene.instances,snapshots:result.modelSnapshots},change.before))throw new Error("Patch instance conflict");
