@@ -1,5 +1,9 @@
 # Implementation status
 
+## OBJ import — FR-065
+
+A bounded worker adapter imports triangles/convex planar quads, UV, named groups and smoothing splits into editable domain meshes. Compatibility matrix and loss diagnostics precede explicit atomic application; external MTL/URIs are never opened. Browser apply/Undo/Redo and cancellation of a 300,000-vertex file passed. Both review axes have no remaining findings after adding the matrix and UV-seam shading caveat. Validation: lint/build and full suite **80 files / 491 tests PASS**. Details: `obj-import.md`. GLB animation/hierarchy compatibility and final release acceptance remain open.
+
 ## Video export — TASK-057
 
 Fixed-step timeline capture shares the TSX renderer and waits for textures. WebCodecs VP9/WebM and optional AVC/MP4 use configuration probes, cancellable jobs and RAM-only output. Actual downloaded files both passed ffprobe: 10 seconds, 300 frames, 30 FPS at 640×360; cancellation and configured prop defaults passed browser checks. Isolated single-thread FFmpeg WASM spike also encoded a verified ten-second test file; adoption limits are explicit in `video-export.md`. Review fixes isolate the internal capture prop and preserve parameter mapping across instances. Validation: lint/build, **79 files / 474 tests PASS**, standalone/normal/compressed TSX harnesses PASS.

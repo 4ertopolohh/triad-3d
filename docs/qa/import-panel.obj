@@ -1,0 +1,14 @@
+# TRIAD OBJ acceptance fixture: local UV and one convex quad
+mtllib intentionally-not-loaded.mtl
+o Панель
+v -1 -1 0
+v 1 -1 0
+v 1 1 0
+v -1 1 0
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+s off
+usemtl deliberately-omitted
+f 1/1 2/2 3/3 4/4
