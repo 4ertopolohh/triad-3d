@@ -1,6 +1,6 @@
 # Data and contracts
 
-Current document version: **1.9.0**, schema `src/domain/schemas/document-v1.9.schema.json`. Version 1.8 is strictly validated before the version-only migration. Optional `Asset.license` stores 1–16384 characters of provenance/license text; it is preserved in native archives and material packs. ZIP formatVersion remains 1.0.0. Historical version sections below describe their introduction points.
+Current document version: **1.10.0**, schema `src/domain/schemas/document-v1.10.schema.json`. Version 1.9 is strictly validated before migration. Optional `modelSnapshots` stores shared frozen model sources; each instance references a snapshot and may store material/animation overrides. Existing legacy instances migrate to one shared snapshot. See `model-instances.md`. Optional `Asset.license` stores 1–16384 characters of provenance/license text; it is preserved in native archives and material packs. ZIP formatVersion remains 1.0.0. Historical version sections below describe their introduction points.
 
 Runtime export is a separate derived contract: `RuntimeProject` replaces computed mesh sources with `{kind:"baked"}` and stores geometry once in the bundle or Meshopt streams. This marker is never accepted in native Project documents. The animation evaluator depends only on node IDs/transforms and timeline data.
 

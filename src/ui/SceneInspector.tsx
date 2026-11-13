@@ -3,6 +3,7 @@ import type { EditorState, EditorStore } from "../app/editor-store";
 import { sceneSettings, sceneSettingsError, type SceneSettings } from "../domain/scene-settings";
 import type { Light } from "../domain/types";
 import { linearToHex, parseHexColor as hexToLinear } from "../materials/color";
+import { InstancePanel } from "./InstancePanel";
 
 /** A draft is bound to its source revision: blur can never overwrite a newer document. */
 function NumericField({ label, value, disabled, onChange }: { label: string; value: number; disabled: boolean; onChange: (value: number) => void }) {
@@ -32,6 +33,7 @@ export function SceneInspector({ store, state, blocked }: { store: EditorStore; 
   const numeric = (label: string, value: number, change: (settings: SceneSettings, value: number) => void) => <NumericField key={`${state.document.project.id}:${revision}:${label}:${value}`} label={label} value={value} disabled={blocked} onChange={v => edit(s => change(s, v))} />;
   const rendering = scene.renderSettings ?? { exposure: 1.25, toneMapping: "aces" as const };
   return <div className="scene-inspector">
+    <InstancePanel store={store} state={state} blocked={blocked}/>
     {error && <p className="material-warning" role="alert">{error}</p>}
     <h3>Окружение и фон</h3>
     <label>Цвет фона<input type="color" aria-label="Цвет фона" disabled={blocked} value={linearToHex(scene.background.color) ?? "#ffffff"} onChange={event => { const color = hexToLinear(event.target.value); if (color) edit(s => { s.background.color = color; }); }} /></label>

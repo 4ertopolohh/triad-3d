@@ -22,6 +22,7 @@ export interface Project {
   animations: AnimationClip[];
   tracks: Track[];
   keyframes: Keyframe[];
+  modelSnapshots?: ModelSnapshot[];
 }
 
 export interface Model {
@@ -70,6 +71,22 @@ export interface Instance {
   modelId: EntityId;
   transform: Transform;
   visible: boolean;
+  snapshotId?: EntityId;
+  materialOverride?: Material;
+  animationOverride?: { clipId: EntityId | null; speed: number };
+}
+
+/** Frozen model state shared by instances; no additional editable Model or Scene. */
+export interface ModelSnapshot {
+  id: EntityId;
+  revision: number;
+  rootNodeId: EntityId;
+  nodes: Node[];
+  modifiers: Modifier[];
+  materials: Material[];
+  animations: AnimationClip[];
+  tracks: Track[];
+  keyframes: Keyframe[];
 }
 
 export interface GroupNode {

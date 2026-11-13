@@ -2,17 +2,18 @@ import { recordingPose } from "../app/recording-pose";
 import { CommitNumber } from "./CommitNumber";
 import { addPreset, analyzeLoop, alignLoop, type AnimationPreset } from "../animation/presets";
 import { BezierEditor } from "./BezierEditor";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
 import { useEditorStore } from "../app/use-editor-store";
 import { timelineOf, type Timeline as TimelineData } from "../animation/timeline";
 import type { TrackProperty } from "../domain/types";
 
-export type AnimationPreview = { clipId: string; time: number; recording?: boolean } | null;
+export type AnimationPreview = { clipId: string; time: number; recording?: boolean; absoluteTime?: number; wrap?: boolean } | null;
 export function Timeline({ store, blocked, onPreview }: { store: EditorStore; blocked: boolean; onPreview: (value: AnimationPreview) => void }) {
   const state = useEditorStore(store);
   const [clipId, setClipId] = useState("");
   const [time, setTime] = useState(0);
+  const playbackTime=useRef(0);
   const [playing, setPlaying] = useState(false);
   const [recording,setRecording] = useState(false);
   const [rate, setRate] = useState(1);
@@ -31,16 +32,16 @@ export function Timeline({ store, blocked, onPreview }: { store: EditorStore; bl
     const stored = state.document.project.tracks.find(t => clip?.trackIds.includes(t.id) && t.nodeId === state.selection.activeId && t.pivot)?.pivot;
     if (stored) {setUsePivot(true);setPivot([...stored]);} else setUsePivot(false);
   },[epoch,clip?.id,state.selection.activeId]);
-  useEffect(() => { setPlaying(false); setRecording(false); setTime(0); onPreview(null); }, [epoch, onPreview]);
+  useEffect(() => { setPlaying(false); setRecording(false); playbackTime.current=0; setTime(0); onPreview(null); }, [epoch, onPreview]);
   useEffect(() => {
     if (!playing || !clip || blocked) return;
-    const start = performance.now(), origin = time;
+    const start = performance.now(), origin = playbackTime.current;
     let handle = 0;
     const frame = (now: number) => {
       const elapsed = origin + (now-start)/1000*rate;
       const begin = clip.loopStartSeconds ?? 0, end = clip.loopEndSeconds ?? clip.durationSeconds;
       const next = clip.loop ? begin + ((elapsed-begin) % (end-begin) + end-begin) % (end-begin) : Math.min(elapsed, clip.durationSeconds);
-      setTime(next); onPreview({ clipId: clip.id, time: next });
+      playbackTime.current=elapsed; setTime(next); onPreview({ clipId: clip.id, time: next, absoluteTime:elapsed, wrap:true });
       if (!clip.loop && elapsed >= clip.durationSeconds) setPlaying(false);
       else handle = requestAnimationFrame(frame);
     };
@@ -78,9 +79,9 @@ export function Timeline({ store, blocked, onPreview }: { store: EditorStore; bl
   return <section className={`timeline ${state.view.timelineExpanded ? "" : "is-collapsed"}`} aria-label="Область анимации">
     <div className="panel-heading"><h2>Таймлайн</h2>{!state.view.timelineExpanded && clip && <button disabled={blocked} onClick={() => { setRecording(false); setPlaying(!playing); }}>{playing ? "Пауза" : "Воспроизвести"}</button>}<button aria-expanded={state.view.timelineExpanded} onClick={() => store.setView({ timelineExpanded: !state.view.timelineExpanded })}>{state.view.timelineExpanded ? "Свернуть таймлайн" : "Развернуть таймлайн"}</button></div>
     <div className="timeline-body" hidden={!state.view.timelineExpanded}>
-      <button disabled={blocked || playing} onClick={() => { const id = crypto.randomUUID(); commit(t => t.animations.push({ id, name: `Клип ${t.animations.length+1}`, durationSeconds: 2, loop: false, trackIds: [] })); setClipId(id); setTime(0); onPreview(null); }}>Добавить клип</button>
+      <button disabled={blocked || playing} onClick={() => { const id = crypto.randomUUID(); commit(t => t.animations.push({ id, name: `Клип ${t.animations.length+1}`, durationSeconds: 2, loop: false, trackIds: [] })); setClipId(id); playbackTime.current=0; setTime(0); onPreview(null); }}>Добавить клип</button>
       {clip && <>
-        <select aria-label="Клип" value={clip.id} disabled={playing || blocked} onChange={e => { setClipId(e.target.value); setTime(0); onPreview(null); }}>{state.document.project.animations.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
+        <select aria-label="Клип" value={clip.id} disabled={playing || blocked} onChange={e => { setClipId(e.target.value); playbackTime.current=0; setTime(0); onPreview(null); }}>{state.document.project.animations.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>
         <button disabled={blocked} onClick={() => { setRecording(false); setPlaying(!playing); }}>{playing ? "Пауза" : "Воспроизвести"}</button>
         <button disabled={blocked || playing} onClick={() => { commit(t => {
           t.animations = t.animations.filter(c => c.id !== clip.id);
@@ -88,7 +89,7 @@ export function Timeline({ store, blocked, onPreview }: { store: EditorStore; bl
           t.tracks = t.tracks.filter(tr => usedTracks.has(tr.id));
           const usedKeys = new Set(t.tracks.flatMap(tr => tr.keyframeIds));
           t.keyframes = t.keyframes.filter(k => usedKeys.has(k.id));
-        }); setTime(0); onPreview(null); }}>Удалить клип</button>
+        }); playbackTime.current=0; setTime(0); onPreview(null); }}>Удалить клип</button>
         <button onClick={() => { setPlaying(false); setRecording(false); onPreview(null); }}>Вернуть исходную позу</button>
         <label><input type="checkbox" checked={recording} disabled={blocked || playing} onChange={e => { setRecording(e.target.checked); if (!e.target.checked) onPreview(null); }} />Запись трансформаций</label>
         <label>Скорость<select value={rate} onChange={e => setRate(Number(e.target.value))}>{[.1,.25,.5,1,1.5,2].map(n => <option key={n} value={n}>{n}×</option>)}</select></label>
@@ -99,7 +100,7 @@ export function Timeline({ store, blocked, onPreview }: { store: EditorStore; bl
         <label>Конец цикла<CommitNumber aria-label="Конец цикла" value={clip.loopEndSeconds ?? clip.durationSeconds} disabled={blocked || playing} onCommit={value => commit(t => { t.animations.find(c => c.id === clip.id)!.loopEndSeconds = value; })} /></label>
         <label>Масштаб шкалы<select value={zoom} onChange={e => setZoom(Number(e.target.value))}>{[1,2,4,8].map(z => <option key={z} value={z}>{z}×</option>)}</select></label>
         <label><input type="checkbox" checked={snap} onChange={e => setSnap(e.target.checked)} />Привязка к кадрам</label>
-        <label>Время: {time.toFixed(3)} с<input aria-label="Время анимации" type="range" min="0" max={clip.durationSeconds} step=".001" value={time} disabled={playing || blocked} onChange={e => { const value = Number(e.target.value); setTime(value); onPreview({ clipId: clip.id, time: value, recording }); }} /></label>
+        <label>Время: {time.toFixed(3)} с<input aria-label="Время анимации" type="range" min="0" max={clip.durationSeconds} step=".001" value={time} disabled={playing || blocked} onChange={e => { const value = Number(e.target.value); playbackTime.current=value; setTime(value); onPreview({ clipId: clip.id, time: value, recording }); }} /></label>
         {([ ["transform.position", "Ключ позиции"], ["transform.rotationQuat", "Ключ вращения"], ["transform.scale", "Ключ масштаба"] ] as const).map(([property,label]) => <button key={property} disabled={blocked || playing || !state.selection.activeId} onClick={() => addKey(property)}>{label}</button>)}
         <fieldset disabled={blocked || playing || !state.selection.activeId}><legend>Пресет анимации</legend>
           <select aria-label="Пресет анимации" value={preset} onChange={e => setPreset(e.target.value as AnimationPreset)}><option value="spin">Вращение</option><option value="orbit">Орбита</option><option value="move">Сдвиг</option><option value="reveal">Появление масштабом</option><option value="oscillate">Колебание</option><option value="bounce">Отскок</option></select>

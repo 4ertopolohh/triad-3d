@@ -1,5 +1,11 @@
 # Implementation status
 
+## Model instances — TASK-050
+
+Document 1.10 adds shared frozen revision snapshots, explicit preview/Sync, per-instance placement/material/animation overrides, pruning and Undo/Redo. Renderer shares geometry across 20 distinct color overrides, with separately derived UV projection variants. TSX exports frozen scene copies with remapped object props and independent animation; GLB bakes selected overrides with a loss report. Browser Sync/Undo/Redo/save/reopen passed (r2/r1 retained, no console errors), proof `qa/instances-reopened.png`; details `model-instances.md`. Two-axis review findings were fixed and re-reviewed. Validation: lint/build, full suite **71 files / 448 tests PASS**, normal and compressed production export harnesses PASS.
+
+Previous deployed checkpoint `4db2a12` passed CI 43336417678 and Pages 43336440449. Remaining NEXT and final release tasks are still open; this is not a complete-release claim.
+
 ## Final-render experiment — TASK-059
 
 Isolated pinned WebGLPathTracer comparison against the exported material golden is implemented and built. Cold attempt: 0 samples/60s and raster fallback; repeat: 32 samples/5666ms, visible noise; cancellation: 1.5 samples/1491ms and raster retained. No production pathtracer integration is claimed; Final remains raster. See `pathtracer-experiment.md` for evidence, review fixes and acceptance conditions.

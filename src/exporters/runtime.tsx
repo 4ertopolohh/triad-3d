@@ -9,7 +9,7 @@ import { createTriplanarMaterial } from "../renderer/triplanar-material";
 import { BaseColorTextures } from "../renderer/base-color-textures";
 import { SurfaceTextures } from "../renderer/surface-textures";
 import { ProceduralRoughnessTextures } from "../renderer/procedural-roughness-textures";
-import { evaluateClip } from "../animation/timeline";
+import { evaluateRuntimePose } from "./runtime-pose";
 import type { RuntimeBundle } from "./export-types";
 import type { Material, Transform } from "../domain/types";
 
@@ -120,9 +120,8 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
         const control = controls.current;
         if (last && control.playing && Number.isFinite(control.speed) && control.speed >= 0 && control.speed <= 100) elapsed += (now-last)/1000*control.speed;
         last = now;
-        const clip = project.animations.find(c => c.id === control.clipId) ?? project.animations[0];
         const seconds = control.time !== undefined && Number.isFinite(control.time) ? control.time : elapsed;
-        const pose = clip ? evaluateClip(project,clip.id,seconds,control.time === undefined) : new Map<string,Transform>();
+        const pose = evaluateRuntimePose(data,control.clipId,seconds,control.time === undefined);
         for (const node of project.nodes) apply(objects.get(node.id)!,pose.get(node.id) ?? node.transform);
         model.scale.setScalar(Number.isFinite(control.scale) && control.scale > 0 ? control.scale : 1);
         for (const [target,original] of colors) { if (control.color && /^#[0-9a-f]{6}$/i.test(control.color)) target.set(control.color); else target.copy(original); }

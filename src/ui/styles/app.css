@@ -205,6 +205,8 @@ button.tree-row[aria-pressed="true"] { outline: 1px solid currentColor; }
 .scene-inspector label { display: grid; gap: 4px; min-width: 0; font-size: var(--font-size-xs); color: var(--color-text-secondary); }
 .scene-inspector input, .scene-inspector select { box-sizing: border-box; width: 100%; min-width: 0; min-height: 30px; padding: 5px; border: var(--border-default); border-radius: var(--radius-sm); background: var(--color-surface-base); color: var(--color-text-primary); }
 .scene-inspector input[aria-invalid="true"] { outline: 1px solid var(--color-danger, #d86666); }
+.scene-inspector input[type="checkbox"] { width: 16px; min-height: 16px; height: 16px; padding: 0; }
+.scene-inspector label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 6px; }
 .scene-inspector fieldset { display: grid; gap: 8px; min-width: 0; padding: 10px; border: var(--border-default); border-radius: var(--radius-sm); }
 .scene-inspector legend { font-size: var(--font-size-xs); }
 .scene-inspector details[open] { display: grid; gap: 8px; }

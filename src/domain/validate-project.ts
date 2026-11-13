@@ -8,6 +8,7 @@ import { parseBevelParameters } from "../geometry/modifiers/bevel";
 import { parseBendParameters, parseTwistParameters, parseTaperParameters } from "../geometry/modifiers/deform";
 import { validateMaterial } from "./validate-material";
 import { sceneExtensionsError } from "./scene-settings";
+import { snapshotProject } from "./model-snapshots";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -57,6 +58,7 @@ export function validateProject(project: Project): ValidationIssue[] {
   for (const [index, asset] of project.assets.entries()) register(asset.id, `assets[${index}].id`);
   for (const [index, light] of project.scene.lights.entries()) register(light.id, `scene.lights[${index}].id`);
   for (const [index, instance] of project.scene.instances.entries()) register(instance.id, `scene.instances[${index}].id`);
+  for(const [index,snapshot]of (project.modelSnapshots??[]).entries())register(snapshot.id,`modelSnapshots[${index}].id`);
   for (const [index, clip] of project.animations.entries()) register(clip.id, `animations[${index}].id`);
   for (const [index, track] of project.tracks.entries()) register(track.id, `tracks[${index}].id`);
   for (const [index, keyframe] of project.keyframes.entries()) register(keyframe.id, `keyframes[${index}].id`);
@@ -172,7 +174,19 @@ export function validateProject(project: Project): ValidationIssue[] {
   project.scene.instances.forEach((instance, index) => {
     reference(instance.modelId, new Set([project.model.id]), `scene.instances[${index}].modelId`);
     checkTransform(instance, finite, `scene.instances[${index}].transform`);
+    if(Math.abs(Math.hypot(...instance.transform.rotationQuat)-1)>1e-5||instance.transform.scale.some(v=>v<=0))issues.push({code:"INVALID_STRUCTURE",path:`scene.instances[${index}].transform`,message:"Кватернион должен быть нормализован, масштаб — положительным."});
+    const snapshot=project.modelSnapshots?.find(s=>s.id===instance.snapshotId);
+    if(!snapshot)issues.push({code:"MISSING_REFERENCE",path:`scene.instances[${index}].snapshotId`,message:"Снимок экземпляра не найден."});
+    if(instance.materialOverride){issues.push(...validateMaterial(instance.materialOverride,`scene.instances[${index}].materialOverride`));for(const id of instance.materialOverride.textureAssetIds??[])reference(id,assetIds,`scene.instances[${index}].materialOverride.textureAssetIds`);for(const id of Object.values(instance.materialOverride.textureSlots??{}))reference(id,assetIds,`scene.instances[${index}].materialOverride.textureSlots`);}
+    for(const id of Object.values(instance.materialOverride?.textureSlots??{})){const asset=project.assets.find(a=>a.id===id);if(asset&&!["image/png","image/jpeg","image/webp"].includes(asset.mediaType))issues.push({code:"INVALID_STRUCTURE",path:`scene.instances[${index}].materialOverride.textureSlots`,message:"Карта материала должна быть PNG, JPEG или WebP."});}
+    const animation=instance.animationOverride;
+    if(animation&&(!Number.isFinite(animation.speed)||animation.speed<0||animation.speed>4||animation.clipId!==null&&!snapshot?.animations.some(c=>c.id===animation.clipId)))issues.push({code:"INVALID_STRUCTURE",path:`scene.instances[${index}].animationOverride`,message:"Некорректный override анимации экземпляра."});
   });
+  if(project.scene.instances.length>128||(project.modelSnapshots?.length??0)>32)issues.push({code:"INVALID_STRUCTURE",path:"scene.instances",message:"Превышен бюджет экземпляров или снимков."});
+  for(const snapshot of project.modelSnapshots??[]){
+    if(!Number.isSafeInteger(snapshot.revision)||snapshot.revision<0)issues.push({code:"INVALID_NUMBER",path:`modelSnapshots.${snapshot.id}.revision`,message:"Некорректная ревизия снимка."});
+    for(const issue of validateProject(snapshotProject(project,snapshot)))issues.push({...issue,path:`modelSnapshots.${snapshot.id}.${issue.path}`});
+  }
 
   for (const modifier of project.modifiers) {
     reference(modifier.nodeId, nodeIds, `modifiers.${modifier.id}.nodeId`);

@@ -1,4 +1,5 @@
 import { surfaceStroke, validSurfaceStroke, type SurfaceStroke } from "../geometry/surface-brush";
+import { applyInstanceCommand, isInstanceCommand, validInstanceCommand, type InstanceCommand } from "./instance-commands";
 import { timelineError, timelineOf, type Timeline } from "../animation/timeline";
 import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
 import { validateProject, type ValidationIssue } from "./validate-project";
@@ -19,6 +20,7 @@ import { displaceStroke, validFootprint, type BrushFootprint, brushParameters, i
 
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
+  | InstanceCommand
   | { commandId: string; type: "SET_TIMELINE"; targetIds: [EntityId]; payload: { projectId: EntityId; timeline: Timeline } }
   | { commandId: string; type: "SET_SCENE_SETTINGS"; targetIds: [EntityId]; payload: { sceneId: EntityId; settings: SceneSettings } }
   | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
@@ -67,6 +69,7 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | {kind:"setInstances";before:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]};after:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]}}
   | { kind: "setTimeline"; before: Timeline; after: Timeline }
   | { kind: "setScene"; before: Project["scene"]; after: Project["scene"] }
   | { kind: "addMaterial"; material: Material; index: number }
@@ -145,6 +148,7 @@ function validNode(value: unknown): value is Node {
 function validCommand(value: unknown): value is ProjectCommand {
   if (!record(value) || !id(value.commandId) || !Array.isArray(value.targetIds) || !record(value.payload)) return false;
   const payload = value.payload;
+  if(isInstanceCommand(value))return validInstanceCommand(value);
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   if (value.type === "SET_TIMELINE") return ownKeys(payload, ["projectId", "timeline"]) && id(payload.projectId) && same(value.targetIds, [payload.projectId]) && timelineError(payload.timeline) === null;
   if (value.type === "SET_SCENE_SETTINGS") return ownKeys(payload, ["sceneId", "settings"]) && id(payload.sceneId)
@@ -342,6 +346,7 @@ function activeDependents(project: Project, nodeId: string): boolean {
 }
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
+  if(validInstanceCommand(command)){const error=applyInstanceCommand(project,command);return error?failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error):null;}
   if (command.type === "SET_TIMELINE") {
     if (command.payload.projectId !== project.id) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Проект не найден.");
     for (const track of [...project.tracks, ...command.payload.timeline.tracks]) {
@@ -654,13 +659,16 @@ function entityIds(project: Project): Set<string> {
     ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
     ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
     ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
-    ...project.keyframes.map((item) => item.id)]);
+    ...project.keyframes.map((item) => item.id),...(project.modelSnapshots??[]).map(item=>item.id)]);
 }
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
   if (!same(timelineOf(before), timelineOf(after))) changes.push({ kind: "setTimeline", before: structuredClone(timelineOf(before)), after: structuredClone(timelineOf(after)) });
-  if (!same(before.scene, after.scene)) changes.push({ kind: "setScene", before: structuredClone(before.scene), after: structuredClone(after.scene) });
+  const sceneAfter={...after.scene,instances:before.scene.instances};
+  if (!same(before.scene, sceneAfter)) changes.push({ kind: "setScene", before: structuredClone(before.scene), after: structuredClone(sceneAfter) });
+  const instancesBefore={instances:before.scene.instances,snapshots:before.modelSnapshots},instancesAfter={instances:after.scene.instances,snapshots:after.modelSnapshots};
+  if(!same(instancesBefore,instancesAfter))changes.push({kind:"setInstances",before:structuredClone(instancesBefore),after:structuredClone(instancesAfter)});
   for (const asset of after.assets) if (!before.assets.some((entry) => entry.id === asset.id)) changes.push({ kind: "addAsset", asset: structuredClone(asset) });
   for (const [index, material] of [...before.materials.entries()].reverse()) if (!after.materials.some(item => item.id === material.id))
     changes.push({ kind: "removeMaterial", material: structuredClone(material), index });
@@ -697,6 +705,7 @@ function diff(before: Project, after: Project): ProjectPatch {
 
 function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if(change.kind==="setInstances")return {kind:"setInstances",before:structuredClone(change.after),after:structuredClone(change.before)};
     if (change.kind === "setTimeline") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setScene") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "addNode") return { kind: "removeNode", node: structuredClone(change.node) };
@@ -721,6 +730,12 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
+    if(change.kind==="setInstances"){
+      if(!same({instances:result.scene.instances,snapshots:result.modelSnapshots},change.before))throw new Error("Patch instance conflict");
+      result.scene.instances=structuredClone(change.after.instances);
+      if(change.after.snapshots)result.modelSnapshots=structuredClone(change.after.snapshots);else delete result.modelSnapshots;
+      continue;
+    }
     if (change.kind === "setTimeline") {
       if (!same(timelineOf(result), change.before)) throw new Error("Patch timeline conflict");
       Object.assign(result, structuredClone(change.after)); continue;
@@ -813,7 +828,7 @@ export function createCommandBus(initialProject: Project): CommandBus {
       const contentPatch = diff(committed, candidate);
       if (contentPatch.changes.length === 0) return { ok: true, id: resultId, project: structuredClone(committed), revision,
         patch: { changes: [] }, undoPatch: { changes: [] }, changed: false };
-      candidate.model.revision += 1;
+      if(contentPatch.changes.some(change=>change.kind!=="setScene"&&change.kind!=="setInstances"))candidate.model.revision += 1;
       const validationIssues = validateProject(candidate);
       if (validationIssues.length) return failure(resultId, CommandErrorCode.VALIDATION_FAILED, "Результат не прошёл проверку документа.", validationIssues);
       const patch = diff(committed, candidate);

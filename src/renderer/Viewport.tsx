@@ -10,6 +10,7 @@ import type { SceneStatus } from "./scene-sync";
 import { ViewportInteractions, editable, brushUnavailable } from "./viewport-interactions";
 import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
+import { InstancePreview } from "./instance-preview";
 import { applyMaterialPresetToNode, materialNodeReason } from "../app/material-actions";
 import { endMaterialDrag, materialDragActive, MATERIAL_PRESET_MIME, resolveMaterialDrop } from "../app/material-drag";
 
@@ -17,6 +18,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
   const host = useRef<HTMLDivElement>(null);
   const interactions = useRef<ViewportInteractions | null>(null);
   const rendererAdapter = useRef<ThreeRendererAdapter | null>(null);
+  const instancePreview = useRef<InstancePreview | null>(null);
   const [quality, setQuality] = useState<PreviewQuality>("final");
   const qualityRef = useRef(quality); qualityRef.current = quality;
   const state = useEditorStore(store);
@@ -61,13 +63,16 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
     rendererAdapter.current = adapter;
     adapter.setQuality(qualityRef.current);
     const preview = new ModifierPreview(store, adapter.graph);
+    const instances = new InstancePreview(store, adapter.graph, setInteractionError);
+    instancePreview.current = instances;
     let generation = -1;
     const sync = () => {
       const state = store.getSnapshot();
-      if (generation === state.derived.generation) return;
+      if (generation === state.derived.generation) { instances.visibility(); return; }
       generation = state.derived.generation;
       adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
       preview.sync();
+      instances.sync();
     };
     let disposed = false;
     void adapter.initialize(host.current, backendMode).then(() => {
@@ -84,7 +89,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
     });
     sync();
     const unsubscribe = store.subscribe(sync);
-    return () => { disposed = true; unsubscribe(); preview.dispose(); interactions.current?.dispose(); interactions.current = null;
+    return () => { disposed = true; unsubscribe(); preview.dispose(); instances.dispose(); instancePreview.current = null; interactions.current?.dispose(); interactions.current = null;
       rendererAdapter.current = null; adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
   useEffect(() => {
@@ -97,6 +102,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       if (object) applyTransform(object, pose.get(node.id) ?? node.transform);
     }
     graph.scene.updateMatrixWorld(true);
+    instancePreview.current?.setAnimation(animationPreview);
   }, [animationPreview, store, state.document.revision, backendMode, attempt]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => rendererAdapter.current?.setQuality(quality), [quality]);
@@ -199,7 +205,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       {subMode && <span>Выбор элементов: Shift — добавить, Ctrl — переключить, Esc — очистить или выйти.</span>}
       {interactionError && <span role="alert">{interactionError}</span>}
       {materialHoverReason && <span role="status">{materialHoverReason}</span>}
-      {mode === "scene" && <span>Предпросмотр основной модели, не экземпляр сцены.</span>}
+      {mode === "scene" && <span>{state.document.project.scene.instances.length ? "Экземпляры сохранённых снимков модели." : "Добавьте экземпляр, чтобы разместить модель в сцене."}</span>}
       {scene.diagnostics.map(text => <span key={text}>{text}</span>)}
     </div>
   </section>;

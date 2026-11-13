@@ -7,6 +7,7 @@ import { createPhysicalMaterial } from "../renderer/pbr-material";
 import { evaluateClip } from "../animation/timeline";
 import { bakePng } from "../materials/procedural/bake";
 import { inspectStaticGlb } from "../importers/gltf/import-glb";
+import { evaluateRuntimePose } from "./runtime-pose";
 
 export async function exportGlb(bundle:RuntimeBundle,readAsset:(id:string)=>Uint8Array|undefined,signal?:AbortSignal):Promise<{blob:Blob;diagnostics:string[]}>{
   const project=bundle.project,scene=new T.Scene(),objects=new Map<string,T.Object3D>();
@@ -60,20 +61,28 @@ export async function exportGlb(bundle:RuntimeBundle,readAsset:(id:string)=>Uint
     }
     for(const node of project.nodes)(node.parentId?objects.get(node.parentId)!:scene).add(objects.get(node.id)!);
     const clips:T.AnimationClip[]=[];
+    const instances=bundle.instancePlayback;
+    const chosen=instances?.flatMap(instance=>{const clip=project.animations.find(c=>c.id===instance.defaultClip);return clip?[{instance,clip}]:[];})??[];
+    const sceneDuration=Math.max(0,...chosen.filter(c=>c.instance.speed>0).map(c=>c.clip.durationSeconds/c.instance.speed));
+    const exportClips=instances?.length?(sceneDuration>0?[{id:"instance-scene",name:"Экземпляры сцены",durationSeconds:sceneDuration,fps:30,trackIds:chosen.flatMap(c=>c.clip.trackIds)}]:[]):project.animations;
+    if(instances?.length){
+      diagnostics.push("Overrides экземпляров запечены в один клип: первая последовательность каждого выбранного клипа, без повторения loop-диапазонов; более короткие клипы удерживают конечную позу.");
+      for(const [id,transform]of evaluateRuntimePose(bundle,undefined,0,false)){const object=objects.get(id);if(object){object.position.fromArray(transform.position);object.quaternion.fromArray(transform.rotationQuat).normalize();object.scale.fromArray(transform.scale);}}
+    }
     const visible=(id:string):boolean=>{let node=project.nodes.find(n=>n.id===id);while(node){if(!node.visible)return false;node=project.nodes.find(n=>n.id===node!.parentId);}return true;};
     if(project.nodes.some(n=>!n.visible))diagnostics.push("Скрытые узлы и их дорожки не включены в GLB.");
-    for(const clip of project.animations){
-      const tracks=project.tracks.filter(t=>clip.trackIds.includes(t.id)&&!t.muted),solo=tracks.some(t=>t.solo),active=tracks.filter(t=>(!solo||t.solo)&&visible(t.nodeId));
+    for(const clip of exportClips){
+      const tracks=project.tracks.filter(t=>clip.trackIds.includes(t.id)&&!t.muted),solo=tracks.some(t=>t.solo),active=tracks.filter(t=>(instances?.length?chosen.some(c=>c.clip.trackIds.includes(t.id)&&(!project.tracks.some(other=>c.clip.trackIds.includes(other.id)&&other.solo&&!other.muted)||t.solo)):!solo||t.solo)&&visible(t.nodeId));
       if(!active.length)continue;
       const count=Math.ceil(clip.durationSeconds*(clip.fps??30));if(count*active.length>100000)throw new Error("Анимация превышает бюджет GLB bake: 100000 значений дорожек.");
       const seconds=new Set<number>([0,clip.durationSeconds]);for(let i=1;i<count;i++)seconds.add(i/(clip.fps??30));
-      for(const track of active)for(const key of project.keyframes.filter(k=>track.keyframeIds.includes(k.id)))seconds.add(key.timeSeconds);
+      for(const track of active)for(const key of project.keyframes.filter(k=>track.keyframeIds.includes(k.id))){const speed=instances?.length?chosen.find(c=>c.clip.trackIds.includes(track.id))?.instance.speed??1:1;if(speed>0)seconds.add(key.timeSeconds/speed);}
       // Evaluate authored double times before Float32 encoding; on collision the later pose wins.
       const samples=new Map<number,number>();for(const time of [...seconds].sort((a,b)=>a-b))samples.set(Math.fround(time),time);
       if(samples.size<seconds.size)diagnostics.push(`${clip.name}: совпадающие Float32-времена объединены с сохранением более поздней позы.`);
       const times=[...samples.keys()],values=new Map(active.map(t=>[t.id,[] as number[]]));
       if(times.length*active.length>200000)throw new Error("Слишком много ключей для GLB bake.");
-      for(const time of times){check();const pose=evaluateClip(project,clip.id,samples.get(time)!,false);for(const track of active){const transform=pose.get(track.nodeId);if(transform)values.get(track.id)!.push(...transform[track.property.slice(10) as "position"|"scale"|"rotationQuat"]);}}
+      for(const time of times){check();const pose=instances?.length?evaluateRuntimePose(bundle,undefined,samples.get(time)!,false):evaluateClip(project,clip.id,samples.get(time)!,false);for(const track of active){const transform=pose.get(track.nodeId);if(transform)values.get(track.id)!.push(...transform[track.property.slice(10) as "position"|"scale"|"rotationQuat"]);}}
       const output:T.KeyframeTrack[]=[];
       for(const track of active){const object=objects.get(track.nodeId),v=values.get(track.id)!;if(!object||!v.length)continue;const property=track.property==="transform.rotationQuat"?"quaternion":track.property.slice(10);const keys=project.keyframes.filter(k=>track.keyframeIds.includes(k.id)).sort((a,b)=>a.timeSeconds-b.timeSeconds);const interpolation=keys.slice(0,-1).every(k=>k.interpolation==="step")?T.InterpolateDiscrete:T.InterpolateLinear;output.push(property==="quaternion"?new T.QuaternionKeyframeTrack(`${object.uuid}.${property}`,times,v,interpolation):new T.VectorKeyframeTrack(`${object.uuid}.${property}`,times,v,interpolation));}
       if(output.length)clips.push(new T.AnimationClip(clip.name,clip.durationSeconds,output));

@@ -5,10 +5,20 @@ import { prepareExport } from "../../src/exporters/package";
 import { exportGlb } from "../../src/exporters/glb";
 import { createMaterialAnimationProject } from "../fixtures/projects";
 import { createHash } from "node:crypto";
+import { createEditorStore } from "../../src/app/editor-store";
 
 // Browser FileReader boundary only; actual exporter and independent loader execute unchanged.
 class Reader { result:ArrayBuffer|null=null;onloadend:(()=>void)|null=null;readAsArrayBuffer(blob:Blob){void blob.arrayBuffer().then(value=>{this.result=value;this.onloadend?.();});} }
 afterEach(()=>vi.unstubAllGlobals());
+it("bakes independent instance speed and paused overrides into a scene clip",async()=>{
+  vi.stubGlobal("FileReader",Reader);const store=createEditorStore(createMaterialAnimationProject()),transform={position:[0,0,0] as const,rotationQuat:[0,0,0,1] as const,scale:[1,1,1] as const};
+  for(let i=0;i<3;i++)store.executeCommand({commandId:`add${i}`,type:"ADD_INSTANCE",targetIds:[`i${i}`],payload:{id:`i${i}`,transform}},i);
+  for(const [i,clipId,speed]of [[1,"clip-1",2],[2,null,1]]as const)store.executeCommand({commandId:`set${i}`,type:"SET_INSTANCE",targetIds:[`i${i}`],payload:{id:`i${i}`,transform,visible:true,animationOverride:{clipId,speed}}},store.getSnapshot().document.revision);
+  const prepared=await prepareExport(store.captureDocument().project,()=>undefined,"max"),output=await exportGlb(prepared.bundle,()=>undefined),loaded=await new GLTFLoader().parseAsync(await output.blob.arrayBuffer(),"");
+  const meshes:T.Mesh[]=[];loaded.scene.traverse(o=>{if(o instanceof T.Mesh)meshes.push(o);});expect(meshes).toHaveLength(3);expect(loaded.animations).toHaveLength(1);
+  const mixer=new T.AnimationMixer(loaded.scene);mixer.clipAction(loaded.animations[0]!).play();mixer.setTime(.5);
+  expect(meshes.map(m=>m.parent!.position.y)).toEqual([.25,.5,0]);mixer.stopAllAction();mixer.uncacheRoot(loaded.scene);meshes.forEach(m=>{m.geometry.dispose();(m.material as T.Material).dispose();});
+});
 it("keeps authored step transition time when the GLB sampler encodes Float32",async()=>{
   vi.stubGlobal("FileReader",Reader);const project=createMaterialAnimationProject();
   project.keyframes[0]!.interpolation="step";project.keyframes[1]!.timeSeconds=.7;project.keyframes[1]!.interpolation="step";

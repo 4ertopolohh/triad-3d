@@ -412,7 +412,7 @@ export class ViewportInteractions {
       this.gizmo.setSpace(state.tool.space);
       this.gizmo.attach(object);
     }
-    this.outline.visible = !!object && id !== state.document.project.model.rootNodeId && object.visible;
+    this.outline.visible = state.tool.mode === "model" && !!object && id !== state.document.project.model.rootNodeId && object.visible;
     this.updateOutline(object || null);
     this.syncMarkers(state);
   };
@@ -513,13 +513,13 @@ export class ViewportInteractions {
     this.orbit.update();
     const id = this.store.getSnapshot().selection.activeId;
     const rootId = this.store.getSnapshot().document.project.model.rootNodeId;
-    this.updateOutline(id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
+    this.updateOutline(this.store.getSnapshot().tool.mode === "model" && id && id !== rootId ? this.graph.objects.get(id)?.object ?? null : null);
   }
   fit(): void {
     const state = this.store.getSnapshot();
     const selected = state.selection.activeId ? this.graph.objects.get(state.selection.activeId)?.object : undefined;
     const root = this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
-    const target = selected?.visible ? selected : root;
+    const target = state.tool.mode === "scene" ? this.graph.scene.children.find(object=>object.userData.instanceLayer) ?? root : selected?.visible ? selected : root;
     if (!target) { this.reset(); return; }
     visibleBounds(target, this.bounds);
     if (this.bounds.isEmpty()) { this.reset(); return; }

@@ -11,7 +11,7 @@ describe("scene settings transactions", () => {
     const old = { ...createProject(), schemaVersion: "1.6.0" };
     old.scene.lights.push({ id: "legacy-dark-light", kind: "directional", color: [1, 1, 1], intensity: 0, position: [0, 0, 0], target: [0, 0, 0] });
     const migrated = deserializeProjectDocument(JSON.stringify(old));
-    expect(migrated).toMatchObject({ ok: true, value: { schemaVersion: "1.9.0", scene: old.scene } });
+    expect(migrated).toMatchObject({ ok: true, value: { schemaVersion: "1.10.0", scene: old.scene } });
     expect(deserializeProjectDocument(JSON.stringify({ ...old, scene: { ...old.scene, renderSettings: { exposure: 2, toneMapping: "aces" } } })).ok).toBe(false);
     if (!migrated.ok) return;
     const project = migrated.value;

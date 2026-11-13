@@ -21,6 +21,8 @@ import type { GeometryOptimizationResult } from "./optimize-geometry";
 import type { PackedGeometry } from "./packed-geometry";
 import packedGeometrySource from "./packed-geometry.ts?raw";
 import meshoptLicense from "../../node_modules/meshoptimizer/LICENSE.md?raw";
+import { expandInstances } from "./instance-project";
+import runtimePoseSource from "./runtime-pose.ts?raw";
 
 const rendererSources = import.meta.glob<string>("../renderer/{pbr-material,triplanar-material,base-color-textures,surface-textures,procedural-roughness-textures}.ts", { query: "?raw", import: "default", eager: true });
 const proceduralSources = import.meta.glob<string>("../materials/procedural/*.ts", { query: "?raw", import: "default", eager: true });
@@ -32,7 +34,6 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   const issues = validateProject(project);
   if (issues.length) throw new Error(issues.map(i => i.message).join("; "));
   if (!["max","balanced","lite"].includes(profile)) throw new Error("Неизвестный профиль экспорта.");
-  if (project.scene.instances.length) throw new Error("Экспорт экземпляров сцены ещё не поддерживается.");
   const parameterNames = new Set<string>();
   for (const parameter of parameters) {
     if (!/^[a-z][a-zA-Z0-9_]*$/.test(parameter.name) || ["width","height","speed","scale","color","playing","clipId","time","assetBaseUrl","onError","nodeOverrides","data","key","ref","constructor","prototype"].includes(parameter.name)
@@ -41,6 +42,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
         || parameter.property === "color" && typeof parameter.defaultValue === "string" && /^#[0-9a-f]{6}$/i.test(parameter.defaultValue))) throw new Error("Некорректный или повторяющийся экспортный prop.");
     parameterNames.add(parameter.name);
   }
+  const expanded=expandInstances(project);project=expanded.project;
   const files = new Map<string,Uint8Array>();
   const exportedProject:RuntimeProject=structuredClone(project),referenceAssets=new Map<string,Uint8Array>();
   const diagnostics: string[] = [];
@@ -100,7 +102,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   }
   check();
   for(const node of exportedProject.nodes)if(node.kind==="mesh"&&Object.hasOwn(geometries,node.id))node.meshSource={kind:"baked"};
-  const bundle: RuntimeBundle = { project: exportedProject, geometries, profile };
+  const bundle: RuntimeBundle = { project: exportedProject, geometries, profile,...(expanded.playback.length?{instancePlayback:expanded.playback}:{}) };
   const add = (path: string, source: string) => files.set(path,encode(source));
   const compressed=Object.keys(packedGeometries).length>0;
   add("src/model.json",json(compressed?{...bundle,geometries:Object.fromEntries(Object.entries(geometries).filter(([id])=>!Object.hasOwn(packedGeometries,id)))}:bundle));
@@ -112,12 +114,13 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   if(compressed)add("licenses/Meshoptimizer-MIT.txt",meshoptLicense);
   for(const asset of exportedProject.assets)if(asset.license)add(`licenses/asset-${asset.hash}.txt`,asset.license);
   add("src/exporters/runtime.tsx",runtimeSource);
+  add("src/exporters/runtime-pose.ts",runtimePoseSource);
   add("src/exporters/export-types.ts",exportTypes);
   add("src/domain/types.ts",`${domainTypes}\nexport type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;\n`);
   add("src/animation/timeline.ts",timelineSource.replace('"../app/editor-store"','"../domain/types"'));
   for (const [path,source] of Object.entries({ ...rendererSources,...proceduralSources })) add(`src/${path.slice(3)}`,source.replace('"../app/editor-store"','"../domain/types"'));
   const overrides: Record<string,Record<string,string>> = Object.create(null);
-  for (const p of parameters) (overrides[p.nodeId] ??= {})[p.property] = `props.${p.name} ?? ${json(p.defaultValue)}`;
+  for (const p of parameters) for(const nodeId of expanded.nodeIds[p.nodeId]??[p.nodeId])(overrides[nodeId] ??= {})[p.property] = `props.${p.name} ?? ${json(p.defaultValue)}`;
   const overrideCode = `{${Object.entries(overrides).map(([id,values]) => `[${json(id)}]:{${Object.entries(values).map(([key,value]) => `${key}:${value}`).join(",")}}`).join(",")}}`;
   const compressionImports=compressed?'import { useEffect, useState } from "react";\nimport packed from "./geometry.json";\nimport { unpackGeometries, type PackedGeometry } from "./exporters/packed-geometry";\n':"";
   const decodeHook=compressed?'const [decoded,setDecoded]=useState<RuntimeBundle|null>(null); const [error,setError]=useState(""); useEffect(()=>{let active=true; void unpackGeometries(packed as unknown as Record<string,PackedGeometry>).then(geometries=>{if(active)setDecoded({...data,geometries:{...data.geometries,...geometries}} as unknown as RuntimeBundle);}).catch(error=>{if(active)setError(String(error));}); return ()=>{active=false;};},[]); if(error)return <p role="alert">{error}</p>; if(!decoded)return <p role="status">Загрузка геометрии…</p>; ':"";
@@ -132,7 +135,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   add("export-report.json",json({profile,triangles,diagnostics,schemaVersion:project.schemaVersion}));
   const bytes = [...files.values()].reduce((sum,b) => sum+b.byteLength,0);
   if (bytes > 256*1024*1024) throw new Error("Экспорт превышает лимит 256 MiB.");
-  progress(1); return { files,diagnostics,triangles,bytes,bundle,...(optimizer||textureOptimizer?{referenceBundle:{project:structuredClone(project),geometries:optimizer?referenceGeometries:geometries,profile:"max" as const},referenceAssets}:{}) };
+  progress(1); return { files,diagnostics,triangles,bytes,bundle,...(optimizer||textureOptimizer?{referenceBundle:{project:structuredClone(project),geometries:optimizer?referenceGeometries:geometries,profile:"max" as const,...(expanded.playback.length?{instancePlayback:expanded.playback}:{})},referenceAssets}:{}) };
 }
 
 export async function createExportZip(prepared: PreparedExport, signal?: AbortSignal): Promise<Blob> {

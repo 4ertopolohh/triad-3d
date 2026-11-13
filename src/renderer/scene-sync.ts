@@ -78,8 +78,11 @@ export class SceneSync {
   private projection = new ProjectionGeometry();
   private assets = new Map<string, DeepReadonly<Project["assets"][number]>>();
   private readAsset: AssetReader = () => undefined;
+  private overrideMaterials = new Set<EditorMaterial>();
   private environment = new EnvironmentTexture(this.scene, () => this.emit());
   constructor(private report: (status: SceneStatus) => void, private decoder: AssetDecoder = decode) { this.scene.add(this.lights); }
+  createOverrideMaterial(value:Material,geometry:T.BufferGeometry):EditorMaterial {const material=this.makeMaterial(value,geometry,"Экземпляр");this.overrideMaterials.add(material);return material;}
+  releaseOverrideMaterial(material:EditorMaterial):void {if(!this.overrideMaterials.delete(material))return;this.textures.release(material);this.surfaceTextures.release(material);this.roughnessTextures.release(material);material.dispose();}
   private makeMaterial(value: DeepReadonly<Material> | undefined, geometry: T.BufferGeometry, name: string, imported = false): EditorMaterial {
     const material = imported && value?.textureMappings?.baseColor?.mode === "triplanar" ? createPhysicalMaterial(value) : ownedMaterial(value);
     editorMaterials.add(material);
@@ -125,7 +128,6 @@ export class SceneSync {
     }
     this.scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
     this.environment.sync(project.scene.background, project.assets, readAsset);
-    if (project.scene.instances.length) this.diagnostics.push("Показан предпросмотр основной модели; экземпляры сцены пока не отображаются.");
     const lightKey = JSON.stringify(project.scene.lights);
     if (lightKey !== this.lightKey) {
       this.lights.clear(); this.lightKey = lightKey;
@@ -268,6 +270,6 @@ export class SceneSync {
     errors: [...this.objects.values()].filter(e => e.error).length,
     empty: ![...this.objects.values()].some(e => e.content || e.loading), diagnostics: [...new Set([...this.diagnostics, ...(this.environment.diagnostic ? [this.environment.diagnostic] : []), ...this.textures.diagnostics(), ...this.surfaceTextures.diagnostics(), ...this.surfaces.diagnostics, ...[...this.modifierDiagnostics.values()].flat(), ...[...this.objects.values()].flatMap(e => e.error ? [e.error] : [])])] }); }
   private remove(entry: Entry): void { if (entry.content) { this.surfaces.release(entry.content); this.disposeContent(entry.content); } entry.object.removeFromParent(); entry.object.clear(); }
-  private clear(): void { this.environment.clear(); for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
+  private clear(): void { for(const material of this.overrideMaterials)this.releaseOverrideMaterial(material);this.environment.clear(); for (const entry of this.objects.values()) this.remove(entry); this.objects.clear(); this.derived.clear(); this.modifierDiagnostics.clear(); this.nodeMaterials.clear(); this.surfaces.clear(); }
   dispose(): void { if (this.closed) return; this.closed = true; this.clear(); this.textures.dispose(); this.roughnessTextures.dispose(); this.surfaceTextures.dispose(); this.surfaces.dispose(); this.lights.clear(); this.scene.clear(); }
 }
