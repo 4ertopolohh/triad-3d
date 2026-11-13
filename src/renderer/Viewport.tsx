@@ -11,6 +11,8 @@ import { ViewportInteractions, editable, brushUnavailable } from "./viewport-int
 import { brushParameters, type BrushSymmetry } from "../geometry/displace-brush";
 import { ModifierPreview } from "./modifier-preview";
 import { InstancePreview } from "./instance-preview";
+import { InteractionController } from "../animation/interaction-controller";
+import type { Project } from "../domain/types";
 import { applyMaterialPresetToNode, materialNodeReason } from "../app/material-actions";
 import { endMaterialDrag, materialDragActive, MATERIAL_PRESET_MIME, resolveMaterialDrop } from "../app/material-drag";
 
@@ -19,6 +21,9 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
   const interactions = useRef<ViewportInteractions | null>(null);
   const rendererAdapter = useRef<ThreeRendererAdapter | null>(null);
   const instancePreview = useRef<InstancePreview | null>(null);
+  const [interactivePreview,setInteractivePreview]=useState(false);
+  const interactiveRef=useRef(false);interactiveRef.current=interactivePreview;
+  const animationRef=useRef(animationPreview);animationRef.current=animationPreview;
   const [quality, setQuality] = useState<PreviewQuality>("final");
   const qualityRef = useRef(quality); qualityRef.current = quality;
   const state = useEditorStore(store);
@@ -64,15 +69,28 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
     adapter.setQuality(qualityRef.current);
     const preview = new ModifierPreview(store, adapter.graph);
     const instances = new InstancePreview(store, adapter.graph, setInteractionError);
+    let ruleController:InteractionController|undefined;
     instancePreview.current = instances;
     let generation = -1;
+    let interactionEpoch=store.getProjectEpoch();
     const sync = () => {
       const state = store.getSnapshot();
+      if(interactionEpoch!==store.getProjectEpoch()){interactionEpoch=store.getProjectEpoch();interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();}
+      if(interactiveRef.current&&(state.tool.active!=="select"||state.meshEdit.mode!=="object")){
+        // This subscriber runs before ViewportInteractions attaches the new gizmo.
+        // Temporary interaction transforms must never become a gesture's starting pose.
+        interactiveRef.current=false;setInteractivePreview(false);ruleController?.reset();
+        const project=state.document.project,animation=animationRef.current;
+        const pose=animation&&project.animations.some(c=>c.id===animation.clipId)?evaluateClip(project,animation.clipId,animation.time,false):new Map();
+        for(const node of project.nodes){const object=adapter.graph.objects.get(node.id)?.object;if(object)applyTransform(object,pose.get(node.id)??node.transform);}
+        instances.setAnimation(animation);adapter.graph.scene.updateMatrixWorld(true);
+      }
       if (generation === state.derived.generation) { instances.visibility(); return; }
       generation = state.derived.generation;
       adapter.sync(state.document.project, store.readAssetBytes, store.getProjectEpoch());
       preview.sync();
       instances.sync();
+      ruleController?.reset();
     };
     let disposed = false;
     void adapter.initialize(host.current, backendMode).then(() => {
@@ -85,11 +103,28 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       controller.setBrush(config.validBrush ? config.brushRadius : NaN,config.brushStrength,config.symmetry);
       controller.setFootprint({shape:config.brushShape,fill:config.brushFill});
       controller.setSurfaceBrush(config.brushMode === "displace" ? null : {mode:config.brushMode,color:new Color(config.brushColor).toArray() as [number,number,number],shape:config.brushShape,fill:config.brushFill,materialSlot:config.brushSlot});
-      adapter.setFrameHook(() => controller.frame());
+      ruleController=new InteractionController(canvas,adapter.graph.camera);
+      let last=performance.now(),interactiveTime=0;
+      adapter.setFrameHook(() => {
+        const now=performance.now(),delta=(now-last)/1000;last=now;
+        const state=store.getSnapshot(),project=state.document.project as Project;
+        if(interactiveRef.current&&!blockedRef.current&&state.tool.active==="select"){
+          interactiveTime+=delta;
+          const animation=animationRef.current,pose=animation&&project.animations.some(c=>c.id===animation.clipId)?evaluateClip(project,animation.clipId,animation.time,false):new Map();
+          for(const node of project.nodes){const object=adapter.graph.objects.get(node.id)?.object;if(object)applyTransform(object,pose.get(node.id)??node.transform);}
+          instances.setAnimation(animation);adapter.graph.scene.updateMatrixWorld(true);
+          const seconds=animation?.absoluteTime??animation?.time??interactiveTime;
+          const root=state.tool.mode==="model"?adapter.graph.objects.get(project.model.rootNodeId)?.object:instances.layer;
+          ruleController!.beginFrame(root?[root]:[]);
+          if(state.tool.mode==="model")ruleController!.apply("model",project.interactions??[],new Map([...adapter.graph.objects].map(([id,entry])=>[id,entry.object])),seconds,delta);
+          else instances.applyInteractions(ruleController!,seconds,delta);
+        }else interactiveTime=0;
+        ruleController?.endFrame();controller.frame();
+      });
     });
     sync();
     const unsubscribe = store.subscribe(sync);
-    return () => { disposed = true; unsubscribe(); preview.dispose(); instances.dispose(); instancePreview.current = null; interactions.current?.dispose(); interactions.current = null;
+    return () => { disposed = true; unsubscribe(); ruleController?.dispose();preview.dispose(); instances.dispose(); instancePreview.current = null; interactions.current?.dispose(); interactions.current = null;
       rendererAdapter.current = null; adapter.setFrameHook(undefined); void adapter.dispose().catch(() => { /* Detached renderer cannot publish UI errors. */ }); };
   }, [store, backendMode, attempt]);
   useEffect(() => {
@@ -103,7 +138,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
     }
     graph.scene.updateMatrixWorld(true);
     instancePreview.current?.setAnimation(animationPreview);
-  }, [animationPreview, store, state.document.revision, backendMode, attempt]);
+  }, [animationPreview, store, state.document.revision, backendMode, attempt,interactivePreview]);
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => rendererAdapter.current?.setQuality(quality), [quality]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
@@ -144,6 +179,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       notice(result.ok ? "success" : "error", result.message);
     }}>
     <div className="renderer-toolbar">
+      <button type="button" aria-pressed={interactivePreview} disabled={blocked} onClick={()=>setInteractivePreview(value=>!value)}>Интерактивный просмотр</button>
       <div className="viewport-tools" role="group" aria-label="Режим выбора">
         <button type="button" aria-pressed={!subMode} onClick={() => store.exitMeshEditMode()}>Объект</button>
         {([ ["vertex", "Вершины"], ["edge", "Рёбра"], ["face", "Грани"] ] as const).map(([editMode, label]) => <button key={editMode} type="button" aria-pressed={state.meshEdit.mode === editMode}

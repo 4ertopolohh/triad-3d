@@ -235,3 +235,7 @@ html, body { height: 100%; overflow: hidden; }
 .material-advanced fieldset label:has(input[type="checkbox"]) input { flex: 0 0 auto; }
 .source-diagnostics { max-height: 200px; overflow: auto; padding-left: 22px; }
 .export-dialog textarea { box-sizing: border-box; width: 100%; resize: vertical; }
+.interaction-editor fieldset { display: grid; gap: 8px; border: var(--border-default); margin: 8px 0; padding: 10px; min-width: 0; }
+.interaction-editor label { display: grid; gap: 4px; font-size: 12px; }
+.interaction-editor input:not([type="checkbox"]), .interaction-editor select { box-sizing: border-box; min-width: 0; width: 100%; padding: 5px; border: var(--border-default); background: var(--color-surface-base); color: var(--color-text-primary); }
+.interaction-editor label:has(input[type="checkbox"]) { display: flex; align-items: center; }

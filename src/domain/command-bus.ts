@@ -1,4 +1,5 @@
 import { surfaceStroke, validSurfaceStroke, type SurfaceStroke } from "../geometry/surface-brush";
+import { interactionError } from "../animation/interactions";
 import { applyInstanceCommand, isInstanceCommand, validInstanceCommand, type InstanceCommand } from "./instance-commands";
 import { timelineError, timelineOf, type Timeline } from "../animation/timeline";
 import type { Asset, EntityId, Material, MaterialSlot, MeshNode, MeshSource, Modifier, Node, Project, Transform, Vec3 } from "./types";
@@ -21,6 +22,7 @@ import { displaceStroke, validFootprint, type BrushFootprint, brushParameters, i
 type DeformPayload = { kind: "bend"; parameters: BendParameters } | { kind: "twist"; parameters: TwistParameters } | { kind: "taper"; parameters: TaperParameters } | { kind: "bevel"; parameters: BevelParameters };
 export type ProjectCommand =
   | InstanceCommand
+  | {commandId:string;type:"SET_INTERACTIONS";targetIds:[string];payload:{projectId:string;rules:NonNullable<Project["interactions"]>}}
   | { commandId: string; type: "SET_TIMELINE"; targetIds: [EntityId]; payload: { projectId: EntityId; timeline: Timeline } }
   | { commandId: string; type: "SET_SCENE_SETTINGS"; targetIds: [EntityId]; payload: { sceneId: EntityId; settings: SceneSettings } }
   | { commandId: string; type: "ADD_ASSET"; targetIds: [EntityId]; payload: { asset: Asset } }
@@ -69,6 +71,7 @@ export const CommandErrorCode = {
 export type CommandErrorCode = typeof CommandErrorCode[keyof typeof CommandErrorCode];
 
 export type PatchChange =
+  | {kind:"setInteractions";before:Project["interactions"];after:Project["interactions"]}
   | {kind:"setInstances";before:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]};after:{instances:Project["scene"]["instances"];snapshots:Project["modelSnapshots"]}}
   | { kind: "setTimeline"; before: Timeline; after: Timeline }
   | { kind: "setScene"; before: Project["scene"]; after: Project["scene"] }
@@ -151,6 +154,7 @@ function validCommand(value: unknown): value is ProjectCommand {
   if(isInstanceCommand(value))return validInstanceCommand(value);
   if (!ownKeys(value, ["commandId", "type", "targetIds", "payload"])) return false;
   if (value.type === "SET_TIMELINE") return ownKeys(payload, ["projectId", "timeline"]) && id(payload.projectId) && same(value.targetIds, [payload.projectId]) && timelineError(payload.timeline) === null;
+  if(value.type==="SET_INTERACTIONS")return ownKeys(payload,["projectId","rules"])&&id(payload.projectId)&&same(value.targetIds,[payload.projectId])&&Array.isArray(payload.rules)&&interactionError(payload.rules,new Set(payload.rules.map((r:unknown)=>record(r)&&typeof r.nodeId==="string"?r.nodeId:"")))===null;
   if (value.type === "SET_SCENE_SETTINGS") return ownKeys(payload, ["sceneId", "settings"]) && id(payload.sceneId)
     && same(value.targetIds, [payload.sceneId]) && sceneSettingsError(payload.settings) === null;
   if (value.type === "ADD_ASSET") {
@@ -347,6 +351,12 @@ function activeDependents(project: Project, nodeId: string): boolean {
 
 function applyCommand(project: Project, command: ProjectCommand): CommandResult | null {
   if(validInstanceCommand(command)){const error=applyInstanceCommand(project,command);return error?failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error):null;}
+  if(command.type==="SET_INTERACTIONS"){
+    const error=interactionError(command.payload.rules,new Set(project.nodes.map(n=>n.id)));
+    if(command.payload.projectId!==project.id||error)return failure(command.commandId,CommandErrorCode.INVALID_COMMAND,error??"Проект не совпадает.");
+    if(command.payload.rules.length)project.interactions=structuredClone(command.payload.rules);else delete project.interactions;
+    return null;
+  }
   if (command.type === "SET_TIMELINE") {
     if (command.payload.projectId !== project.id) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Проект не найден.");
     for (const track of [...project.tracks, ...command.payload.timeline.tracks]) {
@@ -659,11 +669,12 @@ function entityIds(project: Project): Set<string> {
     ...project.materials.map((item) => item.id), ...project.assets.map((item) => item.id),
     ...project.scene.lights.map((item) => item.id), ...project.scene.instances.map((item) => item.id),
     ...project.animations.map((item) => item.id), ...project.tracks.map((item) => item.id),
-    ...project.keyframes.map((item) => item.id),...(project.modelSnapshots??[]).map(item=>item.id)]);
+    ...project.keyframes.map((item) => item.id),...(project.modelSnapshots??[]).map(item=>item.id),...(project.interactions??[]).map(item=>item.id)]);
 }
 
 function diff(before: Project, after: Project): ProjectPatch {
   const changes: PatchChange[] = [];
+  if(!same(before.interactions,after.interactions))changes.push({kind:"setInteractions",before:structuredClone(before.interactions),after:structuredClone(after.interactions)});
   if (!same(timelineOf(before), timelineOf(after))) changes.push({ kind: "setTimeline", before: structuredClone(timelineOf(before)), after: structuredClone(timelineOf(after)) });
   const sceneAfter={...after.scene,instances:before.scene.instances};
   if (!same(before.scene, sceneAfter)) changes.push({ kind: "setScene", before: structuredClone(before.scene), after: structuredClone(sceneAfter) });
@@ -705,6 +716,7 @@ function diff(before: Project, after: Project): ProjectPatch {
 
 function inverse(patch: ProjectPatch): ProjectPatch {
   return { changes: [...patch.changes].reverse().map((change): PatchChange => {
+    if(change.kind==="setInteractions")return {kind:"setInteractions",before:structuredClone(change.after),after:structuredClone(change.before)};
     if(change.kind==="setInstances")return {kind:"setInstances",before:structuredClone(change.after),after:structuredClone(change.before)};
     if (change.kind === "setTimeline") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
     if (change.kind === "setScene") return { ...change, before: structuredClone(change.after), after: structuredClone(change.before) };
@@ -730,6 +742,7 @@ function inverse(patch: ProjectPatch): ProjectPatch {
 export function applyProjectPatch(project: Project, patch: ProjectPatch): Project {
   const result = structuredClone(project);
   for (const change of patch.changes) {
+    if(change.kind==="setInteractions"){if(!same(result.interactions,change.before))throw new Error("Patch interaction conflict");if(change.after)result.interactions=structuredClone(change.after);else delete result.interactions;continue;}
     if(change.kind==="setInstances"){
       if(!same({instances:result.scene.instances,snapshots:result.modelSnapshots},change.before))throw new Error("Patch instance conflict");
       result.scene.instances=structuredClone(change.after.instances);

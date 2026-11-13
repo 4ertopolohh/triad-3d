@@ -1,5 +1,11 @@
 # Implementation status
 
+## Layered interactions — TASK-051/052
+
+Document 1.11 adds validated event/condition/action rules, five presets, independent animation channels, priority/blending and smooth release. Inspector, frozen instances and TSX runtime share the same behavior; GLB reports omitted rules. One scene-wide hit test prevents clicks through occluders. Entering edit tools or replacing the project resets transient preview before editing. Two-axis review completed with fixes verified. Validation: lint/build, **73 files / 453 tests PASS**, normal/compressed production export harnesses and independently downloaded ZIP build PASS. Browser verified click toggle in the generated runtime and edit-mode restoration; see `interactions.md`.
+
+Checkpoint `77449b7` passed CI 43341706846 and Pages 43341748137. Physics, advanced stamps, video and final release gates remain open.
+
 ## Model instances — TASK-050
 
 Document 1.10 adds shared frozen revision snapshots, explicit preview/Sync, per-instance placement/material/animation overrides, pruning and Undo/Redo. Renderer shares geometry across 20 distinct color overrides, with separately derived UV projection variants. TSX exports frozen scene copies with remapped object props and independent animation; GLB bakes selected overrides with a loss report. Browser Sync/Undo/Redo/save/reopen passed (r2/r1 retained, no console errors), proof `qa/instances-reopened.png`; details `model-instances.md`. Two-axis review findings were fixed and re-reviewed. Validation: lint/build, full suite **71 files / 448 tests PASS**, normal and compressed production export harnesses PASS.

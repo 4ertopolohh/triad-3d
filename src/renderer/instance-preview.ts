@@ -6,6 +6,7 @@ import { snapshotProject } from "../domain/model-snapshots";
 import { ModifierEvaluator } from "../geometry/modifiers";
 import { evaluateClip } from "../animation/timeline";
 import { SceneSync, applyTransform } from "./scene-sync";
+import type { InteractionController } from "../animation/interaction-controller";
 
 type Prototype = { graph: SceneSync; project: Project; ready: boolean; pending: boolean; failed: boolean; materials:Map<string,ReturnType<SceneSync["createOverrideMaterial"]>> };
 /** Clone only scene objects; geometry, materials and textures belong to one cached prototype. */
@@ -91,6 +92,7 @@ export class InstancePreview {
     const root=this.graph.objects.get(state.document.project.model.rootNodeId)?.object;
     if(root)root.visible=!!state.document.project.nodes.find(n=>n.id===state.document.project.model.rootNodeId)?.visible&&(!scene||!state.document.project.scene.instances.length);
   }
+  applyInteractions(controller:InteractionController,time:number,delta:number):void{for(const [id,copy]of this.copies)controller.apply(id,copy.source.project.interactions??[],copy.nodes,time,delta);}
   setAnimation(preview:{clipId:string;time:number;absoluteTime?:number;wrap?:boolean}|null):void{
     this.animation=preview;
     for(const {nodes,instance,source} of this.copies.values()){

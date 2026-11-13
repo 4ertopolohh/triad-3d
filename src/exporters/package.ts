@@ -23,6 +23,9 @@ import packedGeometrySource from "./packed-geometry.ts?raw";
 import meshoptLicense from "../../node_modules/meshoptimizer/LICENSE.md?raw";
 import { expandInstances } from "./instance-project";
 import runtimePoseSource from "./runtime-pose.ts?raw";
+import interactionSource from "../animation/interactions.ts?raw";
+import interactionControllerSource from "../animation/interaction-controller.ts?raw";
+import { interactionConflicts } from "../animation/interactions";
 
 const rendererSources = import.meta.glob<string>("../renderer/{pbr-material,triplanar-material,base-color-textures,surface-textures,procedural-roughness-textures}.ts", { query: "?raw", import: "default", eager: true });
 const proceduralSources = import.meta.glob<string>("../materials/procedural/*.ts", { query: "?raw", import: "default", eager: true });
@@ -45,8 +48,8 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   const expanded=expandInstances(project);project=expanded.project;
   const files = new Map<string,Uint8Array>();
   const exportedProject:RuntimeProject=structuredClone(project),referenceAssets=new Map<string,Uint8Array>();
-  const diagnostics: string[] = [];
-  if (project.animations.length && project.modifiers.some(m => m.enabled && m.kind === "boolean")) diagnostics.push("Boolean фиксируется при экспорте: анимация резака не пересчитывает результат CSG.");
+  const diagnostics: string[] = interactionConflicts(project.interactions??[]);
+  if ((project.animations.length||project.interactions?.length) && project.modifiers.some(m => m.enabled && m.kind === "boolean")) diagnostics.push("Boolean фиксируется при экспорте: анимация и взаимодействия резака не пересчитывают результат CSG.");
   const geometries: Record<string,ExportGeometry> = Object.create(null);
   const referenceGeometries: Record<string,ExportGeometry> = Object.create(null);
   const packedGeometries:Record<string,PackedGeometry>=Object.create(null);
@@ -115,6 +118,8 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   for(const asset of exportedProject.assets)if(asset.license)add(`licenses/asset-${asset.hash}.txt`,asset.license);
   add("src/exporters/runtime.tsx",runtimeSource);
   add("src/exporters/runtime-pose.ts",runtimePoseSource);
+  add("src/animation/interactions.ts",interactionSource);
+  add("src/animation/interaction-controller.ts",interactionControllerSource);
   add("src/exporters/export-types.ts",exportTypes);
   add("src/domain/types.ts",`${domainTypes}\nexport type DeepReadonly<T> = T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T;\n`);
   add("src/animation/timeline.ts",timelineSource.replace('"../app/editor-store"','"../domain/types"'));

@@ -1,5 +1,6 @@
 import Ajv2020 from "ajv/dist/2020.js";
-import documentSchema from "./schemas/document-v1.10.schema.json";
+import documentSchema from "./schemas/document-v1.11.schema.json";
+import v110DocumentSchema from "./schemas/document-v1.10.schema.json";
 import v19DocumentSchema from "./schemas/document-v1.9.schema.json";
 import { rememberModel } from "./model-snapshots";
 import v18DocumentSchema from "./schemas/document-v1.8.schema.json";
@@ -15,7 +16,7 @@ import manifestSchema from "./schemas/manifest-v1.schema.json";
 import type { Project } from "./types";
 import { validateProject } from "./validate-project";
 
-export const DOCUMENT_SCHEMA_VERSION = "1.10.0";
+export const DOCUMENT_SCHEMA_VERSION = "1.11.0";
 export const NATIVE_FORMAT_VERSION = "1.0.0";
 export const SERIALIZATION_LIMITS = { maxJsonBytes: 16 * 1024 * 1024, maxDepth: 64, maxValues: 250_000 } as const;
 
@@ -43,6 +44,7 @@ export interface DocumentMigration {
 
 const ajv = new Ajv2020({ strict: true, allErrors: false, coerceTypes: false, removeAdditional: false, useDefaults: false });
 const documentValidator = ajv.compile(documentSchema);
+const v110DocumentValidator = ajv.compile(v110DocumentSchema);
 const v19DocumentValidator = ajv.compile(v19DocumentSchema);
 const v18DocumentValidator = ajv.compile(v18DocumentSchema);
 const v17DocumentValidator = ajv.compile(v17DocumentSchema);
@@ -156,7 +158,7 @@ const builtinMigrations: readonly DocumentMigration[] = [{ from: "1.0.0", to: "1
     const snapshot=rememberModel(project,id);for(const instance of project.scene.instances)instance.snapshotId=snapshot.id;
   }
   return project;
-} }];
+} }, {from:"1.10.0",to:"1.11.0",migrate(input){if(!v110DocumentValidator(input))throw new Error("Invalid v1.10 document");return {...input as Record<string,unknown>,schemaVersion:"1.11.0"};}}];
 
 export function migrateProjectDocument(value: unknown, migrations: readonly DocumentMigration[] = []): Result<unknown> {
   const initial = versionOf(value);

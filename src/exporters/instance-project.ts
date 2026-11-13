@@ -9,7 +9,7 @@ export function expandInstances(input:Project):{project:Project;playback:Instanc
   const project=structuredClone(input),playback:InstancePlayback[]=[];
   project.nodes=[{id:"export-root",kind:"group",name:"Сцена",parentId:null,children:[],transform:identity,visible:true,locked:false,materialSlots:[],modifierIds:[]}];
   project.model.rootNodeId="export-root";project.modifiers=[];project.materials=[];project.animations=[];project.tracks=[];project.keyframes=[];
-  delete project.modelSnapshots;project.scene.instances=[];
+  delete project.modelSnapshots;delete project.interactions;project.scene.instances=[];
   input.scene.instances.forEach((instance,index)=>{
     const snapshot=input.modelSnapshots?.find(s=>s.id===instance.snapshotId);if(!snapshot)throw new Error("Снимок экземпляра отсутствует.");
     const view=structuredClone(snapshotProject(input,snapshot)),prefix=`instance-${index}:`,id=(value:string)=>prefix+value,root=id("placement");
@@ -17,6 +17,7 @@ export function expandInstances(input:Project):{project:Project;playback:Instanc
     project.nodes.push({id:root,kind:"group",name:`Экземпляр ${index+1}`,parentId:"export-root",children:[id(view.model.rootNodeId)],transform:structuredClone(instance.transform),visible:instance.visible,locked:false,materialSlots:[],modifierIds:[]});
     // Prefix all namespaces; placement has a reserved ID independent of authored identifiers.
     const map=(value:string)=>id(`entity:${value}`);
+    if(view.interactions?.length)(project.interactions??=[]).push(...view.interactions.map(rule=>({...rule,id:map(rule.id),nodeId:map(rule.nodeId)})));
     for(const node of view.nodes)(nodeIds[node.id]??=[]).push(map(node.id));
     project.nodes.at(-1)!.children=[map(view.model.rootNodeId)];
     for(const node of view.nodes){node.id=map(node.id);node.parentId=node.parentId?map(node.parentId):root;node.children=node.children.map(map);node.modifierIds=node.modifierIds.map(map);node.materialSlots=node.materialSlots.map(s=>({...s,materialId:map(s.materialId)}));if(instance.materialOverride&&node.kind==="mesh")node.materialSlots=(node.materialSlots.length?node.materialSlots:[{name:"Материал",materialId:""}]).map(s=>({...s,materialId:id("override")}));project.nodes.push(node);}

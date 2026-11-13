@@ -9,6 +9,7 @@ import { parseBendParameters, parseTwistParameters, parseTaperParameters } from 
 import { validateMaterial } from "./validate-material";
 import { sceneExtensionsError } from "./scene-settings";
 import { snapshotProject } from "./model-snapshots";
+import { interactionError } from "../animation/interactions";
 
 export type ValidationCode =
   | "DUPLICATE_ID"
@@ -27,6 +28,7 @@ export interface ValidationIssue {
 
 export function validateProject(project: Project): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
+  const rulesError=interactionError(project.interactions??[],new Set(project.nodes.map(n=>n.id)));if(rulesError)issues.push({code:"INVALID_STRUCTURE",path:"interactions",message:rulesError});
   for(const asset of project.assets)if(asset.license!==undefined&&(typeof asset.license!=="string"||!asset.license.trim()||asset.license.length>16384))issues.push({code:"INVALID_STRUCTURE",path:`assets.${asset.id}.license`,message:"Лицензия ресурса должна содержать 1–16384 символа."});
   const animationError = timelineError(timelineOf(project));
   if (animationError) issues.push({ code: "INVALID_STRUCTURE", path: "animations", message: animationError });
@@ -52,6 +54,7 @@ export function validateProject(project: Project): ValidationIssue[] {
   register(project.model.id, "model.id");
   finite(project.model.revision, "model.revision");
   register(project.scene.id, "scene.id");
+  for(const rule of project.interactions??[])register(rule.id,`interactions.${rule.id}`);
   for (const [index, node] of project.nodes.entries()) register(node.id, `nodes[${index}].id`);
   for (const [index, modifier] of project.modifiers.entries()) register(modifier.id, `modifiers[${index}].id`);
   for (const [index, material] of project.materials.entries()) register(material.id, `materials[${index}].id`);

@@ -4,8 +4,8 @@ import source from "./static-runtime.tsx?raw";
 
 export function singleFileExport(bundle: RuntimeBundle): {code:string; reason?:never} | {code?:never; reason:string} {
   const project = bundle.project;
-  if (project.assets.length || project.animations.length || project.scene.instances.length || project.materials.some(m => m.proceduralMaps || Object.values(m.textureSlots ?? {}).length))
-    return {reason:"Копируемый фрагмент поддерживает статическую модель без ресурсов и процедурных карт. Для анимации, текстур и процедур используйте ZIP с полным runtime."};
+  if (project.assets.length || project.animations.length || project.scene.instances.length || project.interactions?.length || project.materials.some(m => m.proceduralMaps || Object.values(m.textureSlots ?? {}).length))
+    return {reason:"Копируемый фрагмент поддерживает статическую модель без ресурсов и процедурных карт. Для анимации, взаимодействий, текстур и процедур используйте ZIP с полным runtime."};
   const snapshot: StaticSnapshot = {
     nodes:project.nodes.map(n => ({id:n.id,parentId:n.parentId,visible:n.visible,position:[...n.transform.position],rotation:[...n.transform.rotationQuat],scale:[...n.transform.scale],materials:n.materialSlots.map(s => s.materialId)})),
     geometries:bundle.geometries, materials:project.materials.map(m=>({...m,baseColor:[...m.baseColor],emissive:[...m.emissive]})), lights:project.scene.lights.map(l=>({...l,color:[...l.color],position:[...l.position],target:[...l.target]})),

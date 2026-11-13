@@ -23,6 +23,7 @@ export interface Project {
   tracks: Track[];
   keyframes: Keyframe[];
   modelSnapshots?: ModelSnapshot[];
+  interactions?: InteractionRule[];
 }
 
 export interface Model {
@@ -87,6 +88,14 @@ export interface ModelSnapshot {
   animations: AnimationClip[];
   tracks: Track[];
   keyframes: Keyframe[];
+  interactions?: InteractionRule[];
+}
+
+export interface InteractionRule {
+  id:EntityId;nodeId:EntityId;name:string;enabled:boolean;priority:number;blend:"additive"|"override";weight:number;releaseSeconds:number;
+  event:"pointer"|"click"|"time"|"proximity";
+  condition:{kind:"always"}|{kind:"distance"|"timeRange";min:number;max:number};
+  action:{kind:"magnet"|"click-toggle"|"hover-reveal"|"orbit-follow"|"pulse";radius:number;strength:number;frequency:number};
 }
 
 export interface GroupNode {

@@ -10,6 +10,7 @@ import { BaseColorTextures } from "../renderer/base-color-textures";
 import { SurfaceTextures } from "../renderer/surface-textures";
 import { ProceduralRoughnessTextures } from "../renderer/procedural-roughness-textures";
 import { evaluateRuntimePose } from "./runtime-pose";
+import { InteractionController } from "../animation/interaction-controller";
 import type { RuntimeBundle } from "./export-types";
 import type { Material, Transform } from "../domain/types";
 
@@ -28,6 +29,7 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
     const host = mount.current; if (!host) return;
     const project = data.project;
     const abort = new AbortController(); let disposed = false, elapsed = 0, last = 0;
+    let interactions:InteractionController|undefined;
     const renderer = new WebGPURenderer({ antialias: data.profile !== "lite", forceWebGL: true });
     const scene = new T.Scene(); const model = new T.Group(); scene.add(model);
     scene.background = new T.Color(...project.scene.background.color).multiplyScalar(project.scene.background.intensity);
@@ -115,9 +117,11 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
       }
       await renderer.init(); if (disposed) { void renderer.dispose(); return; }
       host.appendChild(renderer.domElement); resize();
+      interactions=new InteractionController(renderer.domElement,camera);
       renderer.setAnimationLoop((now: number) => {
         if (disposed) return;
         const control = controls.current;
+        const delta=last?Math.max(0,(now-last)/1000):0;
         if (last && control.playing && Number.isFinite(control.speed) && control.speed >= 0 && control.speed <= 100) elapsed += (now-last)/1000*control.speed;
         last = now;
         const seconds = control.time !== undefined && Number.isFinite(control.time) ? control.time : elapsed;
@@ -133,11 +137,12 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
               if ("color" in m && m.color instanceof T.Color) m.color.set(override.color!);
           });
         }
+        scene.updateMatrixWorld(true);interactions!.beginFrame([model]);interactions!.apply("runtime",project.interactions??[],objects,seconds,delta);interactions!.endFrame();
         renderer.render(scene,camera);
       });
     })().catch(error => { if (!disposed) fail(error instanceof Error ? error.message : String(error)); });
     function cleanupResources() { base.dispose(); surface.dispose(); roughness.dispose(); textures.forEach(t => t.dispose()); materials.forEach(m => m.dispose()); geometries.forEach(g => g.dispose()); textures.clear(); materials.clear(); geometries.clear(); }
-    return () => { disposed = true; abort.abort(); observer.disconnect(); renderer.setAnimationLoop(null); cleanupResources(); renderer.domElement.remove(); void renderer.dispose(); };
+    return () => { disposed = true; abort.abort(); interactions?.dispose();observer.disconnect(); renderer.setAnimationLoop(null); cleanupResources(); renderer.domElement.remove(); void renderer.dispose(); };
   }, [data,assetBaseUrl,assetUrls]);
   return <div style={{ width,height,position:"relative" }}><div ref={mount} style={{width:"100%",height:"100%"}} />{error && <p role="alert" style={{position:"absolute",top:0}}>{error}</p>}</div>;
 }

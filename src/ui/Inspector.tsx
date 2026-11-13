@@ -6,6 +6,7 @@ import type { Node } from "../domain/types";
 import { primitiveDefinitions, type PrimitiveSource } from "../geometry/primitives";
 import { BooleanEditor } from "./BooleanEditor";
 import { MaterialInspector } from "./MaterialInspector";
+import { InteractionEditor } from "./InteractionEditor";
 import { accessReason, displayTransform, eulerDegrees, mixedValue, parseNumber, prepareFlagCommands, prepareTransformCommands, sessionCurrent, updatedPrimitiveSource, type Axis, type EditSession, type TransformField } from "./inspector-logic";
 
 const selectionKey = (state: EditorState) => state.selection.ids.join("\u0000");
@@ -136,6 +137,7 @@ export function Inspector({ store, state, blocked }: { store: EditorStore; state
         {mesh && mesh.meshSource.kind !== "asset" && <MeshEditActions store={store} state={state} node={mesh} blocked={blocked} />}
       </section>
       <MaterialInspector store={store} state={state} />
+      {nodes.length===1&&nodes[0]&&<InteractionEditor store={store} state={state} nodeId={nodes[0].id} disabled={disabled}/>}
       {state.meshEdit.mode !== "object" && <VertexEditor key={`${epoch === store.getProjectEpoch() ? project.id : "new"}:${state.meshEdit.nodeId}`} store={store} state={state} blocked={blocked} />}
       {nodes.length === 1 && nodes[0]?.kind === "mesh" && <BooleanEditor key={nodes[0].id} store={store} project={project} target={nodes[0]} disabled={blocked || state.tool.mode !== "model"} reason={modeReason || accessReason(project, nodes[0])} />}
     </>}
