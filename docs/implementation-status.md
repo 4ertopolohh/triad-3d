@@ -1,5 +1,11 @@
 # Implementation status
 
+## Export optimization — TASK-060
+
+Opt-in export-only attribute-aware Meshopt weld/simplify/compress, matching runtime decoder, WebP color conversion, original/result comparison and measured loss report are implemented. Domain remains untouched; computed runtime mesh sources use a separate baked marker rather than duplicated source arrays. Empty Boolean and large index stream regressions are covered. Lint/build and full suite **68 files / 440 tests PASS**. Browser Worker/WebP/Meshopt-decode comparison passed without console errors. Details and limits: `export-optimization.md`; proof `qa/optimization.png` and `.json`. Review findings about producer/decoder limits and duplicate editable source arrays were fixed and re-reviewed. Production dependency audit after compatible updates: 0 findings; development minimatch advisory remains (10 dependent moderate entries), no forced major dependency downgrade applied.
+
+Published checkpoint `f4161c2` (source importer, GLB and packs) passed Windows/Ubuntu CI 43331646655 and Pages 43331666820; public smoke confirmed import-code/packs controls. Optimization is a subsequent checkpoint.
+
 ## GLB export and material packs — TASK-056 / TASK-058
 
 Validation: lint, typecheck/build and full suite **67 files / 432 tests PASS**; targeted duplicate-JPEG regression also passed. Browser pack proof: `qa/material-pack.png`.

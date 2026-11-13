@@ -1,5 +1,6 @@
 import { singleFileExport } from "../exporters/single-file";
 import { GlbExport } from "./GlbExport";
+import { optimizeGeometryInWorker, optimizeTextureInWorker } from "../exporters/optimization-client";
 import { useEffect, useMemo, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
 import type { Project } from "../domain/types";
@@ -17,13 +18,14 @@ export function ExportDialog({ store, onClose }: { store: EditorStore; onClose: 
   const [result, setResult] = useState<{ prepared: PreparedExport; blob: Blob; revision: number } | null>(null);
   const [parameters,setParameters] = useState<ExportParameter[]>([]);
   const [error, setError] = useState("");
+  const [optimize,setOptimize]=useState(false);
   async function prepare() {
     setResult(null); setError("");
     let output: { prepared: PreparedExport; blob: Blob; revision: number } | null = null;
     const outcome = await store.jobs.run({ id: crypto.randomUUID(), name: "Подготовка TSX/ZIP", cancellable: true, validate: () => null,
       compute: async (input, signal, progress) => {
         try {
-          const prepared = await prepareExport(structuredClone(input.project) as Project,store.readAssetBytes,profile,signal,p => progress(p*.8),parameters);
+          const prepared = await prepareExport(structuredClone(input.project) as Project,store.readAssetBytes,profile,signal,p => progress(p*.8),parameters,optimize?(geometry,signal)=>optimizeGeometryInWorker(geometry,{ratio:.5,error:.01},signal):undefined,optimize?optimizeTextureInWorker:undefined);
           const blob = await createExportZip(prepared,signal); signal.throwIfAborted();
           output = { prepared,blob,revision: input.revision }; progress(1);
           return { ok: true, value: true };
@@ -37,6 +39,7 @@ export function ExportDialog({ store, onClose }: { store: EditorStore; onClose: 
     <label>Профиль<select aria-label="Профиль экспорта" value={profile} disabled={busy} onChange={e => { setProfile(e.target.value as ExportProfile); setResult(null); }}><option value="max">Max — разрешение до 2×</option><option value="balanced">Balanced — до 1,5×</option><option value="lite">Lite — 1× без сглаживания</option></select></label>
     <p>React-компонент, исходники runtime, ресурсы и готовый Vite-проект. Геометрия модификаторов фиксируется при экспорте. Профили меняют качество растра; исходная модель сохраняется.</p>
     <p>Props: размер, масштаб, цвет, скорость, клип, воспроизведение и время. Инструкции подключения входят в ZIP.</p>
+    <label><input type="checkbox" disabled={busy} checked={optimize} onChange={e=>{setOptimize(e.target.checked);setResult(null);}} />Оптимизировать копию экспорта</label><p>Meshopt: цель 50% треугольников, бюджет ошибки 0,01 с учётом атрибутов; швы ограничивают сокращение. Цветовые карты: WebP 0,9, до 2048 px. Числовые PBR-карты и GLB-ресурсы сохраняются. Проверьте отчёт и сравнение перед скачиванием.</p>
     <details><summary>Параметры объектов</summary><p>Выбранные props доступны в React-компоненте. Масштаб умножает исходный; цвет заменяет основной цвет материала.</p>
       {state.document.project.nodes.filter(n => n.kind === "mesh").map((node,index) => <div key={node.id}><strong>{node.name}</strong>{(["scale","color"] as const).map(property => {
         const selected = parameters.find(p => p.nodeId === node.id && p.property === property);
@@ -58,8 +61,9 @@ export function ExportDialog({ store, onClose }: { store: EditorStore; onClose: 
 function ExportPreview({prepared,parameters}: {prepared:PreparedExport; parameters:ExportParameter[]}) {
   const [open,setOpen] = useState(false);
   const [urls,setUrls] = useState<Record<string,string> | null>(null);
+  const [referenceUrls,setReferenceUrls]=useState<Record<string,string>|null>(null);
   const [time,setTime] = useState(0);
-  const reference = useMemo<RuntimeBundle>(() => ({...prepared.bundle,profile:"max"}),[prepared]);
+  const reference = useMemo<RuntimeBundle>(() => prepared.referenceBundle??({...prepared.bundle,profile:"max"}),[prepared]);
   const overrides = useMemo(() => {
     const values: Record<string,{scale?:number; color?:string}> = Object.create(null);
     for (const p of parameters) { const value = values[p.nodeId] ??= {}; if (p.property === "scale") value.scale = Number(p.defaultValue); else value.color = String(p.defaultValue); }
@@ -69,11 +73,14 @@ function ExportPreview({prepared,parameters}: {prepared:PreparedExport; paramete
     const next: Record<string,string> = Object.create(null);
     for (const asset of prepared.bundle.project.assets) { const bytes = prepared.files.get(`public/${asset.path}`); if (bytes) next[asset.id] = URL.createObjectURL(new Blob([bytes.slice().buffer],{type:asset.mediaType})); }
     setUrls(next);
-    return () => Object.values(next).forEach(url => URL.revokeObjectURL(url));
+    const original:Record<string,string>=Object.assign(Object.create(null),next);
+    for(const asset of prepared.referenceBundle?.project.assets??[]){const bytes=prepared.referenceAssets?.get(asset.id);if(bytes)original[asset.id]=URL.createObjectURL(new Blob([bytes.slice().buffer],{type:asset.mediaType}));}
+    setReferenceUrls(original);
+    return () => new Set([...Object.values(next),...Object.values(original)]).forEach(url => URL.revokeObjectURL(url));
   },[prepared]);
-  return <details onToggle={e => setOpen(e.currentTarget.open)}><summary>Сравнить Max и выбранный профиль</summary><p>Одна подготовленная геометрия, материалы и камера; одинаковое время анимации. Это сравнение профилей экспорта.</p>
+  return <details onToggle={e => setOpen(e.currentTarget.open)}><summary>Сравнить Max и выбранный профиль</summary><p>{prepared.referenceBundle?"Слева исходная подготовленная геометрия, справа результат оптимизации. ":"Одна подготовленная геометрия. "}Одинаковые материалы, камера и время анимации.</p>
     <label>Время<input aria-label="Время сравнения экспорта" type="range" min="0" max={prepared.bundle.project.animations[0]?.durationSeconds ?? 1} step=".01" value={time} onChange={e => setTime(Number(e.target.value))} /></label>
-    {open && urls && <div style={{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:8}}><div>Max<TriadRuntime data={reference} assetUrls={urls} height={240} playing={false} time={time} nodeOverrides={overrides} /></div><div>{prepared.bundle.profile}<TriadRuntime data={prepared.bundle} assetUrls={urls} height={240} playing={false} time={time} nodeOverrides={overrides} /></div></div>}
+    {open && urls && referenceUrls && <div style={{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:8}}><div>Max<TriadRuntime data={reference} assetUrls={referenceUrls} height={240} playing={false} time={time} nodeOverrides={overrides} /></div><div>{prepared.bundle.profile}<TriadRuntime data={prepared.bundle} assetUrls={urls} height={240} playing={false} time={time} nodeOverrides={overrides} /></div></div>}
   </details>;
 }
 

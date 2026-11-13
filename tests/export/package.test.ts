@@ -1,8 +1,48 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { prepareExport } from "../../src/exporters/package";
 import { createMaterialAnimationProject } from "../fixtures/projects";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { optimizeGeometry } from "../../src/exporters/optimize-geometry";
+import { unpackGeometries } from "../../src/exporters/packed-geometry";
+
+it("retains original comparison assets and skips images shared with numeric PBR slots",async()=>{
+  const bytes=new Uint8Array(await readFile(new URL("../assets/sample.png",import.meta.url))),hash=[...new Uint8Array(await crypto.subtle.digest("SHA-256",bytes))].map(n=>n.toString(16).padStart(2,"0")).join("");
+  const project=createMaterialAnimationProject(),asset={id:"image",hash,path:`assets/${hash}.png`,mediaType:"image/png",colorSpace:"srgb" as const};project.assets.push(asset);
+  project.materials[0]!.textureSlots={baseColor:"image"};project.materials[0]!.textureAssetIds=["image"];
+  const optimize=vi.fn(async()=>({asset,bytes,report:"fixture"}));
+  const result=await prepareExport(project,()=>bytes,"max",undefined,undefined,[],undefined,optimize);
+  expect(optimize).toHaveBeenCalledOnce();expect(result.referenceAssets!.get("image")).toEqual(bytes);
+  project.materials[0]!.textureSlots.normal="image";optimize.mockClear();
+  const shared=await prepareExport(project,()=>bytes,"max",undefined,undefined,[],undefined,optimize);
+  expect(optimize).not.toHaveBeenCalled();expect(shared.files.get(`public/${asset.path}`)).toEqual(bytes);
+});
+
+it("keeps a true reference bundle when optimizing only the exported copy",async()=>{
+  const project=createMaterialAnimationProject(),node=project.nodes.find(n=>n.id==="mesh-node")!;
+  if(node.kind!=="mesh")throw new Error("fixture");
+  node.meshSource={kind:"primitive",primitive:"sphere",parameters:{radius:1,widthSegments:64,heightSegments:32}};
+  const before=structuredClone(project);
+  const output=await prepareExport(project,()=>undefined,"balanced",undefined,undefined,[],geometry=>optimizeGeometry(geometry,{ratio:.5,error:.01}));
+  expect(project).toEqual(before);expect(output.referenceBundle).toBeDefined();
+  expect(output.bundle.geometries["mesh-node"]!.indices!.length).toBeLessThan(output.referenceBundle!.geometries["mesh-node"]!.indices!.length);
+  const unpacked=await unpackGeometries(JSON.parse(new TextDecoder().decode(output.files.get("src/geometry.json"))));
+  expect(unpacked).toEqual(output.bundle.geometries);
+  expect(JSON.parse(new TextDecoder().decode(output.files.get("src/model.json"))).geometries).toEqual({});
+  expect(output.bundle.project.nodes.find(n=>n.id==="mesh-node")).toMatchObject({meshSource:{kind:"baked"}});
+  if(process.env.TRIAD_OPTIMIZED_EXPORT)for(const [path,bytes]of output.files){const target=join(process.env.TRIAD_OPTIMIZED_EXPORT,path);await mkdir(dirname(target),{recursive:true});await writeFile(target,bytes);}
+});
+
+it("does not retain duplicate editable arrays in the runtime document",async()=>{
+  const project=createMaterialAnimationProject(),node=project.nodes.find(n=>n.id==="mesh-node")!;
+  if(node.kind!=="mesh")throw new Error("fixture");
+  node.meshSource={kind:"editable",positions:[0,0,0,1,0,0,0,1,0],indices:[0,1,2]};
+  const prepared=await prepareExport(project,()=>undefined,"max");
+  const saved=JSON.parse(new TextDecoder().decode(prepared.files.get("src/model.json")));
+  expect(saved.project.nodes.find((n:{id:string})=>n.id==="mesh-node").meshSource).toEqual({kind:"baked"});
+  expect(saved.geometries["mesh-node"].positions).toEqual(node.meshSource.positions);
+  expect(node.meshSource.kind).toBe("editable");
+});
 
 it("packages actual geometry, surface runtime, animation and standalone sources deterministically", async () => {
   const project = createMaterialAnimationProject();

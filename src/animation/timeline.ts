@@ -68,7 +68,7 @@ export function cubicEasing(t: number, curve: readonly number[] = [.42, 0, .58, 
 }
 
 /** Absolute evaluation; never integrates a previous pose or mutates Project. */
-export function evaluateClip(project: DeepReadonly<Project>, clipId: string, seconds: number, wrap = true): Map<string, Transform> {
+export function evaluateClip(project: DeepReadonly<Timeline & {nodes:{id:string;transform:Transform}[]}>, clipId: string, seconds: number, wrap = true): Map<string, Transform> {
   if (!Number.isFinite(seconds)) throw new Error("Время должно быть конечным.");
   const clip = project.animations.find(c => c.id === clipId);
   if (!clip) throw new Error("Клип не найден.");

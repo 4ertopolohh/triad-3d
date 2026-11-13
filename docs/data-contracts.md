@@ -2,6 +2,8 @@
 
 Current document version: **1.9.0**, schema `src/domain/schemas/document-v1.9.schema.json`. Version 1.8 is strictly validated before the version-only migration. Optional `Asset.license` stores 1–16384 characters of provenance/license text; it is preserved in native archives and material packs. ZIP formatVersion remains 1.0.0. Historical version sections below describe their introduction points.
 
+Runtime export is a separate derived contract: `RuntimeProject` replaces computed mesh sources with `{kind:"baked"}` and stores geometry once in the bundle or Meshopt streams. This marker is never accepted in native Project documents. The animation evaluator depends only on node IDs/transforms and timeline data.
+
 ## Native `.triad3d` container (TASK-010A)
 
 The native file is a ZIP with exactly one `manifest.json`, one `document.json`, and zero or more `assets/<sha256>.<ext>` entries. New documents use `schemaVersion: "1.8.0"`; the unchanged ZIP container uses `formatVersion: "1.0.0"` and `appVersion`. Each declared asset ID and path must match the document metadata, and both metadata and entry bytes must have the declared SHA-256. Supported binary filename extensions are `png`, `jpg`, `jpeg`, `webp`, `hdr`, `exr`, `glb`, and `bin`; decoding/importing these resources belongs to later tasks. No history, selection, UI state, cache, or persistent session data is stored.
