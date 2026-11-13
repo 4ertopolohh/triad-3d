@@ -17,7 +17,7 @@ run("npm", ["exec", "vitest", "run", "tests/export/prepare.test.ts"], root, {
 });
 const generated = await readFile(join(isolated, "src", "TriadModel.tsx"), "utf8");
 if (/from\s+["'][^"']*(?:src\/domain|src\/ui|triad-3d)/.test(generated)) throw new Error("Generated component imports editor internals");
-run("npm", ["ci", "--no-audit", "--no-fund"], isolated);
+run("npm", ["ci", "--prefer-offline", "--no-audit", "--no-fund"], isolated);
 run("npm", ["run", "typecheck"], isolated);
 run("npm", ["run", "build"], isolated);
 await stat(join(isolated, "dist", "index.html"));

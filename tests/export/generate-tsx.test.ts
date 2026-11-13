@@ -90,7 +90,9 @@ describe("TASK-004 TSX export spike", () => {
 
   it("typechecks and builds the generated component outside the repository", () => {
     execFileSync(process.execPath, ["scripts/check-export-harness.mjs"], {
-      cwd: process.cwd(), stdio: "inherit", timeout: 180_000,
+      // Includes a fresh npm installation, not only compilation; Windows cold installs
+      // exceeded two minutes in release QA. Keep a bounded five-minute integration budget.
+      cwd: process.cwd(), stdio: "inherit", timeout: 300_000,
     });
-  }, 200_000);
+  }, 320_000);
 });

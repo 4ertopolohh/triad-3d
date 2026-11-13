@@ -1,3 +1,4 @@
+import type { StampParameters } from "../geometry/modifiers/stamp";
 import { PhysicsController } from "../animation/physics-controller";
 import { Color } from "three";
 import { evaluateClip } from "../animation/timeline";
@@ -31,6 +32,8 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
   const [snap, setSnap] = useState(false);
   const [radiusText, setRadiusText] = useState("0.35");
   const [strengthText, setStrengthText] = useState("0.06");
+  const [stampShape,setStampShape]=useState<StampParameters["shape"]>("hole");
+  const stampRef=useRef(stampShape);stampRef.current=stampShape;
   const [brushMode,setBrushMode] = useState<"displace" | "paint" | "material">("displace");
   const [brushColor,setBrushColor] = useState("#e56040");
   const [brushShape,setBrushShape] = useState<"round" | "box">("round");
@@ -99,7 +102,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
       const canvas = adapter.canvas;
       if (disposed || !canvas) return;
       const controller = new ViewportInteractions(adapter.graph, canvas, store, setInteractionError, blockedRef.current);
-      controller.setSnap(snapRef.current);
+      controller.setSnap(snapRef.current);controller.setStampShape(stampRef.current);
       interactions.current = controller;
       const config = brushConfig.current;
       controller.setBrush(config.validBrush ? config.brushRadius : NaN,config.brushStrength,config.symmetry);
@@ -146,6 +149,7 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
   useEffect(() => interactions.current?.setBlocked(blocked), [blocked]);
   useEffect(() => rendererAdapter.current?.setQuality(quality), [quality]);
   useEffect(() => interactions.current?.setSnap(snap), [snap]);
+  useEffect(()=>interactions.current?.setStampShape(stampShape),[stampShape]);
   useEffect(() => { interactions.current?.setBrush(validBrush ? brushRadius : NaN, brushStrength, symmetry); }, [validBrush, brushRadius, brushStrength, symmetry]);
   const canTransform = editable(state, state.selection.activeId, blocked);
   const subMode = state.meshEdit.mode !== "object";
@@ -195,6 +199,10 @@ export function Viewport({ store, mode, blocked, notice, animationPreview = null
         {([ ["select", "Выбор (Esc)"], ["move", "Переместить (G)"], ["rotate", "Вращать (R)"], ["scale", "Масштабировать (S)"] ] as const).map(([tool, label]) =>
           <button key={tool} type="button" title={label} aria-label={label} aria-pressed={state.tool.active === tool}
             disabled={subMode || tool !== "select" && !canTransform} onClick={() => store.setTool({ active: tool })}>{label.split(" (")[0]}</button>)}
+      </div>
+      <div className="viewport-tools" role="group" aria-label="Процедурные штампы">
+        <button type="button" aria-pressed={state.tool.active==="stamp"} disabled={blocked||subMode||!canTransform||activeNode?.kind!=="mesh"||activeNode.meshSource.kind==="asset"} onClick={()=>store.setTool({active:state.tool.active==="stamp"?"select":"stamp"})}>Кисть штампов</button>
+        {state.tool.active==="stamp"&&<><select aria-label="Вид штампа" value={stampShape} onChange={e=>setStampShape(e.target.value as StampParameters["shape"])}><option value="hole">Отверстие</option><option value="dent">Углубление</option><option value="spike">Шип</option></select><label>Радиус штампа<input type="number" value={radiusText} onChange={e=>setRadiusText(e.target.value)}/></label><label>Глубина / высота<input type="number" min="0.005" max="5" step="0.01" value={Number(strengthText)*10} onChange={e=>setStrengthText(String(Number(e.target.value)/10))}/></label><span>Кликните по поверхности выбранного mesh. Повторения, seed и зеркало — в стеке.</span></>}
       </div>
       <div className="viewport-tools" role="group" aria-label="Кисть рельефа">
         <button type="button" aria-pressed={state.tool.active === "displace"} disabled={!!brushReason || !validBrush}

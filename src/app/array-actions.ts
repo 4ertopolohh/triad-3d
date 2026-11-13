@@ -1,5 +1,5 @@
-import { createCommandBus, type ProjectCommand } from "../domain/command-bus";
-import type { Project } from "../domain/types";
+import { checkedModifierChange } from "./checked-modifier-change";
+import { type ProjectCommand } from "../domain/command-bus";
 import { ModifierEvaluator } from "../geometry/modifiers";
 import type { ArrayParameters } from "../geometry/modifiers/types";
 import type { EditorStore } from "./editor-store";
@@ -19,6 +19,7 @@ export async function applyArrayChange(store: EditorStore, change: ArrayChange, 
   const target = project.nodes.find(node => node.id === change.targetId);
   const id = crypto.randomUUID();
   if (!target || target.kind !== "mesh") return failure(id, "Выберите один mesh.");
+  if(change.type!=="add"){const modifier=project.modifiers.find(m=>m.id===change.modifierId);if(!modifier||modifier.nodeId!==target.id||modifier.kind!=="array")return failure(id,"Модификатор не принадлежит выбранному объекту или имеет другой тип.");}
   const commandId = crypto.randomUUID();
   let command: ProjectCommand;
   if (change.type === "add") {
@@ -28,29 +29,5 @@ export async function applyArrayChange(store: EditorStore, change: ArrayChange, 
   else if (change.type === "enable") command = { commandId, type: "SET_MODIFIER_ENABLED", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, enabled: change.enabled } };
   else if (change.type === "move") command = { commandId, type: "MOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId, toIndex: change.toIndex } };
   else command = { commandId, type: "REMOVE_MODIFIER", targetIds: [change.modifierId], payload: { modifierId: change.modifierId } };
-  const commands = [command];
-  let candidate: Project;
-  try {
-    const bus = createCommandBus(structuredClone(project) as Project);
-    const prepared = bus.executeTransaction(commands, bus.getRevision(), id);
-    if (!prepared.ok) return failure(id, `${prepared.code}: ${prepared.message}${prepared.issues?.[0] ? ` ${prepared.issues[0].message}` : ""}`);
-    if (!prepared.changed) return { ok: true, id, status: "succeeded", committed: false };
-    candidate = prepared.project;
-  } catch (error) { return failure(id, error instanceof Error ? error.message : "Не удалось проверить массив."); }
-  const candidateTarget = candidate.nodes.find(node => node.id === target.id);
-  if (candidateTarget?.kind === "mesh" && !candidateTarget.modifierIds.some(modifierId => candidate.modifiers.find(item => item.id === modifierId)?.enabled)) {
-    const committed = store.executeTransaction(commands, snapshot.document.revision, id);
-    return committed.ok ? { ok: true, id, status: "succeeded", committed: committed.changed } : failure(id, committed.message);
-  }
-  const evaluator = evaluatorFactory();
-  try {
-    return await store.jobs.run({
-      id, name: "Проверка массива", cancellable: true,
-      validate: input => input.revision === snapshot.document.revision && input.projectId === project.id ? null : { code: "STALE_PROJECT", message: "Проект изменился до вычисления." },
-      compute: async (_input, signal) => {
-        const result = await evaluator.evaluate(candidate, target.id, signal);
-        return result.ok ? { ok: true as const, value: commands } : { ok: false as const, error: { code: "COMPUTE_FAILED" as const, message: `${result.error.code}: ${result.error.message}` } };
-      }, commands: value => value,
-    });
-  } finally { evaluator.dispose(); }
+  return checkedModifierChange(store,target.id,[command],"Проверка массива",evaluatorFactory);
 }

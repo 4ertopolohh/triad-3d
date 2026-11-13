@@ -1,5 +1,11 @@
 # Implementation status
 
+## Procedural stamps — TASK-055
+
+Schema 1.13 adds editable seeded hole/dent/spike generators, projected repetitions and mirrors. All updates and dependent Boolean stacks validate before one reversible commit. Shared derived crease normals keep editor and export consistent. Review fixes cover closest-hit projection, cancellation, ownership and Enter-key modal behavior. Browser editing and native golden reopen passed in WebGPU and WebGL2. Validation: lint/build, **77 files / 469 tests PASS**, normal/compressed production export harnesses PASS. Legacy isolated npm harness required a five-minute installation/build budget on this Windows host; completed in the final full run. Profile and limitations: `procedural-stamps.md`.
+
+Physics checkpoint `158cc9f` passed CI 43348255786 and Pages 43348258022. Video, format compatibility and final release gates remain open.
+
 ## Physics — TASK-053
 
 Schema 1.12 adds reversible validated actor configuration and frozen snapshot/export support. Lazy Rapier handles dynamic/static/kinematic bodies, fixed 60 Hz stepping, explicit colliders, mass/restitution/friction and scoped contact events. Editor restores authored poses before editing; TSX exposes onCollision and documents controlled-time behavior. Review findings (scene fallback, conflicting rules, parent scale and encoding) were fixed and re-reviewed. Browser floor/sphere simulation and edit restoration passed without console errors. Validation: lint/build, full suite **76 files / 459 tests PASS**, normal/compressed production harnesses PASS; an additional conflict regression is covered by the final targeted rerun. Details and limits: `physics.md`.

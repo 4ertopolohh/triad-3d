@@ -1,3 +1,4 @@
+import { StampItem } from "./StampEditor";
 import { useState } from "react";
 import { applyBooleanChange, booleanOperandReason, type BooleanChange } from "../app/boolean-actions";
 import type { DeepReadonly, EditorStore } from "../app/editor-store";
@@ -46,6 +47,7 @@ export function BooleanEditor({ store, project, target, disabled, reason }: { st
     {!stack.length && <p className="panel-hint">Модификаторов пока нет.</p>}
     {stack.map((modifier, index) => {
       if (!modifier) return null;
+      if (modifier.kind === "stamp") return <StampItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={targetReason||""}/>;
       if (modifier.kind === "array") return <ArrayItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={reason} />;
       if (modifier.kind === "mirror") return <MirrorItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled} reason={target.meshSource.kind === "asset" ? "Mirror для импортированного GLB пока недоступен: нет resolver геометрии." : reason} />;
       if (modifier.kind === "bend" || modifier.kind === "twist" || modifier.kind === "taper" || modifier.kind === "bevel") return <DeformItem key={modifier.id} store={store} targetId={target.id} modifier={modifier} index={index} length={stack.length} disabled={disabled || store.getSnapshot().meshEdit.mode !== "object"} reason={target.meshSource.kind === "asset" ? "Деформации импортированного GLB пока недоступны: нет resolver геометрии." : store.getSnapshot().meshEdit.mode !== "object" ? "Вернитесь к режиму объектов." : reason} />;

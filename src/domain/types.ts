@@ -134,7 +134,7 @@ export type MeshSource =
 export interface Modifier {
   id: EntityId;
   nodeId: EntityId;
-  kind: "boolean" | "mirror" | "array" | "bend" | "twist" | "taper" | "bevel";
+  kind: "stamp" | "boolean" | "mirror" | "array" | "bend" | "twist" | "taper" | "bevel";
   order: number;
   enabled: boolean;
   version: number;

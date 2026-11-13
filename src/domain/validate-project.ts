@@ -1,3 +1,4 @@
+import { parseStampParameters } from "../geometry/modifiers/stamp";
 import { physicsError } from "./physics-config";
 import { timelineError, timelineOf } from "../animation/timeline";
 import type { EntityId, Keyframe, Light, Node, Project } from "./types";
@@ -212,6 +213,10 @@ export function validateProject(project: Project): ValidationIssue[] {
     for (const [name, value] of Object.entries(modifier.parameters)) {
       if (typeof value === "number") finite(value, `modifiers.${modifier.id}.parameters.${name}`);
       else if (Array.isArray(value)) value.forEach((component, index) => finite(component, `modifiers.${modifier.id}.parameters.${name}[${index}]`));
+    }
+    if (modifier.kind === "stamp") {
+      try { parseStampParameters(modifier.parameters); }
+      catch (error) { issues.push({ code: "INVALID_STRUCTURE", path: `modifiers.${modifier.id}.parameters`, message: error instanceof Error ? error.message : "Некорректные параметры штампа." }); }
     }
     if (modifier.kind === "array") {
       try { parseArrayParameters(modifier.parameters); }

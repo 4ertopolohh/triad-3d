@@ -1,3 +1,4 @@
+import { parseStampParameters, type StampParameters } from "../geometry/modifiers/stamp";
 import { physicsError } from "./physics-config";
 import { surfaceStroke, validSurfaceStroke, type SurfaceStroke } from "../geometry/surface-brush";
 import { interactionError } from "../animation/interactions";
@@ -50,7 +51,9 @@ export type ProjectCommand =
   | { commandId: string; type: "DELETE_NODE"; targetIds: [EntityId]; payload: { nodeId: EntityId } }
   | { commandId: string; type: "ADD_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
   | { commandId: string; type: "UPDATE_BOOLEAN_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { modifierId: EntityId; operation: BooleanParameters["operation"]; cutterNodeId: EntityId } }
+  | { commandId: string; type: "ADD_STAMP_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: StampParameters } }
   | { commandId: string; type: "ADD_ARRAY_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: ArrayParameters } }
+  | { commandId: string; type: "UPDATE_STAMP_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: StampParameters } }
   | { commandId: string; type: "UPDATE_ARRAY_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: ArrayParameters } }
   | { commandId: string; type: "ADD_MIRROR_MODIFIER"; targetIds: [EntityId, EntityId]; payload: { nodeId: EntityId; modifierId: EntityId; parameters: MirrorParameters } }
   | { commandId: string; type: "UPDATE_MIRROR_MODIFIER"; targetIds: [EntityId]; payload: { modifierId: EntityId; parameters: MirrorParameters } }
@@ -184,6 +187,12 @@ function validCommand(value: unknown): value is ProjectCommand {
   if (value.type === "UPDATE_BOOLEAN_MODIFIER") return ownKeys(payload, ["modifierId", "operation", "cutterNodeId"])
     && id(payload.modifierId) && id(payload.cutterNodeId) && booleanOperation(payload.operation)
     && same(value.targetIds, [payload.modifierId, payload.cutterNodeId]);
+  if (value.type === "ADD_STAMP_MODIFIER" || value.type === "UPDATE_STAMP_MODIFIER") {
+    try { parseStampParameters(payload.parameters); } catch { return false; }
+    return value.type === "ADD_STAMP_MODIFIER"
+      ? ownKeys(payload, ["nodeId", "modifierId", "parameters"]) && id(payload.nodeId) && id(payload.modifierId) && same(value.targetIds, [payload.nodeId, payload.modifierId])
+      : ownKeys(payload, ["modifierId", "parameters"]) && id(payload.modifierId) && same(value.targetIds, [payload.modifierId]);
+  }
   if (value.type === "ADD_ARRAY_MODIFIER" || value.type === "UPDATE_ARRAY_MODIFIER") {
     try { parseArrayParameters(payload.parameters); } catch { return false; }
     return value.type === "ADD_ARRAY_MODIFIER"
@@ -524,7 +533,7 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     project.nodes.push(structuredClone(node));
     return null;
   }
-  if (command.type === "ADD_ARRAY_MODIFIER" || command.type === "ADD_MIRROR_MODIFIER" || command.type === "ADD_DEFORM_MODIFIER") {
+  if (command.type === "ADD_STAMP_MODIFIER" || command.type === "ADD_ARRAY_MODIFIER" || command.type === "ADD_MIRROR_MODIFIER" || command.type === "ADD_DEFORM_MODIFIER") {
     const { nodeId, modifierId, parameters } = command.payload;
     const target = nodeById(project, nodeId);
     if (!target || target.kind !== "mesh") return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор требует существующий mesh.");
@@ -534,8 +543,8 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     const last = project.modifiers.find(item => item.id === target.modifierIds.at(-1));
     const order = last ? last.order + 1 : 0;
     if (!Number.isSafeInteger(order)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Порядок стека переполнен.");
-    project.modifiers.push({ id: modifierId, nodeId, kind: command.type === "ADD_ARRAY_MODIFIER" ? "array" : command.type === "ADD_MIRROR_MODIFIER" ? "mirror" : command.payload.kind, order, enabled: true, version: 0,
-      parameters: structuredClone(command.type === "ADD_ARRAY_MODIFIER" ? parseArrayParameters(parameters) : command.type === "ADD_MIRROR_MODIFIER" ? parseMirrorParameters(parameters) : parseDeform(command.payload.kind, parameters)) });
+    project.modifiers.push({ id: modifierId, nodeId, kind: command.type === "ADD_STAMP_MODIFIER" ? "stamp" : command.type === "ADD_ARRAY_MODIFIER" ? "array" : command.type === "ADD_MIRROR_MODIFIER" ? "mirror" : command.payload.kind, order, enabled: true, version: 0,
+      parameters: structuredClone(command.type === "ADD_STAMP_MODIFIER" ? parseStampParameters(parameters) : command.type === "ADD_ARRAY_MODIFIER" ? parseArrayParameters(parameters) : command.type === "ADD_MIRROR_MODIFIER" ? parseMirrorParameters(parameters) : parseDeform(command.payload.kind, parameters)) });
     target.modifierIds.push(modifierId);
     return null;
   }
@@ -553,7 +562,7 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
     target.modifierIds.push(modifierId);
     return null;
   }
-  if (command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "UPDATE_ARRAY_MODIFIER" || command.type === "UPDATE_MIRROR_MODIFIER" || command.type === "UPDATE_DEFORM_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
+  if (command.type === "UPDATE_STAMP_MODIFIER" || command.type === "UPDATE_BOOLEAN_MODIFIER" || command.type === "UPDATE_ARRAY_MODIFIER" || command.type === "UPDATE_MIRROR_MODIFIER" || command.type === "UPDATE_DEFORM_MODIFIER" || command.type === "SET_MODIFIER_ENABLED"
     || command.type === "MOVE_MODIFIER" || command.type === "REMOVE_MODIFIER") {
     const modifier = project.modifiers.find(item => item.id === command.payload.modifierId);
     if (!modifier) return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Модификатор не найден.");
@@ -562,7 +571,14 @@ function applyCommand(project: Project, command: ProjectCommand): CommandResult 
       return failure(command.commandId, CommandErrorCode.INVALID_REFERENCE, "Стек модификатора не найден.");
     const block = blocked(project, target);
     if (block) return failure(command.commandId, block, "Целевой mesh недоступен для редактирования.");
-    if (command.type === "UPDATE_ARRAY_MODIFIER") {
+    if (command.type === "UPDATE_STAMP_MODIFIER") {
+      if (modifier.kind !== "stamp") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является штампом.");
+      const parameters = parseStampParameters(command.payload.parameters);
+      if (!same(parseStampParameters(modifier.parameters), parameters)) {
+        if (!bump(modifier)) return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Версия модификатора переполнена.");
+        modifier.parameters = structuredClone(parameters);
+      }
+    } else if (command.type === "UPDATE_ARRAY_MODIFIER") {
       if (modifier.kind !== "array") return failure(command.commandId, CommandErrorCode.INVALID_COMMAND, "Модификатор не является массивом.");
       const parameters = parseArrayParameters(command.payload.parameters);
       if (!same(parseArrayParameters(modifier.parameters), parameters)) {

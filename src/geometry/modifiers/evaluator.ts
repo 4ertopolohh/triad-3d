@@ -1,3 +1,4 @@
+import { parseStampParameters, stampMeshes } from "./stamp";
 import { Matrix4, Quaternion, Vector3 } from "three";
 import type { MeshNode, Modifier, Node, Project } from "../../domain/types";
 import { primitiveGeometry } from "../../renderer/primitive";
@@ -208,6 +209,20 @@ export class ModifierEvaluator {
           stage = { ...stage, mesh: output, key, attributes: {}, warnings, applied: [...stage.applied, modifier.id] };
           this.write(stage); progress?.(stage);
           continue;
+        }
+        if(modifier.kind==="stamp"){
+          const params=parseStampParameters(modifier.parameters),key=stable([stage.key,modifier.id,modifier.version,modifier.order,params]);
+          const cached=this.read(key);if(cached){stage=cached;progress?.(stage);continue;}
+          const matrix=new Matrix4().toArray();
+          for(const cutter of await stampMeshes(params,stage.mesh,ctx.signal)){
+            this.check(ctx.signal,ctx.epoch);
+            if(stage.empty)throw new EvaluationFailure("GEOMETRY_DEGENERATE","Штамп удалил весь объём; уменьшите размеры.",nodeId,modifier.id);
+            const result=await this.runner.run({jobId:`stamp-${++this.nextJob}`,operation:params.shape==="spike"?"union":"subtract",target:{mesh:cloneMesh(stage.mesh),worldMatrix:matrix,attributes:stage.attributes},cutter:{mesh:cutter,worldMatrix:matrix,attributes:{}}},ctx.signal);
+            this.check(ctx.signal,ctx.epoch);this.checkProject(ctx,nodeId);validateMesh(result.output,result.empty);
+            if(result.coordinateSpace!=="target-local"||result.empty)throw new EvaluationFailure("GEOMETRY_DEGENERATE","Штамп удалил весь объём или вернул некорректный результат.",nodeId,modifier.id);
+            stage={...stage,mesh:cloneMesh(result.output),attributes:{},warnings:[...stage.warnings,...result.warnings],empty:false};
+          }
+          stage={...stage,key,applied:[...stage.applied,modifier.id]};this.write(stage);progress?.(stage);continue;
         }
         if (modifier.kind === "array") {
           let params;

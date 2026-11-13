@@ -1,3 +1,4 @@
+import { derivedGeometry } from "../geometry/derived-geometry";
 import { SurfaceTextures } from "./surface-textures";
 import * as T from "three";
 import type { DeepReadonly } from "../app/editor-store";
@@ -235,13 +236,10 @@ export class SceneSync {
     if (!entry) return;
     validateMesh(mesh, empty);
     if (empty !== (mesh.indices.length === 0)) throw new Error("Некорректный пустой результат Boolean.");
-    const geometry = new T.BufferGeometry();
+    const geometry = derivedGeometry(mesh);
     let content: T.Mesh | undefined;
     try {
       if (!empty) {
-        geometry.setAttribute("position", new T.BufferAttribute(mesh.positions.slice(), 3));
-        geometry.setIndex(new T.BufferAttribute(mesh.indices.slice(), 1));
-        geometry.computeVertexNormals();
         content = new T.Mesh(geometry);
         this.projection.applyMesh(content, this.nodeMaterials.get(nodeId)?.textureMappings?.baseColor);
         content.material = this.makeMaterial(this.nodeMaterials.get(nodeId), content.geometry, nodeId);

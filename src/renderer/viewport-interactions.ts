@@ -1,3 +1,5 @@
+import { applyStampChange } from "../app/stamp-actions";
+import { stampPlacements, type StampParameters } from "../geometry/modifiers/stamp";
 import type { SurfaceStroke } from "../geometry/surface-brush";
 import { recordingPose } from "../app/recording-pose";
 import { checkedTransform, transformNeedsEvaluation } from "../app/checked-transform";
@@ -183,7 +185,20 @@ export class ViewportInteractions {
     if (this.drag) { this.restore(this.drag); this.drag = null; this.gizmo.dragging = false; this.gizmo.axis = null; this.orbit.enabled = true; }
     if (message) this.report(message);
   }
+  private stampShape:StampParameters["shape"]="hole";
+  setStampShape(shape:StampParameters["shape"]):void{this.stampShape=shape;}
   private onPointerDown = (event: PointerEvent) => {
+    if(this.store.getSnapshot().tool.active==="stamp"){
+      event.stopImmediatePropagation();this.down=null;
+      const state=this.store.getSnapshot(),id=state.selection.activeId;
+      if(event.button!==0||!id||!editable(state,id,this.blocked)||state.tool.mode!=="model"||!this.brushValid)return;
+      if(this.brushStrength<=0){this.report("Глубина / высота штампа должна быть положительной.");return;}
+      const hit=this.brushHit(event),node=state.document.project.nodes.find(n=>n.id===id),wrapper=this.graph.objects.get(id)?.object;
+      if(!hit||!wrapper||node?.kind!=="mesh"||node.meshSource.kind==="asset")return;
+      const normal=hit.normalWorld.clone().applyMatrix3(new T.Matrix3().setFromMatrix4(wrapper.matrixWorld).transpose()).normalize();
+      void applyStampChange(this.store,{type:"add",targetId:id,parameters:{shape:this.stampShape,center:hit.pointNodeLocal.toArray(),normal:normal.toArray(),radius:this.brushRadius,depth:Math.max(.005,Math.abs(this.brushStrength)*10),count:1,spread:0,seed:1,mirror:"off"}}).then(result=>this.report(result.ok?null:result.error.message));
+      return;
+    }
     if (this.store.getSnapshot().tool.active === "displace") {
       event.stopImmediatePropagation();
       if (event.button !== 0 || this.stroke || !this.brushValid) return;
@@ -257,7 +272,19 @@ export class ViewportInteractions {
     this.brushPoints.geometry.setDrawRange(0, affected.length + centers.length);
     this.brushPoints.geometry.computeBoundingSphere();
   }
+  private showStamp(hit:SurfaceHit|null):void{
+    this.clearBrushPreview();
+    if(!hit||!this.brushValid||this.brushStrength<=0||!editable(this.store.getSnapshot(),hit.nodeId,this.blocked))return;
+    const wrapper=this.graph.objects.get(hit.nodeId)?.object;if(!wrapper)return;
+    const normal=hit.normalWorld.clone().applyMatrix3(new T.Matrix3().setFromMatrix4(wrapper.matrixWorld).transpose()).normalize();
+    const placements=stampPlacements({shape:this.stampShape,center:hit.pointNodeLocal.toArray(),normal:normal.toArray(),radius:this.brushRadius,depth:Math.max(.005,Math.abs(this.brushStrength)*10),count:1,spread:0,seed:1,mirror:"off"});
+    const points:number[]=[];
+    for(const placement of placements){const rotation=new T.Quaternion().setFromUnitVectors(new T.Vector3(0,1,0),new T.Vector3(...placement.normal));for(let i=0;i<48;i++){const angle=i*Math.PI/24,point=new T.Vector3(Math.cos(angle)*this.brushRadius,0,Math.sin(angle)*this.brushRadius).applyQuaternion(rotation).add(new T.Vector3(...placement.center));points.push(...point.toArray());}}
+    const geometry=new T.BufferGeometry();geometry.setAttribute("position",new T.Float32BufferAttribute(points,3));
+    this.brushPoints=new T.Points(geometry,new T.PointsMaterial({color:0xff9a24,size:3,sizeAttenuation:false,depthTest:false,depthWrite:false,toneMapped:false}));this.brushPoints.raycast=()=>{};this.brushPoints.renderOrder=1001;wrapper.add(this.brushPoints);
+  }
   private onPointerMove = (event: PointerEvent) => {
+    if(this.store.getSnapshot().tool.active==="stamp"){this.showStamp(this.brushHit(event));return;}
     if (this.store.getSnapshot().tool.active !== "displace") return;
     const hit = this.brushHit(event);
     if (!this.stroke) { this.showBrush(!this.brushValid || brushUnavailable(this.store.getSnapshot(), this.blocked) ? null : hit); return; }
@@ -344,7 +371,7 @@ export class ViewportInteractions {
   };
   private onPointerCancel = () => { this.down = null; this.gizmoPress = false; this.cancel(this.stroke ? "Мазок отменён." : "Преобразование отменено."); };
   private onKeyDown = (event: KeyboardEvent) => {
-    if (this.store.getSnapshot().tool.active === "displace") {
+    if (["displace","stamp"].includes(this.store.getSnapshot().tool.active)) {
       if (event.key === "Escape") { if (this.stroke) this.cancel("Мазок отменён."); else this.store.setTool({ active: "select" }); event.preventDefault(); }
       else if (["g", "r", "s", "Delete"].includes(event.key)) event.preventDefault();
       return;
@@ -398,16 +425,16 @@ export class ViewportInteractions {
     if (this.stroke && (state.document.revision !== this.stroke.revision || this.store.getProjectEpoch() !== this.stroke.epoch
       || state.tool.active !== "displace" || state.selection.activeId !== this.stroke.id || brushUnavailable(state, this.blocked)))
       this.cancel("Мазок отменён: состояние проекта изменилось.");
-    if (state.tool.active !== "displace" || brushUnavailable(state, this.blocked)) this.clearBrushPreview();
+    if (state.tool.active === "stamp" || state.tool.active !== "displace" || brushUnavailable(state, this.blocked)) this.clearBrushPreview();
     if (this.drag && (state.document.revision !== this.drag.revision || this.store.getProjectEpoch() !== this.drag.epoch
       || state.tool.active !== this.drag.tool || state.tool.space !== this.drag.space
       || state.selection.activeId !== this.drag.id || !editable(state, this.drag.id, this.blocked)))
       this.cancel("Изменение отменено: состояние проекта изменилось.");
     const id = state.selection.activeId;
     const object = id && this.graph.objects.get(id)?.object;
-    this.gizmo.enabled = state.tool.active !== "displace";
+    this.gizmo.enabled = state.tool.active !== "displace" && state.tool.active !== "stamp";
     this.gizmo.detach();
-    if (object && state.meshEdit.mode === "object" && editable(state, id, this.blocked) && state.tool.active !== "select" && state.tool.active !== "displace") {
+    if (object && state.meshEdit.mode === "object" && editable(state, id, this.blocked) && state.tool.active !== "select" && state.tool.active !== "displace" && state.tool.active !== "stamp") {
       this.gizmo.setMode(state.tool.active === "move" ? "translate" : state.tool.active === "rotate" ? "rotate" : "scale");
       this.gizmo.setSpace(state.tool.space);
       this.gizmo.attach(object);

@@ -161,7 +161,7 @@ describe("baseColor projection", () => {
     project.materials[0]!.textureMappings = { baseColor: { mode: "planar", axis: "y", tiling: [2, 1], offset: [1, 0] } };
     sync.sync(project, () => undefined);
     expect(sync.objects.get("mesh-node")!.content).toBe(content);
-    expect([...content.geometry.getAttribute("uv").array]).toEqual([1, 0, 3, 0, 1, 0, 1, 1]);
+    expect([...content.geometry.getAttribute("uv").array]).toEqual([...indices].flatMap(i => [[1,0],[3,0],[1,0],[1,1]][i]!));
     project.materials[0]!.textureMappings.baseColor = { mode: "box", tiling: [2, 1], offset: [1, 0] };
     sync.sync(project, () => undefined);
     expect(sync.objects.get("mesh-node")!.content).toBe(content);

@@ -8,7 +8,7 @@ it("stores physics configuration atomically with native roundtrip and Undo/Redo"
   const store = createEditorStore(createMaterialAnimationProject()), before = store.captureDocument().project;
   expect(store.executeCommand({ commandId: "physics", type: "SET_PHYSICS", targetIds: [before.id], payload: { projectId: before.id, actors: [actor] } }, 0).ok).toBe(true);
   const saved = serializeProjectDocument(store.captureDocument().project); expect(saved.ok).toBe(true);
-  if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: { schemaVersion: "1.12.0", physics: [actor] } });
+  if (saved.ok) expect(deserializeProjectDocument(saved.value)).toMatchObject({ ok: true, value: { schemaVersion: "1.13.0", physics: [actor] } });
   expect(store.undo(1).ok).toBe(true); expect(store.captureDocument().project).toEqual(before);
   expect(store.redo(2).ok).toBe(true); expect(store.captureDocument().project.physics).toEqual([actor]);
 });

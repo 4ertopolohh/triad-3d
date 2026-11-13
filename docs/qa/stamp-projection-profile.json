@@ -1,0 +1,9 @@
+{
+  "inputTriangles": 49600,
+  "cutters": 31,
+  "elapsedMs": 1621.527399999999,
+  "timerTicks": 31,
+  "maxTimerGapMs": 108.41359999999986,
+  "node": "v24.21.0",
+  "platform": "win32"
+}

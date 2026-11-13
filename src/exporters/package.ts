@@ -1,3 +1,4 @@
+import { derivedGeometry } from "../geometry/derived-geometry";
 import rapierLicense from "../../node_modules/@dimforge/rapier3d-compat/LICENSE?raw";
 import { physicsConflicts } from "../domain/physics-config";
 import physicsSource from "../animation/physics.ts?raw";
@@ -71,7 +72,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
           if (node.modifierIds.some(id => project.modifiers.find(m => m.id === id)?.enabled)) {
             const result = await evaluator.evaluate(project,node.id,signal);
             if (!result.ok) throw new Error(`${node.name}: ${result.error.message}`);
-            geometry = new T.BufferGeometry(); geometry.setAttribute("position",new T.BufferAttribute(result.mesh.positions,3)); geometry.setIndex(new T.BufferAttribute(result.mesh.indices,1)); geometry.computeVertexNormals();
+            geometry = derivedGeometry(result.mesh);
             diagnostics.push(...result.warnings.map(w => `${node.name}: ${w.message}`));
           } else if (node.meshSource.kind === "primitive") geometry = primitiveGeometry(node.meshSource);
           else if (node.meshSource.kind === "editable") geometry = editableGeometry(node.meshSource);
