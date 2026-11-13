@@ -14,5 +14,6 @@
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "qa/**/*.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "qa/**/*.ts", "qa/**/*.tsx", "vite.config.ts"],
+  "exclude": ["**/node_modules/**", "**/dist/**"]
 }

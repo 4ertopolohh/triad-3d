@@ -1,0 +1,9 @@
+{
+  "name": "triad-pathtracer-experiment",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"dev":"vite --host 127.0.0.1 --port 5183", "build":"vite build"},
+  "dependencies": {"three":"0.186.1", "three-mesh-bvh":"0.9.16", "three-gpu-pathtracer":"0.0.27", "xatlas-web":"0.1.0"},
+  "devDependencies": {"vite":"8.3.4"}
+}

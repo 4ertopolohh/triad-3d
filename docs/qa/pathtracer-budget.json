@@ -1,0 +1,10 @@
+{
+  "status": "TIME_BUDGET",
+  "samples": 0,
+  "elapsedMs": 60030,
+  "resolution": "400×300",
+  "three": "186",
+  "pathtracer": "0.0.27",
+  "backend": "WebGL2",
+  "fallback": "Raster remains available"
+}

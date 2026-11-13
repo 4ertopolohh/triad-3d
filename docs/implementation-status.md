@@ -1,5 +1,9 @@
 # Implementation status
 
+## Final-render experiment — TASK-059
+
+Isolated pinned WebGLPathTracer comparison against the exported material golden is implemented and built. Cold attempt: 0 samples/60s and raster fallback; repeat: 32 samples/5666ms, visible noise; cancellation: 1.5 samples/1491ms and raster retained. No production pathtracer integration is claimed; Final remains raster. See `pathtracer-experiment.md` for evidence, review fixes and acceptance conditions.
+
 ## Export optimization — TASK-060
 
 Opt-in export-only attribute-aware Meshopt weld/simplify/compress, matching runtime decoder, WebP color conversion, original/result comparison and measured loss report are implemented. Domain remains untouched; computed runtime mesh sources use a separate baked marker rather than duplicated source arrays. Empty Boolean and large index stream regressions are covered. Lint/build and full suite **68 files / 440 tests PASS**. Browser Worker/WebP/Meshopt-decode comparison passed without console errors. Details and limits: `export-optimization.md`; proof `qa/optimization.png` and `.json`. Review findings about producer/decoder limits and duplicate editable source arrays were fixed and re-reviewed. Production dependency audit after compatible updates: 0 findings; development minimatch advisory remains (10 dependent moderate entries), no forced major dependency downgrade applied.
