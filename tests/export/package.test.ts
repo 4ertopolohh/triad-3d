@@ -50,7 +50,7 @@ it("packages actual geometry, surface runtime, animation and standalone sources 
   project.interactions=[{id:"pulse",nodeId:"mesh-node",name:"Пульсация",enabled:true,priority:0,blend:"additive",weight:1,releaseSeconds:.1,event:"time",condition:{kind:"always"},action:{kind:"pulse",radius:3,strength:1,frequency:1}}];
   project.materials[0]!.proceduralMaps = { height: { kind: "stone",seed: 1,scale: 4,intensity: .5,resolution:128,strength:.1 } };
   const before = structuredClone(project);
-  const parameters = [{name:"cubeSize",nodeId:"mesh-node",property:"scale" as const,defaultValue:2}];
+  const parameters = [{name:"capture",nodeId:"mesh-node",property:"scale" as const,defaultValue:2}];
   const result = await prepareExport(project,() => undefined,"balanced",undefined,undefined,parameters);
   expect(project).toEqual(before);
   expect(result.triangles).toBe(12);
@@ -59,7 +59,7 @@ it("packages actual geometry, surface runtime, animation and standalone sources 
   expect(result.files.has("src/materials/procedural/generate.ts")).toBe(true);
   expect(new TextDecoder().decode(result.files.get("src/animation/timeline.ts"))).not.toContain("editor-store");
   const again = await prepareExport(project,() => undefined,"balanced",undefined,undefined,parameters);
-  expect(new TextDecoder().decode(result.files.get("src/TriadModel.tsx"))).toContain("cubeSize?: number");
+  expect(new TextDecoder().decode(result.files.get("src/TriadModel.tsx"))).toContain("capture?: number");
   expect(again.files).toEqual(result.files);
   if (process.env.TRIAD_PRODUCTION_EXPORT) for (const [path,bytes] of result.files) { const target = join(process.env.TRIAD_PRODUCTION_EXPORT,path); await mkdir(dirname(target),{recursive:true}); await writeFile(target,bytes); }
 });

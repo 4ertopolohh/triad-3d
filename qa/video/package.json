@@ -1,0 +1,6 @@
+{
+  "name":"triad-video-fallback-experiment","version":"0.0.0","private":true,"type":"module",
+  "scripts":{"dev":"vite --host 127.0.0.1 --port 5185","build":"vite build"},
+  "dependencies":{"@ffmpeg/ffmpeg":"0.12.15","@ffmpeg/core":"0.12.10"},
+  "devDependencies":{"vite":"8.3.4"}
+}

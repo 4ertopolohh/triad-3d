@@ -1,3 +1,4 @@
+import { parameterOverrides } from "../../src/exporters/parameter-overrides";
 import { expect, it } from "vitest";
 import { createMaterialAnimationProject } from "../fixtures/projects";
 import { createEditorStore } from "../../src/app/editor-store";
@@ -14,6 +15,7 @@ it("exports frozen instance geometry with independent animation speed and paused
   expect(validateProject(expanded.project)).toEqual([]);
   const exported=await prepareExport(project,()=>undefined,"max",undefined,undefined,[{name:"cubeSize",nodeId:"mesh-node",property:"scale",defaultValue:2}]);
   expect(project).toEqual(before);expect(exported.bundle.project.scene.instances).toEqual([]);expect(exported.bundle.project.modelSnapshots).toBeUndefined();expect(exported.triangles).toBe(36);
+  expect(Object.keys(parameterOverrides([{name:"size",nodeId:"mesh-node",property:"scale",defaultValue:2}],exported.parameterNodeIds))).toEqual(["instance-0:entity:mesh-node","instance-1:entity:mesh-node","instance-2:entity:mesh-node"]);
   const pose=evaluateRuntimePose(exported.bundle,"clip-1",.5,false);
   expect(pose.get("instance-0:entity:mesh-node")!.position[1]).toBe(.25);
   expect(pose.get("instance-1:entity:mesh-node")!.position[1]).toBe(.5);

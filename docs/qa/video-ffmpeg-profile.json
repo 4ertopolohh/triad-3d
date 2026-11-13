@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "loadMs": 534.7000000178814,
+  "encodeMs": 3596.4000000059605,
+  "totalMs": 4131.100000023842,
+  "bytes": 218827,
+  "expectedFrames": 300,
+  "expectedDuration": 10,
+  "crossOriginIsolated": false,
+  "sharedArrayBuffer": false,
+  "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+}

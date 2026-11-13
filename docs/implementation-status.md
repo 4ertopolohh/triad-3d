@@ -1,5 +1,11 @@
 # Implementation status
 
+## Video export — TASK-057
+
+Fixed-step timeline capture shares the TSX renderer and waits for textures. WebCodecs VP9/WebM and optional AVC/MP4 use configuration probes, cancellable jobs and RAM-only output. Actual downloaded files both passed ffprobe: 10 seconds, 300 frames, 30 FPS at 640×360; cancellation and configured prop defaults passed browser checks. Isolated single-thread FFmpeg WASM spike also encoded a verified ten-second test file; adoption limits are explicit in `video-export.md`. Review fixes isolate the internal capture prop and preserve parameter mapping across instances. Validation: lint/build, **79 files / 474 tests PASS**, standalone/normal/compressed TSX harnesses PASS.
+
+Stamp checkpoint `b43049c` passed CI 43353668899 and Pages 43353671910. Remaining work: format compatibility and expanded release acceptance.
+
 ## Procedural stamps — TASK-055
 
 Schema 1.13 adds editable seeded hole/dent/spike generators, projected repetitions and mirrors. All updates and dependent Boolean stacks validate before one reversible commit. Shared derived crease normals keep editor and export consistent. Review fixes cover closest-hit projection, cancellation, ownership and Enter-key modal behavior. Browser editing and native golden reopen passed in WebGPU and WebGL2. Validation: lint/build, **77 files / 469 tests PASS**, normal/compressed production export harnesses PASS. Legacy isolated npm harness required a five-minute installation/build budget on this Windows host; completed in the final full run. Profile and limitations: `procedural-stamps.md`.

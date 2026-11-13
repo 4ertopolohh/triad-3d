@@ -1,5 +1,7 @@
 import { singleFileExport } from "../exporters/single-file";
 import { GlbExport } from "./GlbExport";
+import { parameterOverrides } from "../exporters/parameter-overrides";
+import { VideoExport } from "./VideoExport";
 import { optimizeGeometryInWorker, optimizeTextureInWorker } from "../exporters/optimization-client";
 import { useEffect, useMemo, useState } from "react";
 import type { EditorStore } from "../app/editor-store";
@@ -52,6 +54,7 @@ export function ExportDialog({ store, onClose }: { store: EditorStore; onClose: 
       const url = URL.createObjectURL(result.blob); const link = document.createElement("a"); link.href = url; link.download = "triad-model.zip"; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
     }}>Скачать ZIP</button></>}
     {result && <GlbExport key={result.revision+profile} store={store} prepared={result.prepared} disabled={busy||result.revision!==state.document.revision} />}
+    {result && <VideoExport key={"video"+result.revision+profile} parameters={parameters} store={store} prepared={result.prepared} disabled={busy||result.revision!==state.document.revision} />}
     {error && <p role="alert">{error}</p>}
     {busy ? <button onClick={() => store.jobs.cancelJob()}>Отменить экспорт</button> : <button onClick={onClose}>Закрыть</button>}
   </section></div>;
@@ -64,11 +67,7 @@ function ExportPreview({prepared,parameters}: {prepared:PreparedExport; paramete
   const [referenceUrls,setReferenceUrls]=useState<Record<string,string>|null>(null);
   const [time,setTime] = useState(0);
   const reference = useMemo<RuntimeBundle>(() => prepared.referenceBundle??({...prepared.bundle,profile:"max"}),[prepared]);
-  const overrides = useMemo(() => {
-    const values: Record<string,{scale?:number; color?:string}> = Object.create(null);
-    for (const p of parameters) { const value = values[p.nodeId] ??= {}; if (p.property === "scale") value.scale = Number(p.defaultValue); else value.color = String(p.defaultValue); }
-    return values;
-  },[parameters]);
+  const overrides = useMemo(() => parameterOverrides(parameters,prepared.parameterNodeIds),[parameters,prepared.parameterNodeIds]);
   useEffect(() => {
     const next: Record<string,string> = Object.create(null);
     for (const asset of prepared.bundle.project.assets) { const bytes = prepared.files.get(`public/${asset.path}`); if (bytes) next[asset.id] = URL.createObjectURL(new Blob([bytes.slice().buffer],{type:asset.mediaType})); }

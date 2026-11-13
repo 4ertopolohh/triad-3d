@@ -70,6 +70,7 @@ export class BaseColorTextures {
   releaseObject(root: T.Object3D): void {
     root.traverse(object => { if (object instanceof T.Mesh) for (const material of Array.isArray(object.material) ? object.material : [object.material]) this.release(material); });
   }
+  async ready(): Promise<void> { await Promise.all([...this.entries.values()].map(entry => entry.pending)); }
   diagnostics(): string[] { return [...this.entries.values()].flatMap(entry => entry.error ? [entry.error] : []); }
   dispose(): void { for (const material of [...this.owners.keys()]) this.release(material); }
 }

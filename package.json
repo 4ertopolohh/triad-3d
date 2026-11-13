@@ -31,6 +31,7 @@
     "@zip.js/zip.js": "^2.24.0",
     "ajv": "^8.20.0",
     "manifold-3d": "^3.5.4",
+    "mediabunny": "1.65.2",
     "meshoptimizer": "1.1.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",

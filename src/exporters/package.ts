@@ -37,7 +37,7 @@ const rendererSources = import.meta.glob<string>("../renderer/{pbr-material,trip
 const proceduralSources = import.meta.glob<string>("../materials/procedural/*.ts", { query: "?raw", import: "default", eager: true });
 const encode = (text: string) => new TextEncoder().encode(text);
 const json = (value: unknown) => JSON.stringify(value).replace(/</g,"\\u003c").replace(/\u2028/g,"\\u2028").replace(/\u2029/g,"\\u2029");
-export interface PreparedExport { files: Map<string,Uint8Array>; diagnostics: string[]; triangles: number; bytes: number; bundle: RuntimeBundle; referenceBundle?: RuntimeBundle; referenceAssets?: Map<string,Uint8Array> }
+export interface PreparedExport { parameterNodeIds?: Record<string,string[]>; files: Map<string,Uint8Array>; diagnostics: string[]; triangles: number; bytes: number; bundle: RuntimeBundle; referenceBundle?: RuntimeBundle; referenceAssets?: Map<string,Uint8Array> }
 
 export async function prepareExport(project: Project, readAsset: (id: string) => Uint8Array | undefined, profile: ExportProfile, signal?: AbortSignal, progress: (value: number) => void = () => {}, parameters: ExportParameter[] = [], optimizer?: (geometry: ExportGeometry, signal?: AbortSignal) => Promise<GeometryOptimizationResult>, textureOptimizer?: (asset:Asset,bytes:Uint8Array,signal?:AbortSignal)=>Promise<TextureOptimizationResult>): Promise<PreparedExport> {
   const issues = validateProject(project);
@@ -151,7 +151,7 @@ export async function prepareExport(project: Project, readAsset: (id: string) =>
   add("export-report.json",json({profile,triangles,diagnostics,schemaVersion:project.schemaVersion}));
   const bytes = [...files.values()].reduce((sum,b) => sum+b.byteLength,0);
   if (bytes > 256*1024*1024) throw new Error("Экспорт превышает лимит 256 MiB.");
-  progress(1); return { files,diagnostics,triangles,bytes,bundle,...(optimizer||textureOptimizer?{referenceBundle:{project:structuredClone(project),geometries:optimizer?referenceGeometries:geometries,profile:"max" as const,...(expanded.playback.length?{instancePlayback:expanded.playback}:{})},referenceAssets}:{}) };
+  progress(1); return { parameterNodeIds:expanded.nodeIds,files,diagnostics,triangles,bytes,bundle,...(optimizer||textureOptimizer?{referenceBundle:{project:structuredClone(project),geometries:optimizer?referenceGeometries:geometries,profile:"max" as const,...(expanded.playback.length?{instancePlayback:expanded.playback}:{})},referenceAssets}:{}) };
 }
 
 export async function createExportZip(prepared: PreparedExport, signal?: AbortSignal): Promise<Blob> {

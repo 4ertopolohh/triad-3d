@@ -22,7 +22,7 @@ export interface TriadModelProps {
   onError?: (message: string) => void;
   onCollision?: (event: { firstNodeId: string; secondNodeId: string; started: boolean }) => void;
 }
-export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, scale = 1, color, playing = true, clipId, time, assetBaseUrl = "./", onError, onCollision, nodeOverrides, assetUrls }: TriadModelProps & { data: RuntimeBundle; assetUrls?: Record<string,string> }) {
+export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, scale = 1, color, playing = true, clipId, time, assetBaseUrl = "./", onError, onCollision, nodeOverrides, assetUrls, __triadCapture: capture }: TriadModelProps & { data: RuntimeBundle; assetUrls?: Record<string,string>; __triadCapture?: {ready: (render: (seconds:number)=>Promise<HTMLCanvasElement>)=>void} }) {
   const mount = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
   const controls = useRef({ speed, scale, color, playing, clipId, time, onError, onCollision, nodeOverrides });
@@ -72,7 +72,7 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
       if (object instanceof T.DirectionalLight || object instanceof T.SpotLight) { object.target.position.fromArray(light.target); scene.add(object.target); }
       scene.add(object);
     }
-    const resize = () => { if (disposed) return; const rect = host.getBoundingClientRect(); const w = Math.max(1,rect.width), h = Math.max(1,rect.height); renderer.setPixelRatio(Math.min(devicePixelRatio,data.profile === "max" ? 2 : data.profile === "balanced" ? 1.5 : 1)); renderer.setSize(w,h); camera.aspect = w/h; camera.updateProjectionMatrix(); };
+    const resize = () => { if (disposed) return; const rect = host.getBoundingClientRect(); const w = Math.max(1,rect.width), h = Math.max(1,rect.height); renderer.setPixelRatio(capture ? 1 : Math.min(devicePixelRatio,data.profile === "max" ? 2 : data.profile === "balanced" ? 1.5 : 1)); renderer.setSize(w,h); camera.aspect = w/h; camera.updateProjectionMatrix(); };
     const observer = new ResizeObserver(resize); observer.observe(host);
     void (async () => {
       setError("");
@@ -118,17 +118,20 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
         texture.flipY = "flipY" in parsed ? parsed.flipY ?? false : false; texture.colorSpace = T.LinearSRGBColorSpace; texture.mapping = T.EquirectangularReflectionMapping; texture.needsUpdate = true; textures.add(texture);
         scene.environment = texture; scene.environmentIntensity = project.scene.background.environmentIntensity ?? 1; scene.environmentRotation.y = project.scene.background.environmentRotation ?? 0;
       }
+      if(capture){ await Promise.all([base.ready(),surface.ready()]); const errors=[...base.diagnostics(),...surface.diagnostics()]; if(errors.length)throw new Error(errors.join("; ")); if(disposed)return; }
       await renderer.init(); if (disposed) { void renderer.dispose(); return; }
       host.appendChild(renderer.domElement); resize();
       interactions=new InteractionController(renderer.domElement,camera);
-      renderer.setAnimationLoop((now: number) => {
+      let previousCaptureTime:number|undefined;
+      const frame = (now: number, fixedSeconds?:number) => {
         if (disposed) return;
         const control = controls.current;
-        const delta=last?Math.max(0,(now-last)/1000):0;
+        const delta=fixedSeconds!==undefined ? (previousCaptureTime===undefined?0:Math.max(0,fixedSeconds-previousCaptureTime)) : last?Math.max(0,(now-last)/1000):0;
+        previousCaptureTime=fixedSeconds;
         if (last && control.playing && Number.isFinite(control.speed) && control.speed >= 0 && control.speed <= 100) elapsed += (now-last)/1000*control.speed;
         last = now;
-        const seconds = control.time !== undefined && Number.isFinite(control.time) ? control.time : elapsed;
-        const pose = evaluateRuntimePose(data,control.clipId,seconds,control.time === undefined);
+        const seconds = fixedSeconds ?? (control.time !== undefined && Number.isFinite(control.time) ? control.time : elapsed);
+        const pose = evaluateRuntimePose(data,control.clipId,seconds,capture ? true : control.time === undefined);
         for (const node of project.nodes) apply(objects.get(node.id)!,pose.get(node.id) ?? node.transform);
         model.scale.setScalar(Number.isFinite(control.scale) && control.scale > 0 ? control.scale : 1);
         for (const [target,original] of colors) { if (control.color && /^#[0-9a-f]{6}$/i.test(control.color)) target.set(control.color); else target.copy(original); }
@@ -145,11 +148,13 @@ export function TriadRuntime({ data, width = "100%", height = 480, speed = 1, sc
         if(controls.current.time!==undefined)physics.reset();
         const collisions=controls.current.time!==undefined?[]:physics.apply([{id:"runtime",actors:project.physics??[],objects}],controls.current.playing?delta*Math.max(0,Math.min(4,Number.isFinite(controls.current.speed)?controls.current.speed:1)):0);
         for(const event of collisions)controls.current.onCollision?.({firstNodeId:event.first.nodeId,secondNodeId:event.second.nodeId,started:event.started});
-        renderer.render(scene,camera);
-      });
+        if(!capture)renderer.render(scene,camera);
+      };
+      if(capture)capture.ready(async seconds=>{ if(disposed)throw new Error("Renderer disposed"); frame(seconds*1000,seconds); await renderer.renderAsync(scene,camera); return renderer.domElement; });
+      else renderer.setAnimationLoop(now=>frame(now));
     })().catch(error => { if (!disposed) fail(error instanceof Error ? error.message : String(error)); });
     function cleanupResources() { base.dispose(); surface.dispose(); roughness.dispose(); textures.forEach(t => t.dispose()); materials.forEach(m => m.dispose()); geometries.forEach(g => g.dispose()); textures.clear(); materials.clear(); geometries.clear(); }
     return () => { disposed = true; abort.abort(); interactions?.dispose();physics.dispose();observer.disconnect(); renderer.setAnimationLoop(null); cleanupResources(); renderer.domElement.remove(); void renderer.dispose(); };
-  }, [data,assetBaseUrl,assetUrls]);
+  }, [data,assetBaseUrl,assetUrls,capture]);
   return <div style={{ width,height,position:"relative" }}><div ref={mount} style={{width:"100%",height:"100%"}} />{error && <p role="alert" style={{position:"absolute",top:0}}>{error}</p>}</div>;
 }

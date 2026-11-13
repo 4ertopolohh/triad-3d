@@ -6,7 +6,7 @@ import { generateProceduralMap } from "../materials/procedural";
 type Owner = T.MeshPhysicalMaterial | MeshPhysicalNodeMaterial;
 type Channel = "normal" | "bump" | "roughness" | "metalness" | "emissive";
 const property = { normal: "normalMap", bump: "bumpMap", roughness: "roughnessMap", metalness: "metalnessMap", emissive: "emissiveMap" } as const;
-type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Map<Owner, Set<Channel>>; error?: string };
+type Entry = { texture?: T.Texture; bitmap?: ImageBitmap; users: Map<Owner, Set<Channel>>; error?: string; pending?: Promise<void> | undefined };
 
 /** Linear data maps never share an sRGB sampler with color images. */
 export class SurfaceTextures {
@@ -23,7 +23,7 @@ export class SurfaceTextures {
       if (!entry) {
         entry = { users: new Map() }; this.entries.set(key, entry);
         const current = entry;
-        void Promise.resolve().then(async () => {
+        current.pending = Promise.resolve().then(async () => {
           const bytes = read(id); if (!bytes) throw new Error("Байты карты отсутствуют.");
           const bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: asset.mediaType }), { imageOrientation: "flipY", colorSpaceConversion: "none", premultiplyAlpha: "none" });
           if (this.entries.get(key) !== current) { bitmap.close(); return; }
@@ -31,7 +31,7 @@ export class SurfaceTextures {
           texture.userData.triadSharedTexture = true; texture.needsUpdate = true;
           current.texture = texture; current.bitmap = bitmap;
           for (const [user, channels] of current.users) for (const kind of channels) { user[property[kind]] = texture; user.needsUpdate = true; }
-        }).catch(() => { current.error = `Не удалось загрузить карту ${channel}: ${id}.`; }).finally(this.changed);
+        }).catch(() => { current.error = `Не удалось загрузить карту ${channel}: ${id}.`; }).finally(() => { current.pending = undefined; this.changed(); });
       }
       const channels = entry.users.get(owner) ?? new Set<Channel>(); channels.add(channel); entry.users.set(owner, channels);
       if (entry.texture) { owner[property[channel]] = entry.texture; owner.needsUpdate = true; }
@@ -61,6 +61,7 @@ export class SurfaceTextures {
     }
   }
   releaseObject(root: T.Object3D): void { root.traverse(o => { if (o instanceof T.Mesh) for (const m of Array.isArray(o.material) ? o.material : [o.material]) this.release(m); }); }
+  async ready(): Promise<void> { await Promise.all([...this.entries.values()].map(entry => entry.pending)); }
   diagnostics(): string[] { return [...this.entries.values()].flatMap(e => e.error ? [e.error] : []); }
   dispose(): void { for (const entry of this.entries.values()) for (const owner of [...entry.users.keys()]) this.release(owner); }
 }
